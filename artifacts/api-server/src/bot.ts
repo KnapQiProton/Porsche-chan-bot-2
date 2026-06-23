@@ -373,7 +373,8 @@ const COMMANDS = [
     .toJSON(),
 ];
 
-// FIX DM: Partials.Channel wajib ada supaya bot bisa terima pesan DM
+// Partials.Channel wajib ada supaya bot bisa terima pesan DM
+// Partials.Message TIDAK dipakai — bisa menyebabkan event double-fire di server channel
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -382,8 +383,18 @@ const client = new Client({
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.DirectMessageTyping,
   ],
-  partials: [Partials.Channel, Partials.Message],
+  partials: [Partials.Channel],
 });
+
+// Deduplication guard: cegah pesan yang sama diproses lebih dari sekali
+const processedMessages = new Set<string>();
+const DEDUP_TTL_MS = 10_000;
+function isDuplicate(messageId: string): boolean {
+  if (processedMessages.has(messageId)) return true;
+  processedMessages.add(messageId);
+  setTimeout(() => processedMessages.delete(messageId), DEDUP_TTL_MS);
+  return false;
+}
 
 client.once(Events.ClientReady, async (c) => {
   logger.info({ tag: c.user.tag }, "Discord bot ready");
@@ -420,6 +431,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 
 client.on(Events.MessageCreate, async (message: Message) => {
   if (message.author.bot) return;
+  if (isDuplicate(message.id)) {
+    logger.warn({ messageId: message.id }, "Duplicate MessageCreate skipped");
+    return;
+  }
 
   const isMentioned = message.mentions.has(client.user!.id);
   const isDM = message.channel.type === 1;
