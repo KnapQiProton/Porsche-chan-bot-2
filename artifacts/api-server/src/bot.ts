@@ -19,7 +19,12 @@ import {
   getVoiceConnection,
   VoiceConnectionStatus,
   entersState,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
 } from "@discordjs/voice";
+import playdl from "play-dl";
 import { GoogleGenAI } from "@google/genai";
 import * as cheerio from "cheerio";
 import { logger } from "./lib/logger";
@@ -386,6 +391,20 @@ const COMMANDS = [
     .setName("leave-vc")
     .setDescription("Keluarkan Porsche-chan dari voice channel (owner only)")
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("play")
+    .setDescription("Putar musik dari YouTube atau Spotify di VC")
+    .addStringOption((opt) =>
+      opt
+        .setName("url")
+        .setDescription("URL YouTube atau Spotify (atau ketik judul lagu)")
+        .setRequired(true),
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("stop")
+    .setDescription("Stop musik (Porsche-chan tetap di VC)")
+    .toJSON(),
 ];
 
 // Partials.Channel wajib ada supaya bot bisa terima pesan DM
@@ -401,6 +420,9 @@ const client = new Client({
   ],
   partials: [Partials.Channel],
 });
+
+// Music state: satu audio player per guild
+const guildPlayers = new Map<string, ReturnType<typeof createAudioPlayer>>();
 
 // Deduplication guard: cegah pesan yang sama diproses lebih dari sekali
 const processedMessages = new Set<string>();
@@ -911,11 +933,155 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       return;
     }
 
+    const existingPlayer = guildPlayers.get(interaction.guild.id);
+    if (existingPlayer) {
+      existingPlayer.stop();
+      guildPlayers.delete(interaction.guild.id);
+    }
     connection.destroy();
     logger.info({ guildId: interaction.guild.id }, "Left voice channel");
 
     await interaction.reply({
       content: `o- oke KnapQi-san~! aku keluar dari VC sekarang... sampai jumpa lagi~ 💕 (◡ ω ◡)`,
+    });
+  }
+
+  if (interaction.commandName === "play") {
+    const query = interaction.options.getString("url", true);
+
+    if (!interaction.guild) {
+      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+
+    const member = interaction.member as GuildMember | null;
+    const voiceChannel = member?.voice?.channel;
+    if (!voiceChannel) {
+      await interaction.reply({
+        content: "e- kamu harus masuk ke voice channel dulu ya~! 🥺",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      // Resolve URL or search query
+      let streamSource: Awaited<ReturnType<typeof playdl.stream>> | null = null;
+      let trackTitle = query;
+      let trackUrl = query;
+
+      const validated = await playdl.validate(query);
+
+      if (validated === "yt_video") {
+        const info = await playdl.video_info(query);
+        trackTitle = info.video_details.title ?? query;
+        trackUrl = info.video_details.url;
+        streamSource = await playdl.stream(query, { quality: 2 });
+      } else if (validated === "sp_track") {
+        // Spotify → search YouTube
+        const spotifyInfo = await playdl.spotify(query);
+        if (spotifyInfo.type !== "track") throw new Error("Only Spotify tracks are supported");
+        const searchTerm = `${spotifyInfo.name} ${(spotifyInfo as { artists?: { name: string }[] }).artists?.[0]?.name ?? ""}`.trim();
+        const results = await playdl.search(searchTerm, { source: { youtube: "video" }, limit: 1 });
+        if (!results[0]) throw new Error("No YouTube match found for Spotify track");
+        trackTitle = results[0].title ?? searchTerm;
+        trackUrl = results[0].url;
+        streamSource = await playdl.stream(trackUrl, { quality: 2 });
+      } else {
+        // Treat as search query
+        const results = await playdl.search(query, { source: { youtube: "video" }, limit: 1 });
+        if (!results[0]) throw new Error("No results found");
+        trackTitle = results[0].title ?? query;
+        trackUrl = results[0].url;
+        streamSource = await playdl.stream(trackUrl, { quality: 2 });
+      }
+
+      if (!streamSource) throw new Error("Could not get audio stream");
+
+      // Join VC if not already in one
+      let connection = getVoiceConnection(interaction.guild.id);
+      if (!connection) {
+        connection = joinVoiceChannel({
+          channelId: voiceChannel.id,
+          guildId: interaction.guild.id,
+          adapterCreator: interaction.guild.voiceAdapterCreator,
+          selfDeaf: true,
+          selfMute: false,
+        });
+        await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+      }
+
+      // Stop existing player if any
+      const existingPlayer = guildPlayers.get(interaction.guild.id);
+      if (existingPlayer) existingPlayer.stop();
+
+      // Create new player and resource
+      const player = createAudioPlayer({
+        behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+      });
+      const resource = createAudioResource(streamSource.stream, {
+        inputType: streamSource.type,
+      });
+
+      player.play(resource);
+      connection.subscribe(player);
+      guildPlayers.set(interaction.guild.id, player);
+
+      player.on("error", (err) => {
+        logger.error({ err }, "Audio player error");
+      });
+
+      const guildId = interaction.guild.id;
+      player.once(AudioPlayerStatus.Idle, () => {
+        guildPlayers.delete(guildId);
+        logger.info({ trackTitle }, "Track finished playing");
+      });
+
+      logger.info({ trackTitle, trackUrl }, "Playing audio");
+
+      const embed = new EmbedBuilder()
+        .setColor(0xf97316)
+        .setTitle("🎵 Sekarang Memutar")
+        .setDescription(`**[${trackTitle}](${trackUrl})**`)
+        .addFields(
+          { name: "⏹ Stop", value: "Gunakan `/stop` untuk stop musik", inline: true },
+          { name: "🚪 Keluar", value: "Gunakan `/leave-vc` untuk keluar VC", inline: true },
+        )
+        .setFooter({ text: "Porsche-chan Music Player 🎵" })
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [embed] });
+    } catch (err) {
+      logger.error({ err }, "Error in /play command");
+      await interaction.editReply(
+        "❌ Gagal memutar lagu... pastikan URL valid atau coba judul lagu yang lain ya! 🥺",
+      );
+    }
+  }
+
+  if (interaction.commandName === "stop") {
+    if (!interaction.guild) {
+      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+
+    const player = guildPlayers.get(interaction.guild.id);
+    if (!player) {
+      await interaction.reply({
+        content: "a- nggak ada musik yang sedang diputar kok~! (◡ ω ◡)",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    player.stop();
+    guildPlayers.delete(interaction.guild.id);
+    logger.info({ guildId: interaction.guild.id }, "Music stopped");
+
+    await interaction.reply({
+      content: "⏹ Musik dihentikan~ Porsche-chan masih di VC kok, tenang aja~ (๑˃ᴗ˂)ﻌ",
     });
   }
 }
