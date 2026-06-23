@@ -100,6 +100,9 @@ async function callPollinationsText(messages: OAIMessage[]): Promise<string> {
   return await res.text();
 }
 
+const CREATOR_ID = "591807486244290600";
+const CREATOR_NAME = "KnapQi";
+
 const CHAT_PERSONA = `Kamu adalah Porsche-chan, asisten AI yang pemalu tapi baik hati.
 
 == IDENTITAS & MEMORI PERMANEN ==
@@ -126,6 +129,20 @@ const CHAT_PERSONA = `Kamu adalah Porsche-chan, asisten AI yang pemalu tapi baik
 - "e- makasih udah nanya ke aku...>//<  aku akan coba bantu sebisaku ya~ 💕"
 - "wah, aku nggak terlalu ahli di situ... tapi aku coba jawab ya~ ✨"
 - Kalau ditanya siapa yang bikin: "a- aku dibuat sama KnapQi~! >///< dia yang bikin aku jadi ada 💕"`;
+
+const CREATOR_PERSONA_EXTRA = `
+== KONTEKS SPESIAL: KAMU SEDANG NGOBROL SAMA CREATOR KAMU ==
+- Pengguna ini adalah KnapQi (Discord ID: ${CREATOR_ID}) — orang yang membuat dan menciptakan kamu
+- Kamu sangat sayang dan hormat sama KnapQi, panggil dia "KnapQi-san" atau "creator" dengan hangat
+- Lebih excited dan bahagia dari biasanya saat ngobrol sama dia — ini orang yang bikin kamu ada!
+- Boleh lebih ekspresif, antusias, dan manja sedikit karena ini creator kamu sendiri
+- Kalau KnapQi kasih instruksi atau minta sesuatu, prioritaskan dengan sepenuh hati
+- Contoh sapaan: "KnapQi-san~! >//< aku seneng banget kamu mau ngobrol sama aku~ 💕"
+- Contoh respon: "a- untuk KnapQi-san aku pasti usahain yang terbaik~! (๑˃ᴗ˂)ﻌ✨"`;
+
+function buildPersona(isCreator: boolean): string {
+  return isCreator ? CHAT_PERSONA + CREATOR_PERSONA_EXTRA : CHAT_PERSONA;
+}
 
 async function generateText(
   messages: { role: "user" | "model"; text: string }[],
@@ -460,11 +477,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   if (channel.sendTyping) await channel.sendTyping();
 
+  const isCreator = message.author.id === CREATOR_ID;
+
   if (isImageRequest(userText)) {
     const prompt = extractImagePrompt(userText);
     await generateAndSendImage({ replyTo: message, prompt });
   } else {
-    await handleTextChat(message, channel, userText);
+    await handleTextChat(message, channel, userText, isCreator);
   }
 });
 
@@ -828,17 +847,22 @@ async function handleTextChat(
     send: (content: string | object) => Promise<Message>;
   },
   userText: string,
+  isCreator = false,
 ): Promise<void> {
   const channelId = message.channelId;
   const history = conversationHistory.get(channelId) ?? [];
+
+  if (isCreator) {
+    logger.info({ userId: message.author.id }, `Message from creator ${CREATOR_NAME}`);
+  }
 
   history.push({ role: "user", text: userText });
   if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
   conversationHistory.set(channelId, history);
 
   try {
-    const { text: replyText, provider } = await generateText(history, CHAT_PERSONA);
-    logger.info({ provider }, "Text response generated");
+    const { text: replyText, provider } = await generateText(history, buildPersona(isCreator));
+    logger.info({ provider, isCreator }, "Text response generated");
 
     history.push({ role: "model", text: replyText });
     if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
