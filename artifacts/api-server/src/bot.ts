@@ -12,7 +12,14 @@ import {
   Interaction,
   EmbedBuilder,
   Partials,
+  GuildMember,
 } from "discord.js";
+import {
+  joinVoiceChannel,
+  getVoiceConnection,
+  VoiceConnectionStatus,
+  entersState,
+} from "@discordjs/voice";
 import { GoogleGenAI } from "@google/genai";
 import * as cheerio from "cheerio";
 import { logger } from "./lib/logger";
@@ -371,6 +378,14 @@ const COMMANDS = [
         .setRequired(false),
     )
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("join-vc")
+    .setDescription("Porsche-chan masuk ke voice channel kamu")
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("leave-vc")
+    .setDescription("Keluarkan Porsche-chan dari voice channel (owner only)")
+    .toJSON(),
 ];
 
 // Partials.Channel wajib ada supaya bot bisa terima pesan DM
@@ -382,6 +397,7 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.DirectMessageTyping,
+    GatewayIntentBits.GuildVoiceStates,
   ],
   partials: [Partials.Channel],
 });
@@ -820,6 +836,87 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       logger.error({ err }, "Error in /scan command");
       await interaction.editReply("❌ Gagal menganalisis gambar. Pastikan gambar valid dan coba lagi ya!");
     }
+  }
+
+  if (interaction.commandName === "join-vc") {
+    const member = interaction.member as GuildMember | null;
+    const voiceChannel = member?.voice?.channel;
+
+    if (!voiceChannel) {
+      await interaction.reply({
+        content: "e- kamu harus masuk ke voice channel dulu ya sebelum aku bisa ikut~! 🥺",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (!interaction.guild) {
+      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+
+    const existing = getVoiceConnection(interaction.guild.id);
+    if (existing) {
+      await interaction.reply({
+        content: `a- aku udah ada di voice channel kok~! (๑˃ᴗ˂)ﻌ Mau aku pindah ke **${voiceChannel.name}**? Pakai /leave-vc dulu ya~`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    try {
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: interaction.guild.id,
+        adapterCreator: interaction.guild.voiceAdapterCreator,
+        selfDeaf: true,
+        selfMute: true,
+      });
+
+      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+      logger.info({ channelId: voiceChannel.id, channelName: voiceChannel.name }, "Joined voice channel");
+
+      await interaction.reply({
+        content: `a- aku udah masuk ke **${voiceChannel.name}**~! >//< aku akan tetap di sini sampai ${CREATOR_NAME} pakai /leave-vc ya~ 🎵✨`,
+      });
+    } catch (err) {
+      logger.error({ err }, "Failed to join voice channel");
+      await interaction.reply({
+        content: "❌ Gagal masuk ke voice channel... coba lagi nanti ya! 🥺",
+        ephemeral: true,
+      });
+    }
+  }
+
+  if (interaction.commandName === "leave-vc") {
+    if (interaction.user.id !== CREATOR_ID) {
+      await interaction.reply({
+        content: "e- maaf, cuma KnapQi-san yang bisa nyuruh aku keluar dari VC~! 👉👈",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (!interaction.guild) {
+      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+
+    const connection = getVoiceConnection(interaction.guild.id);
+    if (!connection) {
+      await interaction.reply({
+        content: "a- aku nggak sedang di voice channel manapun kok~! (◡ ω ◡)",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    connection.destroy();
+    logger.info({ guildId: interaction.guild.id }, "Left voice channel");
+
+    await interaction.reply({
+      content: `o- oke KnapQi-san~! aku keluar dari VC sekarang... sampai jumpa lagi~ 💕 (◡ ω ◡)`,
+    });
   }
 }
 

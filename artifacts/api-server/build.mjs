@@ -29,6 +29,16 @@ async function buildAll() {
     // - use path traversal to read files (e.g. @google-cloud/secret-manager loads sibling .proto files)
     external: [
       "*.node",
+      "ffmpeg-static",
+      "prism-media",
+      "@snazzah/davey",
+      "@snazzah/davey-linux-x64-gnu",
+      "@discordjs/voice",
+      "sodium-native",
+      "libsodium-wrappers",
+      "opusscript",
+      "@discordjs/opus",
+      "mediaplex",
       "sharp",
       "better-sqlite3",
       "sqlite3",
