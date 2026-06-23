@@ -379,9 +379,26 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
+client.on("error", (err) => {
+  logger.error({ err }, "Discord client error (non-fatal)");
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error({ reason }, "Unhandled promise rejection (non-fatal)");
+});
+
 client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  await handleSlashCommand(interaction);
+  try {
+    await handleSlashCommand(interaction);
+  } catch (err: unknown) {
+    const code = (err as { code?: number })?.code;
+    if (code === 10062) {
+      logger.warn("Interaction expired (10062) — user took too long or bot restarted");
+      return;
+    }
+    logger.error({ err }, "Unhandled error in slash command");
+  }
 });
 
 client.on(Events.MessageCreate, async (message: Message) => {
