@@ -23,8 +23,10 @@ import {
   createAudioResource,
   AudioPlayerStatus,
   NoSubscriberBehavior,
+  StreamType,
 } from "@discordjs/voice";
 import playdl from "play-dl";
+import ytdl from "@distube/ytdl-core";
 import { GoogleGenAI } from "@google/genai";
 import * as cheerio from "cheerio";
 import { logger } from "./lib/logger";
@@ -987,50 +989,47 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         return input;
       }
 
-      // Resolve URL or search query
-      let streamSource: Awaited<ReturnType<typeof playdl.stream>> | null = null;
+      // Resolve final YouTube URL for streaming
       let trackTitle = query;
-      let trackUrl = query;
+      let trackUrl = "";
 
       const normalizedQuery = normalizeYouTubeUrl(query);
       const validated = await playdl.validate(normalizedQuery);
       logger.info({ query, normalizedQuery, validated }, "play-dl validate result");
 
-      if (validated === "yt_video") {
-        const info = await playdl.video_info(normalizedQuery);
-        trackTitle = info.video_details.title ?? query;
-        trackUrl = info.video_details.url;
-        streamSource = await playdl.stream(normalizedQuery, { quality: 2 });
+      if (validated === "yt_video" || validated === "yt_playlist") {
+        // For playlist: treat the URL as-is (ytdl can handle it, will pick first)
+        // For video: use directly
+        if (validated === "yt_video") {
+          const info = await playdl.video_info(normalizedQuery);
+          trackTitle = info.video_details.title ?? query;
+        }
+        trackUrl = normalizedQuery;
       } else if (validated === "sp_track") {
         // Spotify → search YouTube
         const spotifyInfo = await playdl.spotify(normalizedQuery);
         if (spotifyInfo.type !== "track") throw new Error("Only Spotify tracks are supported");
         const searchTerm = `${spotifyInfo.name} ${(spotifyInfo as { artists?: { name: string }[] }).artists?.[0]?.name ?? ""}`.trim();
         const results = await playdl.search(searchTerm, { source: { youtube: "video" }, limit: 1 });
-        if (!results[0]) throw new Error("No YouTube match found for Spotify track");
+        if (!results[0]?.url) throw new Error("No YouTube match found for Spotify track");
         trackTitle = results[0].title ?? searchTerm;
         trackUrl = results[0].url;
-        streamSource = await playdl.stream(trackUrl, { quality: 2 });
-      } else if (validated === "yt_playlist") {
-        // Ambil lagu pertama dari playlist
-        const playlist = await playdl.playlist_info(normalizedQuery, { incomplete: true });
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const videos: any[] = await (playlist as any).fetch(1);
-        const first = videos?.[0] ?? (playlist as any).videos?.[0];
-        if (!first) throw new Error("Playlist kosong atau tidak bisa diakses");
-        trackTitle = (first.title as string | undefined) ?? query;
-        trackUrl = (first.url as string | undefined) ?? normalizedQuery;
-        streamSource = await playdl.stream(trackUrl, { quality: 2 });
       } else {
-        // Treat as search query (teks biasa atau URL tidak dikenal)
+        // Treat as search query (plain text or unrecognized URL)
         const results = await playdl.search(normalizedQuery, { source: { youtube: "video" }, limit: 1 });
-        if (!results[0]) throw new Error("No results found");
+        if (!results[0]?.url) throw new Error("No results found");
         trackTitle = results[0].title ?? query;
         trackUrl = results[0].url;
-        streamSource = await playdl.stream(trackUrl, { quality: 2 });
       }
 
-      if (!streamSource) throw new Error("Could not get audio stream");
+      logger.info({ trackTitle, trackUrl }, "Resolved track, starting ytdl stream");
+
+      // Stream via @distube/ytdl-core (handles YouTube cipher correctly)
+      const ytdlStream = ytdl(trackUrl, {
+        filter: "audioonly",
+        quality: "highestaudio",
+        highWaterMark: 1 << 25,
+      });
 
       // Join VC if not already in one
       let connection = getVoiceConnection(interaction.guild.id);
@@ -1053,8 +1052,8 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       const player = createAudioPlayer({
         behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
       });
-      const resource = createAudioResource(streamSource.stream, {
-        inputType: streamSource.type,
+      const resource = createAudioResource(ytdlStream, {
+        inputType: StreamType.Arbitrary,
       });
 
       player.play(resource);

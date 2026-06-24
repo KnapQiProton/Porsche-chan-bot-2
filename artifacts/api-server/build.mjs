@@ -40,6 +40,7 @@ async function buildAll() {
       "@discordjs/opus",
       "mediaplex",
       "play-dl",
+      "@distube/ytdl-core",
       "m3u8stream",
       "miniget",
       "sharp",
