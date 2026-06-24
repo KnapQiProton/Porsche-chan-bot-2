@@ -26,7 +26,7 @@ import {
   StreamType,
 } from "@discordjs/voice";
 import playdl from "play-dl";
-import ytdl from "@distube/ytdl-core";
+import { spawn } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import * as cheerio from "cheerio";
 import { logger } from "./lib/logger";
@@ -425,6 +425,34 @@ const client = new Client({
 
 // Music state: satu audio player per guild
 const guildPlayers = new Map<string, ReturnType<typeof createAudioPlayer>>();
+
+// yt-dlp helpers
+function ytDlpStream(url: string): import("stream").Readable {
+  const proc = spawn("yt-dlp", [
+    "-f", "bestaudio",
+    "--no-playlist",
+    "--no-warnings",
+    "-o", "-",
+    url,
+  ]);
+  proc.stderr.on("data", (d: Buffer) => {
+    const msg = d.toString().trim();
+    if (msg) logger.warn({ msg }, "yt-dlp stderr");
+  });
+  proc.on("error", (err) => logger.error({ err }, "yt-dlp spawn error"));
+  if (!proc.stdout) throw new Error("yt-dlp stdout is null");
+  return proc.stdout;
+}
+
+async function ytDlpTitle(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("yt-dlp", ["--print", "title", "--no-playlist", "--no-warnings", url]);
+    let out = "";
+    proc.stdout.on("data", (d: Buffer) => { out += d.toString(); });
+    proc.on("close", (code) => code === 0 ? resolve(out.trim()) : reject(new Error(`yt-dlp title exit ${code}`)));
+    proc.on("error", reject);
+  });
+}
 
 // Deduplication guard: cegah pesan yang sama diproses lebih dari sekali
 const processedMessages = new Set<string>();
@@ -998,12 +1026,6 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       logger.info({ query, normalizedQuery, validated }, "play-dl validate result");
 
       if (validated === "yt_video" || validated === "yt_playlist") {
-        // For playlist: treat the URL as-is (ytdl can handle it, will pick first)
-        // For video: use directly
-        if (validated === "yt_video") {
-          const info = await playdl.video_info(normalizedQuery);
-          trackTitle = info.video_details.title ?? query;
-        }
         trackUrl = normalizedQuery;
       } else if (validated === "sp_track") {
         // Spotify → search YouTube
@@ -1022,14 +1044,17 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         trackUrl = results[0].url;
       }
 
-      logger.info({ trackTitle, trackUrl }, "Resolved track, starting ytdl stream");
+      // Fetch title via yt-dlp (fast, no stream yet)
+      try {
+        trackTitle = await ytDlpTitle(trackUrl);
+      } catch {
+        // title is optional, keep the search result title
+      }
 
-      // Stream via @distube/ytdl-core (handles YouTube cipher correctly)
-      const ytdlStream = ytdl(trackUrl, {
-        filter: "audioonly",
-        quality: "highestaudio",
-        highWaterMark: 1 << 25,
-      });
+      logger.info({ trackTitle, trackUrl }, "Resolved track, starting yt-dlp stream");
+
+      // Spawn yt-dlp to stream best audio → ffmpeg transcodes → Discord
+      const audioStream = ytDlpStream(trackUrl);
 
       // Join VC if not already in one
       let connection = getVoiceConnection(interaction.guild.id);
@@ -1048,11 +1073,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       const existingPlayer = guildPlayers.get(interaction.guild.id);
       if (existingPlayer) existingPlayer.stop();
 
-      // Create new player and resource
+      // Create new player and resource (StreamType.Arbitrary → ffmpeg transcodes)
       const player = createAudioPlayer({
         behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
       });
-      const resource = createAudioResource(ytdlStream, {
+      const resource = createAudioResource(audioStream, {
         inputType: StreamType.Arbitrary,
       });
 
