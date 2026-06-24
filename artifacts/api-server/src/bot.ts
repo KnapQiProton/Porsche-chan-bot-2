@@ -967,21 +967,43 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     await interaction.deferReply();
 
     try {
+      // Normalize YouTube Music URLs → regular YouTube URLs
+      // music.youtube.com/watch?v=ID → youtube.com/watch?v=ID
+      function normalizeYouTubeUrl(input: string): string {
+        try {
+          const u = new URL(input);
+          if (u.hostname === "music.youtube.com") {
+            u.hostname = "www.youtube.com";
+            return u.toString();
+          }
+          // youtu.be/ID → youtube.com/watch?v=ID
+          if (u.hostname === "youtu.be") {
+            const id = u.pathname.slice(1);
+            return `https://www.youtube.com/watch?v=${id}`;
+          }
+        } catch {
+          // bukan URL, biarkan
+        }
+        return input;
+      }
+
       // Resolve URL or search query
       let streamSource: Awaited<ReturnType<typeof playdl.stream>> | null = null;
       let trackTitle = query;
       let trackUrl = query;
 
-      const validated = await playdl.validate(query);
+      const normalizedQuery = normalizeYouTubeUrl(query);
+      const validated = await playdl.validate(normalizedQuery);
+      logger.info({ query, normalizedQuery, validated }, "play-dl validate result");
 
       if (validated === "yt_video") {
-        const info = await playdl.video_info(query);
+        const info = await playdl.video_info(normalizedQuery);
         trackTitle = info.video_details.title ?? query;
         trackUrl = info.video_details.url;
-        streamSource = await playdl.stream(query, { quality: 2 });
+        streamSource = await playdl.stream(normalizedQuery, { quality: 2 });
       } else if (validated === "sp_track") {
         // Spotify → search YouTube
-        const spotifyInfo = await playdl.spotify(query);
+        const spotifyInfo = await playdl.spotify(normalizedQuery);
         if (spotifyInfo.type !== "track") throw new Error("Only Spotify tracks are supported");
         const searchTerm = `${spotifyInfo.name} ${(spotifyInfo as { artists?: { name: string }[] }).artists?.[0]?.name ?? ""}`.trim();
         const results = await playdl.search(searchTerm, { source: { youtube: "video" }, limit: 1 });
@@ -989,9 +1011,19 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         trackTitle = results[0].title ?? searchTerm;
         trackUrl = results[0].url;
         streamSource = await playdl.stream(trackUrl, { quality: 2 });
+      } else if (validated === "yt_playlist") {
+        // Ambil lagu pertama dari playlist
+        const playlist = await playdl.playlist_info(normalizedQuery, { incomplete: true });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const videos: any[] = await (playlist as any).fetch(1);
+        const first = videos?.[0] ?? (playlist as any).videos?.[0];
+        if (!first) throw new Error("Playlist kosong atau tidak bisa diakses");
+        trackTitle = (first.title as string | undefined) ?? query;
+        trackUrl = (first.url as string | undefined) ?? normalizedQuery;
+        streamSource = await playdl.stream(trackUrl, { quality: 2 });
       } else {
-        // Treat as search query
-        const results = await playdl.search(query, { source: { youtube: "video" }, limit: 1 });
+        // Treat as search query (teks biasa atau URL tidak dikenal)
+        const results = await playdl.search(normalizedQuery, { source: { youtube: "video" }, limit: 1 });
         if (!results[0]) throw new Error("No results found");
         trackTitle = results[0].title ?? query;
         trackUrl = results[0].url;
