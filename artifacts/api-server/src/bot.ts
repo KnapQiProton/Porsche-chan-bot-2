@@ -473,6 +473,15 @@ client.once(Events.ClientReady, async (c) => {
   } catch (err) {
     logger.error({ err }, "Failed to register slash commands");
   }
+
+  // Initialize SoundCloud client (auto-fetch free client_id)
+  try {
+    const scClientId = await playdl.getFreeClientID();
+    await playdl.setToken({ soundcloud: { client_id: scClientId } });
+    logger.info("SoundCloud initialized");
+  } catch (err) {
+    logger.warn({ err }, "SoundCloud init failed — /play may not work");
+  }
 });
 
 client.on("error", (err) => {
@@ -1017,44 +1026,46 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         return input;
       }
 
-      // Resolve final YouTube URL for streaming
+      // Resolve query to a SoundCloud search term
+      // YouTube is blocked server-side (requires PO token), so we use SoundCloud for audio.
+      // For YouTube/Spotify URLs, we extract the title first, then search SoundCloud.
       let trackTitle = query;
-      let trackUrl = "";
+      let scSearchQuery = query;
 
       const normalizedQuery = normalizeYouTubeUrl(query);
       const validated = await playdl.validate(normalizedQuery);
       logger.info({ query, normalizedQuery, validated }, "play-dl validate result");
 
-      if (validated === "yt_video" || validated === "yt_playlist") {
-        trackUrl = normalizedQuery;
+      if (validated === "yt_video") {
+        // Extract title from YouTube via yt-dlp, then search SoundCloud
+        try {
+          const ytTitle = await ytDlpTitle(normalizedQuery);
+          scSearchQuery = ytTitle;
+          trackTitle = ytTitle;
+          logger.info({ ytTitle }, "Got YouTube title for SoundCloud search");
+        } catch {
+          // Fall back to using URL as search query
+        }
       } else if (validated === "sp_track") {
-        // Spotify → search YouTube
         const spotifyInfo = await playdl.spotify(normalizedQuery);
         if (spotifyInfo.type !== "track") throw new Error("Only Spotify tracks are supported");
-        const searchTerm = `${spotifyInfo.name} ${(spotifyInfo as { artists?: { name: string }[] }).artists?.[0]?.name ?? ""}`.trim();
-        const results = await playdl.search(searchTerm, { source: { youtube: "video" }, limit: 1 });
-        if (!results[0]?.url) throw new Error("No YouTube match found for Spotify track");
-        trackTitle = results[0].title ?? searchTerm;
-        trackUrl = results[0].url;
-      } else {
-        // Treat as search query (plain text or unrecognized URL)
-        const results = await playdl.search(normalizedQuery, { source: { youtube: "video" }, limit: 1 });
-        if (!results[0]?.url) throw new Error("No results found");
-        trackTitle = results[0].title ?? query;
-        trackUrl = results[0].url;
+        scSearchQuery = `${spotifyInfo.name} ${(spotifyInfo as { artists?: { name: string }[] }).artists?.[0]?.name ?? ""}`.trim();
+        trackTitle = scSearchQuery;
       }
+      // else: plain text search, use as-is
 
-      // Fetch title via yt-dlp (fast, no stream yet)
-      try {
-        trackTitle = await ytDlpTitle(trackUrl);
-      } catch {
-        // title is optional, keep the search result title
-      }
+      // Search SoundCloud (works without cookies/PO tokens)
+      const scResults = await playdl.search(scSearchQuery, { source: { soundcloud: "tracks" }, limit: 1 });
+      if (!scResults[0]?.url) throw new Error(`Lagu "${scSearchQuery}" tidak ditemukan di SoundCloud`);
 
-      logger.info({ trackTitle, trackUrl }, "Resolved track, starting yt-dlp stream");
+      const scTrack = scResults[0] as { name?: string; url: string };
+      trackTitle = scTrack.name ?? trackTitle;
+      const trackUrl = scTrack.url;
 
-      // Spawn yt-dlp to stream best audio → ffmpeg transcodes → Discord
-      const audioStream = ytDlpStream(trackUrl);
+      logger.info({ trackTitle, trackUrl }, "Resolved SoundCloud track, starting stream");
+
+      // Stream via play-dl (SoundCloud — no token required)
+      const scStream = await playdl.stream(trackUrl);
 
       // Join VC if not already in one
       let connection = getVoiceConnection(interaction.guild.id);
@@ -1073,12 +1084,12 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       const existingPlayer = guildPlayers.get(interaction.guild.id);
       if (existingPlayer) existingPlayer.stop();
 
-      // Create new player and resource (StreamType.Arbitrary → ffmpeg transcodes)
+      // Create new player and resource
       const player = createAudioPlayer({
         behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
       });
-      const resource = createAudioResource(audioStream, {
-        inputType: StreamType.Arbitrary,
+      const resource = createAudioResource(scStream.stream, {
+        inputType: scStream.type,
       });
 
       player.play(resource);
