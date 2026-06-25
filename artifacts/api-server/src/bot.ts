@@ -1058,9 +1058,17 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       const scResults = await playdl.search(scSearchQuery, { source: { soundcloud: "tracks" }, limit: 1 });
       if (!scResults[0]?.url) throw new Error(`Lagu "${scSearchQuery}" tidak ditemukan di SoundCloud`);
 
-      const scTrack = scResults[0] as { name?: string; url: string };
+      const scTrack = scResults[0] as { name?: string; url: string; durationInSec?: number; durationRaw?: string };
       trackTitle = scTrack.name ?? trackTitle;
       const trackUrl = scTrack.url;
+
+      // Format duration MM:SS or HH:MM:SS
+      const durSec = scTrack.durationInSec ?? 0;
+      const durStr = durSec > 0
+        ? (durSec >= 3600
+          ? `${Math.floor(durSec / 3600)}:${String(Math.floor((durSec % 3600) / 60)).padStart(2, "0")}:${String(durSec % 60).padStart(2, "0")}`
+          : `${Math.floor(durSec / 60)}:${String(durSec % 60).padStart(2, "0")}`)
+        : (scTrack.durationRaw ?? "N/A");
 
       logger.info({ trackTitle, trackUrl }, "Resolved SoundCloud track, starting stream");
 
@@ -1113,10 +1121,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         .setTitle("🎵 Sekarang Memutar")
         .setDescription(`**[${trackTitle}](${trackUrl})**`)
         .addFields(
-          { name: "⏹ Stop", value: "Gunakan `/stop` untuk stop musik", inline: true },
-          { name: "🚪 Keluar", value: "Gunakan `/leave-vc` untuk keluar VC", inline: true },
+          { name: "⏱ Durasi", value: durStr, inline: true },
+          { name: "⏹ Stop", value: "`/stop`", inline: true },
+          { name: "🚪 Keluar VC", value: "`/leave-vc`", inline: true },
         )
-        .setFooter({ text: "Porsche-chan Music Player 🎵" })
+        .setFooter({ text: "Porsche-chan Music Player 🎵 • via SoundCloud" })
         .setTimestamp();
 
       await interaction.editReply({ embeds: [embed] });
