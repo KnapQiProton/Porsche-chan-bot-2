@@ -426,32 +426,65 @@ const client = new Client({
 // Music state: satu audio player per guild
 const guildPlayers = new Map<string, ReturnType<typeof createAudioPlayer>>();
 
-// yt-dlp helpers
-function ytDlpStream(url: string): import("stream").Readable {
-  const proc = spawn("yt-dlp", [
-    "-f", "bestaudio",
-    "--no-playlist",
-    "--no-warnings",
-    "-o", "-",
-    url,
-  ]);
-  proc.stderr.on("data", (d: Buffer) => {
-    const msg = d.toString().trim();
-    if (msg) logger.warn({ msg }, "yt-dlp stderr");
-  });
-  proc.on("error", (err) => logger.error({ err }, "yt-dlp spawn error"));
-  if (!proc.stdout) throw new Error("yt-dlp stdout is null");
-  return proc.stdout;
-}
-
-async function ytDlpTitle(url: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("yt-dlp", ["--print", "title", "--no-playlist", "--no-warnings", url]);
+// yt-dlp: get YouTube stream info using the mediaconnect client (works server-side without cookies)
+async function ytGetStreamInfo(input: string): Promise<{
+  streamUrl: string;
+  webpageUrl: string;
+  title: string;
+  durationSec: number;
+} | null> {
+  return new Promise((resolve) => {
+    const proc = spawn("yt-dlp", [
+      "--extractor-args", "youtube:player_client=mediaconnect",
+      "-f", "bestaudio",
+      "--print", "%(title)s\n%(duration)s\n%(webpage_url)s\n%(url)s",
+      "--no-playlist",
+      "--no-warnings",
+      input,
+    ]);
     let out = "";
     proc.stdout.on("data", (d: Buffer) => { out += d.toString(); });
-    proc.on("close", (code) => code === 0 ? resolve(out.trim()) : reject(new Error(`yt-dlp title exit ${code}`)));
-    proc.on("error", reject);
+    proc.stderr.on("data", (d: Buffer) => {
+      const msg = d.toString().trim();
+      if (msg) logger.warn({ msg }, "yt-dlp stderr");
+    });
+    proc.on("close", (code) => {
+      if (code !== 0) { resolve(null); return; }
+      const lines = out.trim().split("\n").filter((l) => l.length > 0);
+      if (lines.length < 4) { resolve(null); return; }
+      const title = lines[0]!;
+      const durationSec = parseInt(lines[1]!, 10) || 0;
+      const webpageUrl = lines[2]!;
+      const streamUrl = lines[lines.length - 1]!;
+      if (!streamUrl.startsWith("http")) { resolve(null); return; }
+      resolve({ title, durationSec, webpageUrl, streamUrl });
+    });
+    proc.on("error", () => resolve(null));
   });
+}
+
+// Stream URL through ffmpeg → raw opus pipe (handles HLS m3u8 and direct audio URLs)
+function ffmpegStreamFrom(url: string): import("stream").Readable {
+  const proc = spawn("ffmpeg", [
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_delay_max", "5",
+    "-i", url,
+    "-vn",
+    "-f", "opus",
+    "-ar", "48000",
+    "-ac", "2",
+    "pipe:1",
+  ]);
+  proc.stderr.on("data", (d: Buffer) => {
+    const msg = d.toString();
+    if (msg.trim() && !msg.includes("frame=") && !msg.includes("size=")) {
+      logger.debug({ msg: msg.trim() }, "ffmpeg");
+    }
+  });
+  proc.on("error", (err) => logger.error({ err }, "ffmpeg spawn error"));
+  if (!proc.stdout) throw new Error("ffmpeg stdout is null");
+  return proc.stdout;
 }
 
 // Deduplication guard: cegah pesan yang sama diproses lebih dari sekali
@@ -1026,54 +1059,74 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         return input;
       }
 
-      // Resolve query to a SoundCloud search term
-      // YouTube is blocked server-side (requires PO token), so we use SoundCloud for audio.
-      // For YouTube/Spotify URLs, we extract the title first, then search SoundCloud.
+      // --- Resolve track: YouTube first, SoundCloud fallback ---
       let trackTitle = query;
-      let scSearchQuery = query;
+      let trackDisplayUrl = "";
+      let durStr = "N/A";
+      let sourceLabel = "YouTube";
+      let audioResource: ReturnType<typeof createAudioResource>;
 
       const normalizedQuery = normalizeYouTubeUrl(query);
       const validated = await playdl.validate(normalizedQuery);
       logger.info({ query, normalizedQuery, validated }, "play-dl validate result");
 
-      if (validated === "yt_video") {
-        // Extract title from YouTube via yt-dlp, then search SoundCloud
-        try {
-          const ytTitle = await ytDlpTitle(normalizedQuery);
-          scSearchQuery = ytTitle;
-          trackTitle = ytTitle;
-          logger.info({ ytTitle }, "Got YouTube title for SoundCloud search");
-        } catch {
-          // Fall back to using URL as search query
-        }
+      // Determine yt-dlp input and SoundCloud fallback search term
+      let ytInput: string;
+      let scFallbackQuery = query;
+
+      if (validated === "yt_video" || validated === "yt_playlist") {
+        ytInput = normalizedQuery;
       } else if (validated === "sp_track") {
         const spotifyInfo = await playdl.spotify(normalizedQuery);
         if (spotifyInfo.type !== "track") throw new Error("Only Spotify tracks are supported");
-        scSearchQuery = `${spotifyInfo.name} ${(spotifyInfo as { artists?: { name: string }[] }).artists?.[0]?.name ?? ""}`.trim();
-        trackTitle = scSearchQuery;
+        scFallbackQuery = `${spotifyInfo.name} ${(spotifyInfo as { artists?: { name: string }[] }).artists?.[0]?.name ?? ""}`.trim();
+        trackTitle = scFallbackQuery;
+        ytInput = `ytsearch1:${scFallbackQuery}`;
+      } else {
+        // Plain text search — try YouTube search first
+        ytInput = `ytsearch1:${query}`;
       }
-      // else: plain text search, use as-is
 
-      // Search SoundCloud (works without cookies/PO tokens)
-      const scResults = await playdl.search(scSearchQuery, { source: { soundcloud: "tracks" }, limit: 1 });
-      if (!scResults[0]?.url) throw new Error(`Lagu "${scSearchQuery}" tidak ditemukan di SoundCloud`);
+      // Attempt 1: YouTube via yt-dlp mediaconnect client
+      logger.info({ ytInput }, "Attempting YouTube stream");
+      const ytInfo = await ytGetStreamInfo(ytInput);
 
-      const scTrack = scResults[0] as { name?: string; url: string; durationInSec?: number; durationRaw?: string };
-      trackTitle = scTrack.name ?? trackTitle;
-      const trackUrl = scTrack.url;
+      if (ytInfo) {
+        trackTitle = ytInfo.title;
+        trackDisplayUrl = ytInfo.webpageUrl;
+        scFallbackQuery = ytInfo.title; // for reference only
+        const ds = ytInfo.durationSec;
+        durStr = ds > 0
+          ? (ds >= 3600
+            ? `${Math.floor(ds / 3600)}:${String(Math.floor((ds % 3600) / 60)).padStart(2, "0")}:${String(ds % 60).padStart(2, "0")}`
+            : `${Math.floor(ds / 60)}:${String(ds % 60).padStart(2, "0")}`)
+          : "N/A";
+        const ytStream = ffmpegStreamFrom(ytInfo.streamUrl);
+        audioResource = createAudioResource(ytStream, { inputType: StreamType.Arbitrary });
+        sourceLabel = "YouTube";
+        logger.info({ trackTitle, durationSec: ytInfo.durationSec }, "Streaming from YouTube");
+      } else {
+        // Attempt 2: SoundCloud fallback
+        logger.info({ scFallbackQuery }, "YouTube failed, falling back to SoundCloud");
+        const scResults = await playdl.search(scFallbackQuery, { source: { soundcloud: "tracks" }, limit: 1 });
+        if (!scResults[0]?.url) throw new Error(`Lagu "${scFallbackQuery}" tidak ditemukan di YouTube maupun SoundCloud`);
 
-      // Format duration MM:SS or HH:MM:SS
-      const durSec = scTrack.durationInSec ?? 0;
-      const durStr = durSec > 0
-        ? (durSec >= 3600
-          ? `${Math.floor(durSec / 3600)}:${String(Math.floor((durSec % 3600) / 60)).padStart(2, "0")}:${String(durSec % 60).padStart(2, "0")}`
-          : `${Math.floor(durSec / 60)}:${String(durSec % 60).padStart(2, "0")}`)
-        : (scTrack.durationRaw ?? "N/A");
+        const scTrack = scResults[0] as { name?: string; url: string; durationInSec?: number; durationRaw?: string };
+        trackTitle = scTrack.name ?? trackTitle;
+        trackDisplayUrl = scTrack.url;
 
-      logger.info({ trackTitle, trackUrl }, "Resolved SoundCloud track, starting stream");
+        const durSec = scTrack.durationInSec ?? 0;
+        durStr = durSec > 0
+          ? (durSec >= 3600
+            ? `${Math.floor(durSec / 3600)}:${String(Math.floor((durSec % 3600) / 60)).padStart(2, "0")}:${String(durSec % 60).padStart(2, "0")}`
+            : `${Math.floor(durSec / 60)}:${String(durSec % 60).padStart(2, "0")}`)
+          : (scTrack.durationRaw ?? "N/A");
 
-      // Stream via play-dl (SoundCloud — no token required)
-      const scStream = await playdl.stream(trackUrl);
+        const scStream = await playdl.stream(scTrack.url);
+        audioResource = createAudioResource(scStream.stream, { inputType: scStream.type });
+        sourceLabel = "SoundCloud";
+        logger.info({ trackTitle, trackUrl: scTrack.url }, "Streaming from SoundCloud");
+      }
 
       // Join VC if not already in one
       let connection = getVoiceConnection(interaction.guild.id);
@@ -1092,15 +1145,12 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       const existingPlayer = guildPlayers.get(interaction.guild.id);
       if (existingPlayer) existingPlayer.stop();
 
-      // Create new player and resource
+      // Create new player
       const player = createAudioPlayer({
         behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
       });
-      const resource = createAudioResource(scStream.stream, {
-        inputType: scStream.type,
-      });
 
-      player.play(resource);
+      player.play(audioResource);
       connection.subscribe(player);
       guildPlayers.set(interaction.guild.id, player);
 
@@ -1114,18 +1164,18 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         logger.info({ trackTitle }, "Track finished playing");
       });
 
-      logger.info({ trackTitle, trackUrl }, "Playing audio");
+      logger.info({ trackTitle, trackDisplayUrl, sourceLabel }, "Playing audio");
 
       const embed = new EmbedBuilder()
-        .setColor(0xf97316)
+        .setColor(sourceLabel === "YouTube" ? 0xff0000 : 0xff5500)
         .setTitle("🎵 Sekarang Memutar")
-        .setDescription(`**[${trackTitle}](${trackUrl})**`)
+        .setDescription(`**[${trackTitle}](${trackDisplayUrl})**`)
         .addFields(
           { name: "⏱ Durasi", value: durStr, inline: true },
           { name: "⏹ Stop", value: "`/stop`", inline: true },
           { name: "🚪 Keluar VC", value: "`/leave-vc`", inline: true },
         )
-        .setFooter({ text: "Porsche-chan Music Player 🎵 • via SoundCloud" })
+        .setFooter({ text: `Porsche-chan Music Player 🎵 • via ${sourceLabel}` })
         .setTimestamp();
 
       await interaction.editReply({ embeds: [embed] });
