@@ -13,6 +13,7 @@ import {
   EmbedBuilder,
   Partials,
   GuildMember,
+  ChannelType,
 } from "discord.js";
 import {
   joinVoiceChannel,
@@ -392,6 +393,16 @@ const COMMANDS = [
     .setDescription("Porsche-chan masuk ke voice channel dan STAY di sana!")
     .toJSON(),
   new SlashCommandBuilder()
+    .setName("stay-vc")
+    .setDescription("Jaga voice channel berdasarkan Channel ID sampai diperintah keluar")
+    .addStringOption((opt) =>
+      opt
+        .setName("channel_id")
+        .setDescription("ID voice channel temporary yang ingin dijaga")
+        .setRequired(true),
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
     .setName("leave-vc")
     .setDescription("Keluarkan Porsche-chan dari voice channel (owner only)")
     .toJSON(),
@@ -425,6 +436,7 @@ const client = new Client({
 
 const guildPlayers = new Map<string, any>();
 const keepDisabledForChannel = new Set<string>();
+const stayChannels = new Map<string, string>();
 
 async function ytGetStreamInfo(input: string): Promise<{ streamUrl: string; webpageUrl: string; title: string; durationSec: number } | null> {
   return new Promise((resolve) => {
@@ -765,6 +777,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
             "`/info` — About Porsche-chan",
             "`/scan` — Analisis gambar pakai AI",
             "`/join-vc` — Join voice channel & STAY",
+            "`/stay-vc <channel_id>` — Jaga VC temporary berdasarkan ID",
             "`/leave-vc` — Leave voice channel (owner only)",
             "`/play` — Putar musik di VC",
             "`/stop` — Stop musik",
@@ -977,6 +990,91 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     }
   }
 
+  // ===== STAY-VC (JAGA VC BERDASARKAN CHANNEL ID) =====
+  if (interaction.commandName === "stay-vc") {
+    if (!interaction.guild) {
+      await interaction.reply({
+        content: "❌ Command ini hanya bisa dipakai di server.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const channelId = interaction.options.getString("channel_id", true).trim();
+    const member = interaction.member as GuildMember | null;
+    const isOwner = interaction.user.id === CREATOR_ID;
+    const isAdmin = member?.permissions?.has("Administrator") ?? false;
+
+    let targetChannel;
+    try {
+      targetChannel = await interaction.guild.channels.fetch(channelId);
+    } catch {
+      targetChannel = null;
+    }
+
+    if (!targetChannel || targetChannel.type !== ChannelType.GuildVoice) {
+      await interaction.reply({
+        content: "❌ Channel ID tidak valid atau channel tersebut bukan voice channel.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (!isOwner && !isAdmin && member?.voice?.channelId !== targetChannel.id) {
+      await interaction.reply({
+        content: "❌ Kamu harus sedang berada di voice channel tersebut untuk memakai `/stay-vc`.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      const existing = getVoiceConnection(interaction.guild.id);
+      if (existing?.joinConfig.channelId === targetChannel.id) {
+        stayChannels.set(interaction.guild.id, targetChannel.id);
+        keepDisabledForChannel.delete(`${interaction.guild.id}:${targetChannel.id}`);
+        await interaction.editReply(
+          `✅ Aku sudah menjaga **${targetChannel.name}** dan akan tetap di sana sampai \`/leave-vc\` digunakan.`,
+        );
+        return;
+      }
+
+      if (existing) {
+        existing.destroy();
+      }
+      guildPlayers.get(interaction.guild.id)?.stop();
+      guildPlayers.delete(interaction.guild.id);
+
+      const connection = joinVoiceChannel({
+        channelId: targetChannel.id,
+        guildId: interaction.guild.id,
+        adapterCreator: interaction.guild.voiceAdapterCreator,
+        selfDeaf: true,
+        selfMute: false,
+      });
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+
+      stayChannels.set(interaction.guild.id, targetChannel.id);
+      keepDisabledForChannel.delete(`${interaction.guild.id}:${targetChannel.id}`);
+      logger.info(
+        { channel: targetChannel.name, channelId: targetChannel.id, guild: interaction.guild.id },
+        "Bot is now staying in requested voice channel",
+      );
+      await interaction.editReply(
+        `✅ Aku masuk ke **${targetChannel.name}** dan akan tetap di sana sampai owner/admin memakai \`/leave-vc\`.`,
+      );
+    } catch (error) {
+      logger.error({ error, channelId, guild: interaction.guild.id }, "Failed to stay in requested voice channel");
+      const failedConnection = getVoiceConnection(interaction.guild.id);
+      failedConnection?.destroy();
+      await interaction.editReply(
+        "❌ Aku tidak bisa masuk ke channel itu. Pastikan ID benar dan bot punya izin **View Channel** serta **Connect**.",
+      );
+    }
+  }
+
   // ===== LEAVE-VC =====
   if (interaction.commandName === "leave-vc") {
     if (!interaction.guild) {
@@ -1010,6 +1108,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     connection.destroy();
     guildPlayers.get(interaction.guild.id)?.stop();
     guildPlayers.delete(interaction.guild.id);
+    stayChannels.delete(interaction.guild.id);
     if (connection.joinConfig.channelId) {
       keepDisabledForChannel.add(`${interaction.guild.id}:${connection.joinConfig.channelId}`);
     }
