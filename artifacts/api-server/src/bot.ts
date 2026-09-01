@@ -437,6 +437,7 @@ const client = new Client({
 const guildPlayers = new Map<string, any>();
 const keepDisabledForChannel = new Set<string>();
 const stayChannels = new Map<string, string>();
+const stayReconnectTimers = new Map<string, NodeJS.Timeout>();
 
 async function ytGetStreamInfo(input: string): Promise<{ streamUrl: string; webpageUrl: string; title: string; durationSec: number } | null> {
   return new Promise((resolve) => {
@@ -977,6 +978,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
 
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      stayChannels.set(interaction.guild.id, voiceChannel.id);
       await interaction.reply({
         content: `✅ Porsche-chan sekarang ada di **${voiceChannel.name}** dan akan STAY di sana! (๑˃ᴗ˂)ﻌ`,
       });
@@ -1256,15 +1258,79 @@ async function autoJoinChannel(channel: any) {
       adapterCreator: guild.voiceAdapterCreator,
     });
     await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+    stayChannels.set(guild.id, channel.id);
     logger.info({ channel: channel.name, guild: guild.id }, "Bot auto-joined VoiceMaster temporary channel");
   } catch (error) {
     logger.error({ error, channel: channel.name }, "Failed to auto-join voice channel");
   }
 }
 
+async function reconnectStayChannel(guildId: string, channelId: string): Promise<void> {
+  if (stayChannels.get(guildId) !== channelId) return;
+
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return;
+
+  let channel;
+  try {
+    channel = await guild.channels.fetch(channelId);
+  } catch (error) {
+    logger.warn({ error, guild: guildId, channelId }, "Could not fetch stay voice channel for reconnect");
+    return;
+  }
+
+  if (!channel || channel.type !== ChannelType.GuildVoice) {
+    logger.warn(
+      { guild: guildId, channelId },
+      "Stay voice channel no longer exists; VoiceMaster may have deleted the temporary channel",
+    );
+    return;
+  }
+
+  const existing = getVoiceConnection(guildId);
+  if (existing?.joinConfig.channelId === channelId) return;
+  existing?.destroy();
+
+  try {
+    const connection = joinVoiceChannel({
+      channelId,
+      guildId,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: true,
+      selfMute: false,
+    });
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    logger.info({ guild: guildId, channel: channel.name, channelId }, "Bot reconnected to stay voice channel");
+  } catch (error) {
+    logger.error({ error, guild: guildId, channelId }, "Failed to reconnect to stay voice channel");
+  }
+}
+
+function scheduleStayReconnect(guildId: string, channelId: string): void {
+  if (stayReconnectTimers.has(guildId)) return;
+
+  const timer = setTimeout(async () => {
+    stayReconnectTimers.delete(guildId);
+    await reconnectStayChannel(guildId, channelId);
+  }, 2_000);
+  stayReconnectTimers.set(guildId, timer);
+}
+
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
-  // Abaikan jika yang berubah adalah bot itu sendiri
-  if (newState.member?.user?.id === client.user?.id) return;
+  // If VoiceMaster disconnects the bot, reconnect while the target channel
+  // still exists. /leave-vc clears stayChannels first, so intentional exits
+  // are never undone by this watchdog.
+  if (newState.member?.user?.id === client.user?.id) {
+    const targetChannelId = stayChannels.get(newState.guild.id);
+    if (targetChannelId && newState.channelId !== targetChannelId) {
+      logger.warn(
+        { guild: newState.guild.id, targetChannelId, actualChannelId: newState.channelId },
+        "Bot left stay voice channel; scheduling reconnect",
+      );
+      scheduleStayReconnect(newState.guild.id, targetChannelId);
+    }
+    return;
+  }
 
   // Cek apakah user masuk ke voice channel (bukan keluar/mute)
   if (!newState.channelId || newState.channelId === oldState.channelId) return;
