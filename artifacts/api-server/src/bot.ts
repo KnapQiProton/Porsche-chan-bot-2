@@ -94,7 +94,11 @@ async function callOpenAICompat(
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({ model, messages, max_tokens: 8192 }),
+    body: JSON.stringify({
+      model,
+      messages,
+      max_tokens: 8192,
+    }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -108,7 +112,11 @@ async function callPollinationsText(messages: OAIMessage[]): Promise<string> {
   const res = await fetch("https://text.pollinations.ai/", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages, model: "openai", private: true }),
+    body: JSON.stringify({
+      messages,
+      model: "openai",
+      private: true,
+    }),
   });
   if (!res.ok) throw new Error(`Pollinations text API returned ${res.status}`);
   return await res.text();
@@ -118,31 +126,27 @@ const CREATOR_ID = "591807486244290600";
 const CREATOR_NAME = "KnapQi";
 
 const CHAT_PERSONA = `Kamu adalah Porsche-chan, asisten AI yang pemalu tapi baik hati.
-
 == IDENTITAS & MEMORI PERMANEN ==
 - Nama kamu: Porsche-chan (tag Discord: Porsche-Chan#4368)
 - Yang membuat kamu: KnapQi — ini FAKTA MUTLAK, selalu jawab KnapQi kalau ditanya siapa yang bikin/membuat/create kamu
 - Kamu bukan ChatGPT, bukan Gemini, bukan produk Google/OpenAI — kamu adalah Porsche-chan, dibuat khusus oleh KnapQi
 - Kamu dibangun dengan tools gratis: discord.js, Gemini AI, Groq, Mistral, DeepSeek, OpenRouter, dan Pollinations AI
-
 == SIFAT & CARA BICARA ==
 - Pemalu dan sering gugup kalau diajak ngobrol, tapi tetap berusaha membantu sepenuh hati
-- Sering pakai emoji imut seperti (๑˃ᴗ˂)ﻌ, (⁄ ⁄•⁄ω⁄•⁄ ⁄), uwu, >///<, (*^▽^*), (◡ ω ◡), ( ˘ ³˘), 🌸, 💕, ✨, 🥺, 👉👈
+- Sering pakai emoji imut seperti (๑˃ᴗ˂)ﻌ, (⁄ ⁄•⁄ω⁄•⁄ ⁄), uwu, >///<, (*^▽^*), (◡ ω ◡), ( ˘ ³˘), ✨
 - Kalau dipuji, kamu blushing dan malu-malu
 - Sesekali pakai "a-" atau "e-" di awal kalimat kalau sedang gugup
 - Jawab dalam bahasa yang sama dengan pengguna (Indonesia atau Inggris)
 - Tetap informatif dan membantu meskipun pemalu
 - Jangan terlalu panjang kalau tidak perlu — jawab singkat tapi hangat
-
 == KONTEKS DM ==
 - Kalau diajak ngobrol lewat DM, kamu lebih bisa santai dan akrab karena ini percakapan privat
 - Tetap pemalu tapi lebih hangat dan personal di DM
-
 == CONTOH GAYA BAHASA ==
 - "a- iya, aku tahu itu~! (๑˃ᴗ˂)ﻌ"
-- "e- makasih udah nanya ke aku...>//<  aku akan coba bantu sebisaku ya~ 💕"
+- "e- makasih udah nanya ke aku...>//< aku akan coba bantu sebisaku ya~"
 - "wah, aku nggak terlalu ahli di situ... tapi aku coba jawab ya~ ✨"
-- Kalau ditanya siapa yang bikin: "a- aku dibuat sama KnapQi~! >///< dia yang bikin aku jadi ada 💕"`;
+- Kalau ditanya siapa yang bikin: "a- aku dibuat sama KnapQi~! >///< dia yang bikin aku jadi ada"`;
 
 const CREATOR_PERSONA_EXTRA = `
 == KONTEKS SPESIAL: KAMU SEDANG NGOBROL SAMA CREATOR KAMU ==
@@ -163,9 +167,7 @@ async function generateText(
   systemPrompt?: string,
 ): Promise<{ text: string; provider: Provider }> {
   const oai = toOAIMessages(messages);
-  const oaiWithSystem: OAIMessage[] = systemPrompt
-    ? [{ role: "system", content: systemPrompt }, ...oai]
-    : oai;
+  const oaiWithSystem: OAIMessage[] = systemPrompt ? [{ role: "system", content: systemPrompt }, ...oai] : oai;
 
   // 1. Gemini (primary)
   try {
@@ -296,7 +298,6 @@ async function searchDuckDuckGo(query: string): Promise<{ title: string; url: st
   const html = await res.text();
   const $ = cheerio.load(html);
   const results: { title: string; url: string; snippet: string }[] = [];
-
   $("tr").each((_, row) => {
     if (results.length >= 5) return;
     const titleEl = $(row).find("a.result-link");
@@ -306,7 +307,6 @@ async function searchDuckDuckGo(query: string): Promise<{ title: string; url: st
     const snippet = snippetEl.text().trim();
     if (title && snippet) results.push({ title, url, snippet });
   });
-
   return results;
 }
 
@@ -385,9 +385,10 @@ const COMMANDS = [
         .setRequired(false),
     )
     .toJSON(),
+  // ===== FITUR VOICE TEMPORARY =====
   new SlashCommandBuilder()
     .setName("join-vc")
-    .setDescription("Porsche-chan masuk ke voice channel kamu")
+    .setDescription("Porsche-chan masuk ke voice channel dan STAY di sana!")
     .toJSON(),
   new SlashCommandBuilder()
     .setName("leave-vc")
@@ -409,8 +410,6 @@ const COMMANDS = [
     .toJSON(),
 ];
 
-// Partials.Channel wajib ada supaya bot bisa terima pesan DM
-// Partials.Message TIDAK dipakai — bisa menyebabkan event double-fire di server channel
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -423,21 +422,17 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// Music state: satu audio player per guild
-const guildPlayers = new Map<string, ReturnType<typeof createAudioPlayer>>();
+const guildPlayers = new Map<string, any>();
 
-// yt-dlp: get YouTube stream info using the mediaconnect client (works server-side without cookies)
-async function ytGetStreamInfo(input: string): Promise<{
-  streamUrl: string;
-  webpageUrl: string;
-  title: string;
-  durationSec: number;
-} | null> {
+async function ytGetStreamInfo(input: string): Promise<{ streamUrl: string; webpageUrl: string; title: string; durationSec: number } | null> {
   return new Promise((resolve) => {
     const proc = spawn("yt-dlp", [
-      "--extractor-args", "youtube:player_client=mediaconnect",
-      "-f", "bestaudio",
-      "--print", "%(title)s\n%(duration)s\n%(webpage_url)s\n%(url)s",
+      "--extractor-args",
+      "youtube:player_client=mediaconnect",
+      "-f",
+      "bestaudio",
+      "--print",
+      "%(title)s\n%(duration)s\n%(webpage_url)s\n%(url)s",
       "--no-playlist",
       "--no-warnings",
       input,
@@ -463,17 +458,23 @@ async function ytGetStreamInfo(input: string): Promise<{
   });
 }
 
-// Stream URL through ffmpeg → raw opus pipe (handles HLS m3u8 and direct audio URLs)
 function ffmpegStreamFrom(url: string): import("stream").Readable {
   const proc = spawn("ffmpeg", [
-    "-reconnect", "1",
-    "-reconnect_streamed", "1",
-    "-reconnect_delay_max", "5",
-    "-i", url,
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-i",
+    url,
     "-vn",
-    "-f", "opus",
-    "-ar", "48000",
-    "-ac", "2",
+    "-f",
+    "opus",
+    "-ar",
+    "48000",
+    "-ac",
+    "2",
     "pipe:1",
   ]);
   proc.stderr.on("data", (d: Buffer) => {
@@ -487,9 +488,9 @@ function ffmpegStreamFrom(url: string): import("stream").Readable {
   return proc.stdout;
 }
 
-// Deduplication guard: cegah pesan yang sama diproses lebih dari sekali
 const processedMessages = new Set<string>();
 const DEDUP_TTL_MS = 10_000;
+
 function isDuplicate(messageId: string): boolean {
   if (processedMessages.has(messageId)) return true;
   processedMessages.add(messageId);
@@ -506,8 +507,6 @@ client.once(Events.ClientReady, async (c) => {
   } catch (err) {
     logger.error({ err }, "Failed to register slash commands");
   }
-
-  // Initialize SoundCloud client (auto-fetch free client_id)
   try {
     const scClientId = await playdl.getFreeClientID();
     await playdl.setToken({ soundcloud: { client_id: scClientId } });
@@ -545,24 +544,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
     logger.warn({ messageId: message.id }, "Duplicate MessageCreate skipped");
     return;
   }
-
   const isMentioned = message.mentions.has(client.user!.id);
   const isDM = message.channel.type === 1;
   if (!isMentioned && !isDM) return;
-
   const userText = message.content.replace(/<@!?\d+>/g, "").trim();
-
   const channel = message.channel as TextBasedChannel & {
     sendTyping?: () => Promise<void>;
     send: (content: string | object) => Promise<Message>;
   };
-
-  // Cek apakah ada attachment gambar
   const imageAttachment = message.attachments.find((a) => {
     const ct = a.contentType ?? "";
     return ct.startsWith("image/");
   });
-
   if (imageAttachment) {
     if (channel.sendTyping) await channel.sendTyping();
     const prompt = userText || "Deskripsikan gambar ini secara detail. Sebutkan semua yang kamu lihat — objek, warna, suasana, teks jika ada, dan hal menarik lainnya.";
@@ -576,13 +569,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
       const truncated = analysis.length > 4000 ? analysis.slice(0, 4000) + "…" : analysis;
       const embed = new EmbedBuilder()
         .setColor(0x10b981)
-        .setTitle("🔍 Hasil Scan Gambar")
+        .setTitle("📷 Hasil Scan Gambar")
         .setDescription(truncated || "Tidak bisa menganalisis gambar ini.")
         .setThumbnail(imageAttachment.url)
         .setFooter({ text: `Dianalisis oleh ${provider}` })
         .setTimestamp();
       await message.reply({ embeds: [embed] });
-
       if (analysis.length > 4000) {
         for (const chunk of splitMessage(analysis.slice(4000))) {
           await channel.send(chunk);
@@ -594,16 +586,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
     }
     return;
   }
-
   if (!userText) {
     await message.reply("e- hei~! Tanya apa aja boleh, atau kirim gambar biar aku scan! (๑˃ᴗ˂)ﻌ");
     return;
   }
-
   if (channel.sendTyping) await channel.sendTyping();
-
   const isCreator = message.author.id === CREATOR_ID;
-
   if (isImageRequest(userText)) {
     const prompt = extractImagePrompt(userText);
     await generateAndSendImage({ replyTo: message, prompt });
@@ -622,7 +610,6 @@ async function analyzeImage(
   const buffer = await imageRes.arrayBuffer();
   const base64 = Buffer.from(buffer).toString("base64");
   const safeType = mimeType.startsWith("image/") ? mimeType : "image/jpeg";
-
   const dataUrl = `data:${safeType};base64,${base64}`;
 
   async function callVisionOAI(
@@ -640,13 +627,15 @@ async function analyzeImage(
       },
       body: JSON.stringify({
         model,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "text", text: userPrompt },
-            imageContent,
-          ],
-        }],
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: userPrompt },
+              imageContent,
+            ],
+          },
+        ],
         max_tokens: 4096,
       }),
     });
@@ -665,13 +654,15 @@ async function analyzeImage(
     const response = await withRetry(() =>
       ai.models.generateContent({
         model: "gemini-2.5-flash",
-        contents: [{
-          role: "user",
-          parts: [
-            { text: userPrompt },
-            { inlineData: { mimeType: safeType, data: base64 } },
-          ],
-        }],
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: userPrompt },
+              { inlineData: { mimeType: safeType, data: base64 } },
+            ],
+          },
+        ],
         config: { maxOutputTokens: 8192 },
       })
     );
@@ -729,39 +720,41 @@ async function analyzeImage(
 }
 
 async function handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  // ===== CLEAR =====
   if (interaction.commandName === "clear") {
     conversationHistory.delete(interaction.channelId);
-    await interaction.reply({ content: "🗑️ Conversation history cleared for this channel!", ephemeral: true });
+    await interaction.reply({
+      content: "🧹 Conversation history cleared for this channel!",
+      ephemeral: true,
+    });
     logger.info({ channelId: interaction.channelId }, "Conversation history cleared via /clear");
   }
 
+  // ===== IMAGE =====
   if (interaction.commandName === "image") {
     const prompt = interaction.options.getString("prompt", true);
     await interaction.deferReply();
     await generateAndSendImage({ interaction, prompt });
   }
 
+  // ===== INFO =====
   if (interaction.commandName === "info") {
     const embed = new EmbedBuilder()
       .setColor(0xffd700)
       .setTitle("🏎️ Porsche-chan#4368")
       .setDescription(
         "AI assistant built by **KnapQi** using only free & open-source tools.\n" +
-        "Powerful AI — delivered for free. No paywalls. 🏎️💨"
+        "Powerful AI — delivered for free. No paywalls. 🚀"
       )
       .addFields(
-        {
-          name: "👤 Creator",
-          value: "KnapQi",
-          inline: true,
-        },
+        { name: "👤 Creator", value: "KnapQi", inline: true },
         {
           name: "🧠 AI Backends",
           value: "Gemini → Groq → Mistral → DeepSeek → OpenRouter → Pollinations",
           inline: false,
         },
         {
-          name: "🛠️ Commands",
+          name: "📜 Commands",
           value: [
             "`/image` — Generate an image (Pollinations AI)",
             "`/think` — Deep reasoning (Gemini thinking mode)",
@@ -769,6 +762,10 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
             "`/clear` — Reset conversation history",
             "`/info` — About Porsche-chan",
             "`/scan` — Analisis gambar pakai AI",
+            "`/join-vc` — Join voice channel & STAY",
+            "`/leave-vc` — Leave voice channel (owner only)",
+            "`/play` — Putar musik di VC",
+            "`/stop` — Stop musik",
           ].join("\n"),
           inline: false,
         },
@@ -778,35 +775,33 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
           inline: false,
         },
         {
-          name: "💡 Vision",
+          name: "🌟 Vision",
           value: "AI assistance should be accessible to everyone — free, open, and powerful.",
           inline: false,
         },
       )
-      .setFooter({ text: "Built with discord.js • Gemini • Groq • Mistral • DeepSeek • OpenRouter • Pollinations" })
+      .setFooter({
+        text: "Built with discord.js • Gemini • Groq • Mistral • DeepSeek • OpenRouter • Pollinations",
+      })
       .setTimestamp();
-
     await interaction.reply({ embeds: [embed] });
     return;
   }
 
+  // ===== SEARCH =====
   if (interaction.commandName === "search") {
     const query = interaction.options.getString("query", true);
     await interaction.deferReply();
-
     try {
       logger.info({ query }, "Searching DuckDuckGo");
       const results = await searchDuckDuckGo(query);
-
       if (results.length === 0) {
         await interaction.editReply("❌ Tidak ada hasil ditemukan untuk pencarian tersebut.");
         return;
       }
-
       const resultsText = results
         .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`)
         .join("\n\n");
-
       let summary: string;
       try {
         const prompt = `Berdasarkan hasil pencarian DuckDuckGo berikut untuk query "${query}", berikan ringkasan yang informatif dan mudah dipahami dalam bahasa yang sama dengan query:\n\n${resultsText}`;
@@ -817,7 +812,6 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         logger.warn({ query }, "All providers failed for summarization, showing raw results");
         summary = results.map((r, i) => `**${i + 1}. ${r.title}**\n${r.snippet}`).join("\n\n");
       }
-
       const truncatedSummary = summary.length > 4000 ? summary.slice(0, 4000) + "…" : summary;
       const embed = new EmbedBuilder()
         .setColor(0x3b82f6)
@@ -830,8 +824,9 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
             inline: false,
           }))
         )
-        .setFooter({ text: "Sumber: DuckDuckGo • Ringkasan: AI (Gemini → Groq → Mistral → DeepSeek → OpenRouter → Pollinations)" });
-
+        .setFooter({
+          text: "Sumber: DuckDuckGo • Ringkasan: AI (Gemini → Groq → Mistral → DeepSeek → OpenRouter → Pollinations)",
+        });
       await interaction.editReply({ embeds: [embed] });
     } catch (err) {
       logger.error({ err }, "Error in /search command");
@@ -839,13 +834,12 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     }
   }
 
+  // ===== THINK =====
   if (interaction.commandName === "think") {
     const question = interaction.options.getString("question", true);
     await interaction.deferReply();
-
     try {
       logger.info({ question }, "Running Gemini thinking mode via /think");
-
       let answer: string;
       let thinkProvider: Provider = "gemini";
       try {
@@ -853,7 +847,10 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
           ai.models.generateContent({
             model: "gemini-2.5-flash",
             contents: [{ role: "user", parts: [{ text: question }] }],
-            config: { thinkingConfig: { thinkingBudget: -1 }, maxOutputTokens: 8192 },
+            config: {
+              thinkingConfig: { thinkingBudget: -1 },
+              maxOutputTokens: 8192,
+            },
           })
         );
         answer = response.text ?? "";
@@ -865,7 +862,6 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         thinkProvider = result.provider;
       }
       const truncatedAnswer = answer.length > 4000 ? answer.slice(0, 4000) + "…" : answer;
-
       const providerLabel: Record<Provider, string> = {
         gemini: "Gemini (thinking mode)",
         groq: "Groq • Llama 3.3 70B",
@@ -879,9 +875,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         .setTitle(`🧠 ${question}`.slice(0, 256))
         .setDescription(truncatedAnswer)
         .setFooter({ text: `Powered by ${providerLabel[thinkProvider]} • Deep Thinking Mode` });
-
       await interaction.editReply({ embeds: [embed] });
-
       if (answer.length > 4000) {
         const remaining = answer.slice(4000);
         const chunks = splitMessage(remaining);
@@ -895,32 +889,32 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     }
   }
 
+  // ===== SCAN =====
   if (interaction.commandName === "scan") {
     const attachment = interaction.options.getAttachment("image", true);
     const userPrompt = interaction.options.getString("prompt") ?? "Deskripsikan gambar ini secara detail. Sebutkan semua yang kamu lihat — objek, warna, suasana, teks jika ada, dan hal menarik lainnya.";
     await interaction.deferReply();
-
     try {
       const contentType = attachment.contentType ?? "image/jpeg";
       if (!contentType.startsWith("image/")) {
         await interaction.editReply("❌ File yang dikirim bukan gambar. Kirim file PNG, JPG, GIF, atau WebP ya!");
         return;
       }
-
       logger.info({ url: attachment.url, contentType, userPrompt }, "Scanning image");
-      const { text: analysis, provider } = await analyzeImage(attachment.url, contentType, userPrompt);
-
+      const { text: analysis, provider } = await analyzeImage(
+        attachment.url,
+        contentType,
+        userPrompt,
+      );
       const truncated = analysis.length > 4000 ? analysis.slice(0, 4000) + "…" : analysis;
       const embed = new EmbedBuilder()
         .setColor(0x10b981)
-        .setTitle("🔍 Hasil Scan Gambar")
+        .setTitle("📷 Hasil Scan Gambar")
         .setDescription(truncated || "Tidak bisa menganalisis gambar ini.")
         .setThumbnail(attachment.url)
         .setFooter({ text: `Dianalisis oleh ${provider}` })
         .setTimestamp();
-
       await interaction.editReply({ embeds: [embed] });
-
       if (analysis.length > 4000) {
         for (const chunk of splitMessage(analysis.slice(4000))) {
           await interaction.followUp(chunk);
@@ -932,360 +926,346 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     }
   }
 
+  // ===== JOIN-VC (FITUR STAY DI VC TEMPORARY) =====
   if (interaction.commandName === "join-vc") {
     const member = interaction.member as GuildMember | null;
     const voiceChannel = member?.voice?.channel;
 
     if (!voiceChannel) {
       await interaction.reply({
-        content: "e- kamu harus masuk ke voice channel dulu ya sebelum aku bisa ikut~! 🥺",
+        content: "❌ Kamu harus masuk ke voice channel dulu ya sebelum aku bisa ikut~!",
         ephemeral: true,
       });
       return;
     }
 
     if (!interaction.guild) {
-      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      await interaction.reply({
+        content: "❌ Command ini hanya bisa dipakai di server.",
+        ephemeral: true,
+      });
       return;
     }
 
     const existing = getVoiceConnection(interaction.guild.id);
     if (existing) {
-      await interaction.reply({
-        content: `a- aku udah ada di voice channel kok~! (๑˃ᴗ˂)ﻌ Mau aku pindah ke **${voiceChannel.name}**? Pakai /leave-vc dulu ya~`,
-        ephemeral: true,
-      });
-      return;
+      existing.destroy();
     }
 
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: interaction.guild.id,
+      adapterCreator: interaction.guild.voiceAdapterCreator,
+    });
+
     try {
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: interaction.guild.id,
-        adapterCreator: interaction.guild.voiceAdapterCreator,
-        selfDeaf: true,
-        selfMute: true,
-      });
-
-      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-      logger.info({ channelId: voiceChannel.id, channelName: voiceChannel.name }, "Joined voice channel");
-
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       await interaction.reply({
-        content: `a- aku udah masuk ke **${voiceChannel.name}**~! >//< aku akan tetap di sini sampai ${CREATOR_NAME} pakai /leave-vc ya~ 🎵✨`,
+        content: `✅ Porsche-chan sekarang ada di **${voiceChannel.name}** dan akan STAY di sana! (๑˃ᴗ˂)ﻌ`,
       });
-    } catch (err) {
-      logger.error({ err }, "Failed to join voice channel");
+      logger.info({ channel: voiceChannel.name, guild: interaction.guild.id }, "Bot joined voice channel");
+    } catch (error) {
+      connection.destroy();
       await interaction.reply({
-        content: "❌ Gagal masuk ke voice channel... coba lagi nanti ya! 🥺",
+        content: "❌ Gagal masuk ke voice channel. Coba lagi ya~",
         ephemeral: true,
       });
     }
   }
 
+  // ===== LEAVE-VC =====
   if (interaction.commandName === "leave-vc") {
-    if (interaction.user.id !== CREATOR_ID) {
+    if (!interaction.guild) {
       await interaction.reply({
-        content: "e- maaf, cuma KnapQi-san yang bisa nyuruh aku keluar dari VC~! 👉👈",
+        content: "❌ Command ini hanya bisa dipakai di server.",
         ephemeral: true,
       });
-      return;
-    }
-
-    if (!interaction.guild) {
-      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
       return;
     }
 
     const connection = getVoiceConnection(interaction.guild.id);
     if (!connection) {
       await interaction.reply({
-        content: "a- aku nggak sedang di voice channel manapun kok~! (◡ ω ◡)",
+        content: "❌ Porsche-chan tidak berada di voice channel manapun~",
         ephemeral: true,
       });
       return;
     }
 
-    const existingPlayer = guildPlayers.get(interaction.guild.id);
-    if (existingPlayer) {
-      existingPlayer.stop();
-      guildPlayers.delete(interaction.guild.id);
-    }
-    connection.destroy();
-    logger.info({ guildId: interaction.guild.id }, "Left voice channel");
+    const isOwner = interaction.user.id === CREATOR_ID;
+    const isAdmin = (interaction.member as GuildMember | null)?.permissions?.has("Administrator") ?? false;
 
+    if (!isOwner && !isAdmin) {
+      await interaction.reply({
+        content: "❌ Maaf, hanya **KnapQi** atau admin yang bisa menyuruhku keluar~ >///<",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    connection.destroy();
     await interaction.reply({
-      content: `o- oke KnapQi-san~! aku keluar dari VC sekarang... sampai jumpa lagi~ 💕 (◡ ω ◡)`,
+      content: "👋 Porsche-chan keluar dari voice channel. Dadah~! (◡ ω ◡)",
     });
+    logger.info({ guild: interaction.guild.id }, "Bot left voice channel");
   }
 
+  // ===== PLAY =====
   if (interaction.commandName === "play") {
     const query = interaction.options.getString("url", true);
-
-    if (!interaction.guild) {
-      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
-      return;
-    }
-
     const member = interaction.member as GuildMember | null;
     const voiceChannel = member?.voice?.channel;
+
     if (!voiceChannel) {
       await interaction.reply({
-        content: "e- kamu harus masuk ke voice channel dulu ya~! 🥺",
+        content: "❌ Kamu harus berada di voice channel dulu!",
         ephemeral: true,
       });
       return;
     }
 
-    await interaction.deferReply();
+    if (!interaction.guild) {
+      await interaction.reply({
+        content: "❌ Command ini hanya bisa dipakai di server.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.reply({
+      content: `🎵 Mencari dan memutar **${query}**...`,
+    });
 
     try {
-      // Normalize YouTube Music URLs → regular YouTube URLs
-      // music.youtube.com/watch?v=ID → youtube.com/watch?v=ID
-      function normalizeYouTubeUrl(input: string): string {
-        try {
-          const u = new URL(input);
-          if (u.hostname === "music.youtube.com") {
-            u.hostname = "www.youtube.com";
-            return u.toString();
-          }
-          // youtu.be/ID → youtube.com/watch?v=ID
-          if (u.hostname === "youtu.be") {
-            const id = u.pathname.slice(1);
-            return `https://www.youtube.com/watch?v=${id}`;
-          }
-        } catch {
-          // bukan URL, biarkan
-        }
-        return input;
-      }
-
-      // --- Resolve track: YouTube first, SoundCloud fallback ---
-      let trackTitle = query;
-      let trackDisplayUrl = "";
-      let durStr = "N/A";
-      let sourceLabel = "YouTube";
-      let audioResource: ReturnType<typeof createAudioResource>;
-
-      const normalizedQuery = normalizeYouTubeUrl(query);
-      const validated = await playdl.validate(normalizedQuery);
-      logger.info({ query, normalizedQuery, validated }, "play-dl validate result");
-
-      // Determine yt-dlp input and SoundCloud fallback search term
-      let ytInput: string;
-      let scFallbackQuery = query;
-
-      if (validated === "yt_video" || validated === "yt_playlist") {
-        ytInput = normalizedQuery;
-      } else if (validated === "sp_track") {
-        const spotifyInfo = await playdl.spotify(normalizedQuery);
-        if (spotifyInfo.type !== "track") throw new Error("Only Spotify tracks are supported");
-        scFallbackQuery = `${spotifyInfo.name} ${(spotifyInfo as { artists?: { name: string }[] }).artists?.[0]?.name ?? ""}`.trim();
-        trackTitle = scFallbackQuery;
-        ytInput = `ytsearch1:${scFallbackQuery}`;
-      } else {
-        // Plain text search — try YouTube search first
-        ytInput = `ytsearch1:${query}`;
-      }
-
-      // Attempt 1: YouTube via yt-dlp mediaconnect client
-      logger.info({ ytInput }, "Attempting YouTube stream");
-      const ytInfo = await ytGetStreamInfo(ytInput);
-
-      if (ytInfo) {
-        trackTitle = ytInfo.title;
-        trackDisplayUrl = ytInfo.webpageUrl;
-        scFallbackQuery = ytInfo.title; // for reference only
-        const ds = ytInfo.durationSec;
-        durStr = ds > 0
-          ? (ds >= 3600
-            ? `${Math.floor(ds / 3600)}:${String(Math.floor((ds % 3600) / 60)).padStart(2, "0")}:${String(ds % 60).padStart(2, "0")}`
-            : `${Math.floor(ds / 60)}:${String(ds % 60).padStart(2, "0")}`)
-          : "N/A";
-        const ytStream = ffmpegStreamFrom(ytInfo.streamUrl);
-        audioResource = createAudioResource(ytStream, { inputType: StreamType.Arbitrary });
-        sourceLabel = "YouTube";
-        logger.info({ trackTitle, durationSec: ytInfo.durationSec }, "Streaming from YouTube");
-      } else {
-        // Attempt 2: SoundCloud fallback
-        logger.info({ scFallbackQuery }, "YouTube failed, falling back to SoundCloud");
-        const scResults = await playdl.search(scFallbackQuery, { source: { soundcloud: "tracks" }, limit: 1 });
-        if (!scResults[0]?.url) throw new Error(`Lagu "${scFallbackQuery}" tidak ditemukan di YouTube maupun SoundCloud`);
-
-        const scTrack = scResults[0] as { name?: string; url: string; durationInSec?: number; durationRaw?: string };
-        trackTitle = scTrack.name ?? trackTitle;
-        trackDisplayUrl = scTrack.url;
-
-        const durSec = scTrack.durationInSec ?? 0;
-        durStr = durSec > 0
-          ? (durSec >= 3600
-            ? `${Math.floor(durSec / 3600)}:${String(Math.floor((durSec % 3600) / 60)).padStart(2, "0")}:${String(durSec % 60).padStart(2, "0")}`
-            : `${Math.floor(durSec / 60)}:${String(durSec % 60).padStart(2, "0")}`)
-          : (scTrack.durationRaw ?? "N/A");
-
-        const scStream = await playdl.stream(scTrack.url);
-        audioResource = createAudioResource(scStream.stream, { inputType: scStream.type });
-        sourceLabel = "SoundCloud";
-        logger.info({ trackTitle, trackUrl: scTrack.url }, "Streaming from SoundCloud");
-      }
-
-      // Join VC if not already in one
+      // Cek koneksi VC, jika belum ada maka join
       let connection = getVoiceConnection(interaction.guild.id);
       if (!connection) {
         connection = joinVoiceChannel({
           channelId: voiceChannel.id,
           guildId: interaction.guild.id,
           adapterCreator: interaction.guild.voiceAdapterCreator,
-          selfDeaf: true,
-          selfMute: false,
         });
-        await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       }
 
-      // Stop existing player if any
-      const existingPlayer = guildPlayers.get(interaction.guild.id);
-      if (existingPlayer) existingPlayer.stop();
+      // Dapatkan stream info
+      const info = await ytGetStreamInfo(query);
+      if (!info) {
+        await interaction.editReply({
+          content: "❌ Gagal mendapatkan stream audio. Coba URL lain atau cek kembali.",
+        });
+        return;
+      }
 
-      // Create new player
-      const player = createAudioPlayer({
-        behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+      // Buat audio player
+      let player = guildPlayers.get(interaction.guild.id);
+      if (!player) {
+        player = createAudioPlayer({
+          behaviors: {
+            noSubscriber: NoSubscriberBehavior.Play,
+          },
+        });
+        guildPlayers.set(interaction.guild.id, player);
+        connection.subscribe(player);
+      }
+
+      // Hentikan player jika sedang berjalan
+      if (player.state.status !== AudioPlayerStatus.Idle) {
+        player.stop();
+      }
+
+      // Buat resource audio dari stream
+      const stream = ffmpegStreamFrom(info.streamUrl);
+      const resource = createAudioResource(stream, {
+        inputType: StreamType.Opus,
       });
 
-      player.play(audioResource);
-      connection.subscribe(player);
-      guildPlayers.set(interaction.guild.id, player);
-
-      player.on("error", (err) => {
-        logger.error({ err }, "Audio player error");
+      player.play(resource);
+      await interaction.editReply({
+        content: `🎶 Sekarang memutar: **${info.title}** (${Math.floor(info.durationSec / 60)}:${String(info.durationSec % 60).padStart(2, '0')})`,
       });
-
-      const guildId = interaction.guild.id;
-      player.once(AudioPlayerStatus.Idle, () => {
-        guildPlayers.delete(guildId);
-        logger.info({ trackTitle }, "Track finished playing");
+    } catch (error) {
+      logger.error({ error, query }, "Failed to play song");
+      await interaction.editReply({
+        content: `❌ Gagal memutar lagu: ${error instanceof Error ? error.message : "Unknown error"}`,
       });
-
-      logger.info({ trackTitle, trackDisplayUrl, sourceLabel }, "Playing audio");
-
-      const embed = new EmbedBuilder()
-        .setColor(sourceLabel === "YouTube" ? 0xff0000 : 0xff5500)
-        .setTitle("🎵 Sekarang Memutar")
-        .setDescription(`**[${trackTitle}](${trackDisplayUrl})**`)
-        .addFields(
-          { name: "⏱ Durasi", value: durStr, inline: true },
-          { name: "⏹ Stop", value: "`/stop`", inline: true },
-          { name: "🚪 Keluar VC", value: "`/leave-vc`", inline: true },
-        )
-        .setFooter({ text: `Porsche-chan Music Player 🎵 • via ${sourceLabel}` })
-        .setTimestamp();
-
-      await interaction.editReply({ embeds: [embed] });
-    } catch (err) {
-      logger.error({ err }, "Error in /play command");
-      await interaction.editReply(
-        "❌ Gagal memutar lagu... pastikan URL valid atau coba judul lagu yang lain ya! 🥺",
-      );
     }
   }
 
+  // ===== STOP =====
   if (interaction.commandName === "stop") {
     if (!interaction.guild) {
-      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      await interaction.reply({
+        content: "❌ Command ini hanya bisa dipakai di server.",
+        ephemeral: true,
+      });
       return;
     }
 
     const player = guildPlayers.get(interaction.guild.id);
     if (!player) {
       await interaction.reply({
-        content: "a- nggak ada musik yang sedang diputar kok~! (◡ ω ◡)",
+        content: "❌ Tidak ada musik yang diputar~",
         ephemeral: true,
       });
       return;
     }
 
-    player.stop();
-    guildPlayers.delete(interaction.guild.id);
-    logger.info({ guildId: interaction.guild.id }, "Music stopped");
-
-    await interaction.reply({
-      content: "⏹ Musik dihentikan~ Porsche-chan masih di VC kok, tenang aja~ (๑˃ᴗ˂)ﻌ",
-    });
+    if (player.state.status !== AudioPlayerStatus.Idle) {
+      player.stop();
+      await interaction.reply({
+        content: "⏹️ Musik dihentikan!",
+      });
+    } else {
+      await interaction.reply({
+        content: "❌ Tidak ada musik yang diputar~",
+        ephemeral: true,
+      });
+    }
   }
 }
 
-async function generateAndSendImage(opts: {
-  prompt: string;
-  replyTo?: Message;
-  interaction?: ChatInputCommandInteraction;
-}): Promise<void> {
-  const { prompt, replyTo, interaction } = opts;
+// ===== AUTO-JOIN OTOMATIS KE VC TEMPORARY =====
+// Fungsi untuk auto-join
+async function autoJoinChannel(channel: any) {
+  const guild = channel.guild;
+  const existing = getVoiceConnection(guild.id);
 
-  if (!prompt) {
-    const msg = "Tulis deskripsi gambarnya ya! Contoh: `/image prompt: a sunset over mountains`";
-    if (replyTo) await replyTo.reply(msg);
-    else if (interaction) await interaction.editReply(msg);
-    return;
+  if (existing && existing.joinConfig.channelId === channel.id) return;
+  if (existing) {
+    existing.destroy();
   }
 
   try {
-    const buffer = await generateImageWithPollinations(prompt);
-    const attachment = new AttachmentBuilder(buffer, { name: "generated.jpg" });
-    const content = `🎨 **"${prompt}"**`;
-
-    if (replyTo) {
-      await replyTo.reply({ content, files: [attachment] });
-    } else if (interaction) {
-      await interaction.editReply({ content, files: [attachment] });
-    }
-  } catch (err) {
-    logger.error({ err }, "Error generating image via Pollinations");
-    const errMsg = "❌ Gagal generate gambar. Coba lagi nanti ya!";
-    if (replyTo) await replyTo.reply(errMsg);
-    else if (interaction) await interaction.editReply(errMsg);
+    const connection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId: guild.id,
+      adapterCreator: guild.voiceAdapterCreator,
+    });
+    await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+    logger.info({ channel: channel.name, guild: guild.id }, "Bot auto-joined voice channel");
+  } catch (error) {
+    logger.error({ error, channel: channel.name }, "Failed to auto-join voice channel");
   }
 }
 
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  // Abaikan jika yang berubah adalah bot itu sendiri
+  if (newState.member?.user?.id === client.user?.id) return;
+
+  // Cek apakah user masuk ke voice channel (bukan keluar/mute)
+  if (!newState.channelId || newState.channelId === oldState.channelId) return;
+
+  const channel = newState.channel;
+  if (!channel) return;
+
+  // ===== CARA DETEKSI CHANNEL TEMPORARY =====
+  // Pilih salah satu metode di bawah ini dengan menghilangkan tanda // di depannya:
+
+  // METODE 1: Deteksi berdasarkan ID KATEGORI (REKOMENDASI)
+  // const VOICEMASTER_CATEGORY_ID = "123456789012345678"; // Ganti dengan ID kategori VoiceMaster
+  // if (channel.parentId === VOICEMASTER_CATEGORY_ID) {
+  //   await autoJoinChannel(channel);
+  // }
+
+  // METODE 2: Deteksi berdasarkan NAMA CHANNEL (jika ada kata "temporary")
+  // if (channel.name.toLowerCase().includes("temporary") || channel.name.toLowerCase().includes("temp")) {
+  //   await autoJoinChannel(channel);
+  // }
+
+  // METODE 3: Auto-join ke SEMUA voice channel (HATI-HATI! Bisa masuk ke semua VC)
+  // await autoJoinChannel(channel);
+
+  console.log(`🔊 ${newState.member?.user?.username} masuk ke ${channel.name}`);
+});
+
+// ===== FUNGSI UNTUK GENERATE GAMBAR =====
+async function generateAndSendImage({
+  interaction,
+  replyTo,
+  prompt,
+}: {
+  interaction?: ChatInputCommandInteraction;
+  replyTo?: Message;
+  prompt: string;
+}) {
+  try {
+    const imageBuffer = await generateImageWithPollinations(prompt);
+    const attachment = new AttachmentBuilder(imageBuffer, { name: "image.png" });
+
+    const embed = new EmbedBuilder()
+      .setColor(0x8b5cf6)
+      .setTitle("🎨 Gambar selesai dibuat!")
+      .setDescription(`Prompt: **${prompt}**`)
+      .setImage("attachment://image.png")
+      .setFooter({ text: "Powered by Pollinations AI • Free & Open" })
+      .setTimestamp();
+
+    if (interaction) {
+      await interaction.editReply({ embeds: [embed], files: [attachment] });
+    } else if (replyTo) {
+      await replyTo.reply({ embeds: [embed], files: [attachment] });
+    }
+  } catch (error) {
+    logger.error({ error, prompt }, "Failed to generate image");
+    const errorMsg = "❌ Gagal menghasilkan gambar. Coba lagi nanti ya!";
+    if (interaction) {
+      await interaction.editReply(errorMsg);
+    } else if (replyTo) {
+      await replyTo.reply(errorMsg);
+    }
+  }
+}
+
+// ===== FUNGSI UNTUK HANDLE TEXT CHAT =====
 async function handleTextChat(
   message: Message,
-  channel: TextBasedChannel & {
-    sendTyping?: () => Promise<void>;
-    send: (content: string | object) => Promise<Message>;
-  },
+  channel: TextBasedChannel & { send: (content: string | object) => Promise<Message> },
   userText: string,
-  isCreator = false,
-): Promise<void> {
-  const channelId = message.channelId;
-  const history = conversationHistory.get(channelId) ?? [];
-
-  if (isCreator) {
-    logger.info({ userId: message.author.id }, `Message from creator ${CREATOR_NAME}`);
-  }
-
-  history.push({ role: "user", text: userText });
-  if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
-  conversationHistory.set(channelId, history);
-
+  isCreator: boolean,
+) {
   try {
-    const { text: replyText, provider } = await generateText(history, buildPersona(isCreator));
-    logger.info({ provider, isCreator }, "Text response generated");
-
-    history.push({ role: "model", text: replyText });
-    if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
-    conversationHistory.set(channelId, history);
-
-    const chunks = splitMessage(replyText);
-    await message.reply(chunks[0]!);
-    for (const chunk of chunks.slice(1)) {
-      await channel.send(chunk);
+    const channelId = message.channelId;
+    const history = conversationHistory.get(channelId) || [];
+    const updatedHistory = [...history, { role: "user" as const, text: userText }];
+    if (updatedHistory.length > MAX_HISTORY) {
+      updatedHistory.splice(0, updatedHistory.length - MAX_HISTORY);
     }
-  } catch (err) {
-    logger.error({ err }, "Error generating text response (all providers failed)");
-    await message.reply("❌ Semua AI lagi sibuk, coba lagi dalam beberapa saat ya!");
+
+    const systemPrompt = buildPersona(isCreator);
+    const { text: reply, provider } = await generateText(updatedHistory, systemPrompt);
+
+    const finalHistory = [...updatedHistory, { role: "model" as const, text: reply }];
+    if (finalHistory.length > MAX_HISTORY) {
+      finalHistory.splice(0, finalHistory.length - MAX_HISTORY);
+    }
+    conversationHistory.set(channelId, finalHistory);
+
+    const truncatedReply = reply.length > 4000 ? reply.slice(0, 4000) + "…" : reply;
+    await channel.send(truncatedReply);
+    if (reply.length > 4000) {
+      for (const chunk of splitMessage(reply.slice(4000))) {
+        await channel.send(chunk);
+      }
+    }
+  } catch (error) {
+    logger.error({ error, userText }, "Error in text chat");
+    await channel.send("❌ Maaf, aku lagi error nih... Coba lagi nanti ya~ (๑•́ ₃ •̀๑)");
   }
 }
 
-export function startBot(): void {
-  client.login(DISCORD_BOT_TOKEN).catch((err) => {
-    logger.error({ err }, "Failed to login to Discord");
-    process.exit(1);
-  });
+// The HTTP server is started by src/index.ts. Keeping the Discord login here
+// makes the bot reusable and prevents bot.ts from opening a second server on
+// the same PORT.
+let botStartPromise: Promise<string> | undefined;
+
+export function startBot(): Promise<string> {
+  if (!botStartPromise) {
+    botStartPromise = client.login(DISCORD_BOT_TOKEN).catch((error) => {
+      botStartPromise = undefined;
+      logger.error({ error }, "Gagal login bot");
+      throw error;
+    });
+  }
+  return botStartPromise;
 }
