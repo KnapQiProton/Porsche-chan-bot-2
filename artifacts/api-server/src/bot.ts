@@ -37,6 +37,7 @@ const GROQ_API_KEY = process.env["GROQ_API_KEY"];
 const MISTRAL_API_KEY = process.env["MISTRAL_API_KEY"];
 const DEEPSEEK_API_KEY = process.env["DEEPSEEK_API_KEY"];
 const OPENROUTER_API_KEY = process.env["OPENROUTER_API_KEY"];
+const VOICEMASTER_CATEGORY_ID = process.env["VOICEMASTER_CATEGORY_ID"]?.trim();
 
 if (!GEMINI_API_KEY) {
   throw new Error("GEMINI_API_KEY environment variable is required.");
@@ -423,6 +424,7 @@ const client = new Client({
 });
 
 const guildPlayers = new Map<string, any>();
+const keepDisabledForChannel = new Set<string>();
 
 async function ytGetStreamInfo(input: string): Promise<{ streamUrl: string; webpageUrl: string; title: string; durationSec: number } | null> {
   return new Promise((resolve) => {
@@ -947,6 +949,8 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       return;
     }
 
+    keepDisabledForChannel.delete(`${interaction.guild.id}:${voiceChannel.id}`);
+
     const existing = getVoiceConnection(interaction.guild.id);
     if (existing) {
       existing.destroy();
@@ -1004,6 +1008,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     }
 
     connection.destroy();
+    guildPlayers.get(interaction.guild.id)?.stop();
+    guildPlayers.delete(interaction.guild.id);
+    if (connection.joinConfig.channelId) {
+      keepDisabledForChannel.add(`${interaction.guild.id}:${connection.joinConfig.channelId}`);
+    }
     await interaction.reply({
       content: "👋 Porsche-chan keluar dari voice channel. Dadah~! (◡ ω ◡)",
     });
@@ -1126,14 +1135,19 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
 }
 
 // ===== AUTO-JOIN OTOMATIS KE VC TEMPORARY =====
-// Fungsi untuk auto-join
+// VoiceMaster temporary channels are identified by their category ID.
+// The bot intentionally does not join every VC in the server.
 async function autoJoinChannel(channel: any) {
   const guild = channel.guild;
   const existing = getVoiceConnection(guild.id);
 
   if (existing && existing.joinConfig.channelId === channel.id) return;
   if (existing) {
-    existing.destroy();
+    logger.info(
+      { currentChannelId: existing.joinConfig.channelId, requestedChannelId: channel.id, guild: guild.id },
+      "Already connected to another voice channel; keeping current connection",
+    );
+    return;
   }
 
   try {
@@ -1143,7 +1157,7 @@ async function autoJoinChannel(channel: any) {
       adapterCreator: guild.voiceAdapterCreator,
     });
     await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-    logger.info({ channel: channel.name, guild: guild.id }, "Bot auto-joined voice channel");
+    logger.info({ channel: channel.name, guild: guild.id }, "Bot auto-joined VoiceMaster temporary channel");
   } catch (error) {
     logger.error({ error, channel: channel.name }, "Failed to auto-join voice channel");
   }
@@ -1159,24 +1173,21 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const channel = newState.channel;
   if (!channel) return;
 
-  // ===== CARA DETEKSI CHANNEL TEMPORARY =====
-  // Pilih salah satu metode di bawah ini dengan menghilangkan tanda // di depannya:
+  if (!VOICEMASTER_CATEGORY_ID) {
+    logger.warn("VOICEMASTER_CATEGORY_ID is not configured; automatic VoiceMaster keep mode is disabled");
+    return;
+  }
 
-  // METODE 1: Deteksi berdasarkan ID KATEGORI (REKOMENDASI)
-  // const VOICEMASTER_CATEGORY_ID = "123456789012345678"; // Ganti dengan ID kategori VoiceMaster
-  // if (channel.parentId === VOICEMASTER_CATEGORY_ID) {
-  //   await autoJoinChannel(channel);
-  // }
+  if (channel.parentId !== VOICEMASTER_CATEGORY_ID) return;
 
-  // METODE 2: Deteksi berdasarkan NAMA CHANNEL (jika ada kata "temporary")
-  // if (channel.name.toLowerCase().includes("temporary") || channel.name.toLowerCase().includes("temp")) {
-  //   await autoJoinChannel(channel);
-  // }
+  const keepKey = `${newState.guild.id}:${channel.id}`;
+  if (keepDisabledForChannel.has(keepKey)) return;
 
-  // METODE 3: Auto-join ke SEMUA voice channel (HATI-HATI! Bisa masuk ke semua VC)
-  // await autoJoinChannel(channel);
-
-  console.log(`🔊 ${newState.member?.user?.username} masuk ke ${channel.name}`);
+  logger.info(
+    { user: newState.member?.user?.username, channel: channel.name, guild: newState.guild.id },
+    "User entered VoiceMaster temporary channel",
+  );
+  await autoJoinChannel(channel);
 });
 
 // ===== FUNGSI UNTUK GENERATE GAMBAR =====
