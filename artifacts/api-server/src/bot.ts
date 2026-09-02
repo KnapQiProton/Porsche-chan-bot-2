@@ -39,6 +39,72 @@ const MISTRAL_API_KEY = process.env["MISTRAL_API_KEY"];
 const DEEPSEEK_API_KEY = process.env["DEEPSEEK_API_KEY"];
 const OPENROUTER_API_KEY = process.env["OPENROUTER_API_KEY"];
 const VOICEMASTER_CATEGORY_ID = process.env["VOICEMASTER_CATEGORY_ID"]?.trim();
+const DEEPL_API_KEY = process.env["DEEPL_API_KEY"]?.trim();
+
+const FLAG_TARGET_LANGUAGES: Record<string, string> = {
+  "🇺🇸": "EN-US",
+  "🇬🇧": "EN-GB",
+  "🇯🇵": "JA",
+  "🇫🇷": "FR",
+  "🇩🇪": "DE",
+  "🇮🇩": "ID",
+  "🇨🇳": "ZH",
+  "🇰🇷": "KO",
+  "🇪🇸": "ES",
+  "🇲🇽": "ES",
+  "🇮🇹": "IT",
+  "🇵🇹": "PT-PT",
+  "🇧🇷": "PT-BR",
+  "🇷🇺": "RU",
+  "🇳🇱": "NL",
+  "🇵🇱": "PL",
+  "🇹🇷": "TR",
+  "🇺🇦": "UK",
+  "🇸🇪": "SV",
+  "🇩🇰": "DA",
+  "🇳🇴": "NB",
+  "🇫🇮": "FI",
+  "🇨🇿": "CS",
+  "🇬🇷": "EL",
+  "🇷🇴": "RO",
+  "🇭🇺": "HU",
+  "🇸🇰": "SK",
+  "🇸🇮": "SL",
+  "🇮🇱": "HE",
+  "🇮🇳": "HI",
+};
+
+const FLAG_LANGUAGE_NAMES: Record<string, string> = {
+  "EN-US": "Inggris (AS)",
+  "EN-GB": "Inggris (UK)",
+  JA: "Jepang",
+  FR: "Prancis",
+  DE: "Jerman",
+  ID: "Indonesia",
+  ZH: "Mandarin",
+  KO: "Korea",
+  ES: "Spanyol",
+  IT: "Italia",
+  "PT-PT": "Portugis (Portugal)",
+  "PT-BR": "Portugis (Brasil)",
+  RU: "Rusia",
+  NL: "Belanda",
+  PL: "Polandia",
+  TR: "Turki",
+  UK: "Ukraina",
+  SV: "Swedia",
+  DA: "Denmark",
+  NB: "Norwegia",
+  FI: "Finlandia",
+  CS: "Ceko",
+  EL: "Yunani",
+  RO: "Rumania",
+  HU: "Hungaria",
+  SK: "Slovakia",
+  SL: "Slovenia",
+  HE: "Ibrani",
+  HI: "Hindi",
+};
 
 if (!GEMINI_API_KEY) {
   throw new Error("GEMINI_API_KEY environment variable is required.");
@@ -431,7 +497,7 @@ const client = new Client({
     GatewayIntentBits.DirectMessageTyping,
     GatewayIntentBits.GuildVoiceStates,
   ],
-  partials: [Partials.Channel],
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
 });
 
 const guildPlayers = new Map<string, any>();
@@ -529,6 +595,11 @@ client.once(Events.ClientReady, async (c) => {
   } catch (err) {
     logger.warn({ err }, "SoundCloud init failed — /play may not work");
   }
+  if (DEEPL_API_KEY) {
+    logger.info("DeepL translator initialized");
+  } else {
+    logger.warn("DEEPL_API_KEY is not configured — flag translation is disabled");
+  }
 });
 
 client.on("error", (err) => {
@@ -550,6 +621,134 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       return;
     }
     logger.error({ err }, "Unhandled error in slash command");
+  }
+});
+
+type DeepLResult = {
+  text: string;
+  detectedSourceLanguage: string;
+};
+
+function addEmbedText(embed: EmbedBuilder, label: string, text: string): void {
+  const chunks = text.match(/[\s\S]{1,1024}/g) ?? [""];
+  chunks.forEach((chunk, index) => {
+    embed.addFields({
+      name: index === 0 ? label : `${label} (lanjutan ${index + 1})`,
+      value: chunk,
+      inline: false,
+    });
+  });
+}
+
+async function translateWithDeepL(text: string, targetLanguage: string): Promise<DeepLResult> {
+  if (!DEEPL_API_KEY) {
+    throw new Error("DEEPL_NOT_CONFIGURED");
+  }
+  if (text.length > 128_000) {
+    throw new Error("DEEPL_TEXT_TOO_LONG");
+  }
+
+  const response = await fetch("https://api-free.deepl.com/v2/translate", {
+    method: "POST",
+    headers: {
+      Authorization: `DeepL-Auth-Key ${DEEPL_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      text: [text],
+      target_lang: targetLanguage,
+    }),
+  });
+
+  let data: {
+    translations?: Array<{
+      text?: string;
+      detected_source_language?: string;
+    }>;
+    message?: string;
+  } = {};
+  try {
+    data = await response.json() as typeof data;
+  } catch {
+    data = {};
+  }
+
+  if (!response.ok) {
+    if (response.status === 456) throw new Error("DEEPL_QUOTA_EXCEEDED");
+    if (response.status === 413) throw new Error("DEEPL_TEXT_TOO_LONG");
+    throw new Error(`DEEPL_HTTP_${response.status}`);
+  }
+
+  const translation = data.translations?.[0];
+  if (!translation?.text) {
+    throw new Error("DEEPL_EMPTY_RESPONSE");
+  }
+
+  return {
+    text: translation.text,
+    detectedSourceLanguage: translation.detected_source_language ?? "AUTO",
+  };
+}
+
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  if (user.bot) return;
+
+  const emoji = reaction.emoji.name;
+  const targetLanguage = emoji ? FLAG_TARGET_LANGUAGES[emoji] : undefined;
+  if (!targetLanguage) return;
+
+  try {
+    if (reaction.partial) {
+      await reaction.fetch();
+    }
+    const message = reaction.message.partial
+      ? await reaction.message.fetch()
+      : reaction.message;
+    const sourceText = message.content.trim();
+
+    if (!sourceText) {
+      await message.reply(
+        `${emoji} Pesan ini tidak memiliki teks yang bisa diterjemahkan. Media atau embed tanpa teks tidak dapat diterjemahkan.`,
+      );
+      return;
+    }
+
+    const result = await translateWithDeepL(sourceText, targetLanguage);
+    const sourceLanguage = result.detectedSourceLanguage.toUpperCase();
+    const targetLanguageName = FLAG_LANGUAGE_NAMES[targetLanguage] ?? targetLanguage;
+    const embed = new EmbedBuilder()
+      .setColor(0x0f766e)
+      .setTitle(`${emoji} Terjemahan baru`)
+      .setDescription(
+        `Diterjemahkan dari **${sourceLanguage}** ke **${targetLanguageName}**.`,
+      )
+      .setFooter({ text: "DeepL Translator • Reaksi bendera untuk menerjemahkan lagi" })
+      .setTimestamp();
+
+    addEmbedText(embed, "Teks asli", sourceText);
+    addEmbedText(embed, "Terjemahan", result.text);
+    await message.reply({ embeds: [embed] });
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "UNKNOWN";
+    logger.error({ error: code, emoji, messageId: reaction.message.id }, "DeepL translation failed");
+
+    const errorMessage =
+      code === "DEEPL_NOT_CONFIGURED"
+        ? "⚠️ Penerjemah belum aktif karena `DEEPL_API_KEY` belum dikonfigurasi."
+        : code === "DEEPL_TEXT_TOO_LONG"
+          ? "❌ Teks terlalu panjang untuk satu permintaan DeepL. Silakan bagi pesan menjadi beberapa bagian."
+          : code === "DEEPL_QUOTA_EXCEEDED"
+            ? "❌ Kuota DeepL sudah habis. Coba lagi setelah kuota reset atau gunakan paket/API key yang masih aktif."
+            : "❌ Terjadi error saat menerjemahkan. Pastikan API key DeepL valid dan coba lagi.";
+
+    try {
+      const message = reaction.message.partial
+        ? await reaction.message.fetch()
+        : reaction.message;
+      await message.reply(errorMessage);
+    } catch (replyError) {
+      logger.error({ replyError, messageId: reaction.message.id }, "Could not send translation error reply");
+    }
   }
 });
 
@@ -780,6 +979,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
             "`/join-vc` — Join voice channel & STAY",
             "`/stay-vc <channel_id>` — Jaga VC temporary berdasarkan ID",
             "`/leave-vc` — Leave voice channel (owner only)",
+            "Reaksi bendera 🇬🇧 🇯🇵 🇫🇷 🇮🇩 pada pesan — Terjemahkan via DeepL",
             "`/play` — Putar musik di VC",
             "`/stop` — Stop musik",
           ].join("\n"),
