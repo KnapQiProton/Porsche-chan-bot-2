@@ -39,7 +39,12 @@ const MISTRAL_API_KEY = process.env["MISTRAL_API_KEY"];
 const DEEPSEEK_API_KEY = process.env["DEEPSEEK_API_KEY"];
 const OPENROUTER_API_KEY = process.env["OPENROUTER_API_KEY"];
 const VOICEMASTER_CATEGORY_ID = process.env["VOICEMASTER_CATEGORY_ID"]?.trim();
-const DEEPL_API_KEY = process.env["DEEPL_API_KEY"]?.trim();
+const LIBRETRANSLATE_URL =
+  process.env["LIBRETRANSLATE_URL"]?.trim() || "https://translate.cutie.dating/translate";
+const LIBRETRANSLATE_BACKUP_URL = "https://libretranslate.com/translate";
+const LIBRETRANSLATE_API_KEY = process.env["LIBRETRANSLATE_API_KEY"]?.trim();
+const DEEPLX_URL =
+  process.env["DEEPLX_URL"]?.trim() || "https://api.deeplx.org/translate";
 
 const FLAG_TARGET_LANGUAGES: Record<string, string> = {
   "🇺🇸": "EN-US",
@@ -595,11 +600,10 @@ client.once(Events.ClientReady, async (c) => {
   } catch (err) {
     logger.warn({ err }, "SoundCloud init failed — /play may not work");
   }
-  if (DEEPL_API_KEY) {
-    logger.info("DeepL translator initialized");
-  } else {
-    logger.warn("DEEPL_API_KEY is not configured — flag translation is disabled");
-  }
+  logger.info(
+    { libreTranslateUrl: LIBRETRANSLATE_URL, deepLXUrl: DEEPLX_URL },
+    "Free translation providers configured",
+  );
 });
 
 client.on("error", (err) => {
@@ -624,9 +628,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   }
 });
 
-type DeepLResult = {
+type TranslationResult = {
   text: string;
   detectedSourceLanguage: string;
+  provider: "LibreTranslate" | "DeepLX";
 };
 
 function addEmbedText(embed: EmbedBuilder, label: string, text: string): void {
@@ -640,31 +645,69 @@ function addEmbedText(embed: EmbedBuilder, label: string, text: string): void {
   });
 }
 
-async function translateWithDeepL(text: string, targetLanguage: string): Promise<DeepLResult> {
-  if (!DEEPL_API_KEY) {
-    throw new Error("DEEPL_NOT_CONFIGURED");
-  }
-  if (text.length > 128_000) {
-    throw new Error("DEEPL_TEXT_TOO_LONG");
+async function translateWithLibreTranslate(
+  text: string,
+  targetLanguage: string,
+  endpoint: string,
+): Promise<TranslationResult> {
+  const body: Record<string, string> = {
+    q: text,
+    source: "auto",
+    target: targetLanguage.split("-")[0]!.toLowerCase(),
+    format: "text",
+  };
+  if (LIBRETRANSLATE_API_KEY) {
+    body.api_key = LIBRETRANSLATE_API_KEY;
   }
 
-  const response = await fetch("https://api-free.deepl.com/v2/translate", {
+  const response = await fetch(endpoint, {
     method: "POST",
-    headers: {
-      Authorization: `DeepL-Auth-Key ${DEEPL_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      text: [text],
-      target_lang: targetLanguage,
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
   });
 
   let data: {
-    translations?: Array<{
-      text?: string;
-      detected_source_language?: string;
-    }>;
+    translatedText?: string;
+    detectedLanguage?: { language?: string };
+    error?: string;
+  } = {};
+  try {
+    data = await response.json() as typeof data;
+  } catch {
+    data = {};
+  }
+
+  if (!response.ok || !data.translatedText) {
+    throw new Error(`LIBRETRANSLATE_HTTP_${response.status}`);
+  }
+
+  return {
+    text: data.translatedText,
+    detectedSourceLanguage: data.detectedLanguage?.language?.toUpperCase() ?? "AUTO",
+    provider: "LibreTranslate",
+  };
+}
+
+async function translateWithDeepLX(
+  text: string,
+  targetLanguage: string,
+): Promise<TranslationResult> {
+  const response = await fetch(DEEPLX_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text,
+      source_lang: "auto",
+      target_lang: targetLanguage,
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  let data: {
+    code?: number;
+    data?: string | { text?: string };
+    source_lang?: string;
     message?: string;
   } = {};
   try {
@@ -673,21 +716,48 @@ async function translateWithDeepL(text: string, targetLanguage: string): Promise
     data = {};
   }
 
-  if (!response.ok) {
-    if (response.status === 456) throw new Error("DEEPL_QUOTA_EXCEEDED");
-    if (response.status === 413) throw new Error("DEEPL_TEXT_TOO_LONG");
-    throw new Error(`DEEPL_HTTP_${response.status}`);
-  }
-
-  const translation = data.translations?.[0];
-  if (!translation?.text) {
-    throw new Error("DEEPL_EMPTY_RESPONSE");
+  const translatedText =
+    typeof data.data === "string" ? data.data : data.data?.text;
+  if (
+    !response.ok ||
+    !translatedText ||
+    translatedText.startsWith("http://") ||
+    translatedText.startsWith("https://") ||
+    (data.code !== undefined && data.code !== 200)
+  ) {
+    throw new Error(`DEEPLX_HTTP_${response.status}`);
   }
 
   return {
-    text: translation.text,
-    detectedSourceLanguage: translation.detected_source_language ?? "AUTO",
+    text: translatedText,
+    detectedSourceLanguage: data.source_lang?.toUpperCase() ?? "AUTO",
+    provider: "DeepLX",
   };
+}
+
+async function translateWithFreeProviders(
+  text: string,
+  targetLanguage: string,
+): Promise<TranslationResult> {
+  if (text.length > 128_000) {
+    throw new Error("TRANSLATION_TEXT_TOO_LONG");
+  }
+
+  const libreEndpoints = [...new Set([LIBRETRANSLATE_URL, LIBRETRANSLATE_BACKUP_URL])];
+  for (const endpoint of libreEndpoints) {
+    try {
+      return await translateWithLibreTranslate(text, targetLanguage, endpoint);
+    } catch (libreError) {
+      logger.warn({ error: libreError, endpoint }, "LibreTranslate endpoint failed");
+    }
+  }
+
+  try {
+    return await translateWithDeepLX(text, targetLanguage);
+  } catch (deepLXError) {
+    logger.error({ error: deepLXError }, "LibreTranslate and DeepLX failed");
+    throw new Error("FREE_TRANSLATORS_UNAVAILABLE");
+  }
 }
 
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
@@ -713,7 +783,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
       return;
     }
 
-    const result = await translateWithDeepL(sourceText, targetLanguage);
+    const result = await translateWithFreeProviders(sourceText, targetLanguage);
     const sourceLanguage = result.detectedSourceLanguage.toUpperCase();
     const targetLanguageName = FLAG_LANGUAGE_NAMES[targetLanguage] ?? targetLanguage;
     const embed = new EmbedBuilder()
@@ -722,7 +792,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
       .setDescription(
         `Diterjemahkan dari **${sourceLanguage}** ke **${targetLanguageName}**.`,
       )
-      .setFooter({ text: "DeepL Translator • Reaksi bendera untuk menerjemahkan lagi" })
+      .setFooter({ text: `${result.provider} • Reaksi bendera untuk menerjemahkan lagi` })
       .setTimestamp();
 
     addEmbedText(embed, "Teks asli", sourceText);
@@ -730,16 +800,14 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     await message.reply({ embeds: [embed] });
   } catch (error) {
     const code = error instanceof Error ? error.message : "UNKNOWN";
-    logger.error({ error: code, emoji, messageId: reaction.message.id }, "DeepL translation failed");
+    logger.error({ error: code, emoji, messageId: reaction.message.id }, "Free translation failed");
 
     const errorMessage =
-      code === "DEEPL_NOT_CONFIGURED"
-        ? "⚠️ Penerjemah belum aktif karena `DEEPL_API_KEY` belum dikonfigurasi."
-        : code === "DEEPL_TEXT_TOO_LONG"
-          ? "❌ Teks terlalu panjang untuk satu permintaan DeepL. Silakan bagi pesan menjadi beberapa bagian."
-          : code === "DEEPL_QUOTA_EXCEEDED"
-            ? "❌ Kuota DeepL sudah habis. Coba lagi setelah kuota reset atau gunakan paket/API key yang masih aktif."
-            : "❌ Terjadi error saat menerjemahkan. Pastikan API key DeepL valid dan coba lagi.";
+      code === "TRANSLATION_TEXT_TOO_LONG"
+        ? "❌ Teks terlalu panjang untuk satu permintaan. Silakan bagi pesan menjadi beberapa bagian."
+        : code === "FREE_TRANSLATORS_UNAVAILABLE"
+          ? "❌ Layanan terjemahan gratis sedang tidak tersedia. LibreTranslate dan DeepLX sudah dicoba, silakan ulangi beberapa saat lagi."
+          : "❌ Terjadi error saat menerjemahkan. Silakan coba lagi beberapa saat lagi.";
 
     try {
       const message = reaction.message.partial
@@ -979,7 +1047,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
             "`/join-vc` — Join voice channel & STAY",
             "`/stay-vc <channel_id>` — Jaga VC temporary berdasarkan ID",
             "`/leave-vc` — Leave voice channel (owner only)",
-            "Reaksi bendera 🇬🇧 🇯🇵 🇫🇷 🇮🇩 pada pesan — Terjemahkan via DeepL",
+            "Reaksi bendera 🇬🇧 🇯🇵 🇫🇷 🇮🇩 pada pesan — Terjemahkan gratis",
             "`/play` — Putar musik di VC",
             "`/stop` — Stop musik",
           ].join("\n"),
