@@ -894,8 +894,10 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     const errorMessage =
       code === "TRANSLATION_TEXT_TOO_LONG"
         ? "❌ Teks terlalu panjang untuk satu permintaan. Silakan bagi pesan menjadi beberapa bagian."
+        : code === "MYMEMORY_TEXT_TOO_LONG"
+          ? "❌ Teks terlalu panjang untuk layanan fallback gratis. Silakan bagi pesan menjadi beberapa bagian."
         : code === "FREE_TRANSLATORS_UNAVAILABLE"
-          ? "❌ Layanan terjemahan gratis sedang tidak tersedia. LibreTranslate dan DeepLX sudah dicoba, silakan ulangi beberapa saat lagi."
+          ? "❌ Layanan terjemahan gratis sedang tidak tersedia. LibreTranslate, DeepLX, dan MyMemory sudah dicoba, silakan ulangi beberapa saat lagi."
           : "❌ Terjadi error saat menerjemahkan. Silakan coba lagi beberapa saat lagi.";
 
     try {
