@@ -45,6 +45,7 @@ const LIBRETRANSLATE_BACKUP_URL = "https://libretranslate.com/translate";
 const LIBRETRANSLATE_API_KEY = process.env["LIBRETRANSLATE_API_KEY"]?.trim();
 const DEEPLX_URL =
   process.env["DEEPLX_URL"]?.trim() || "https://api.deeplx.org/translate";
+const MYMEMORY_URL = "https://api.mymemory.translated.net/get";
 
 const FLAG_TARGET_LANGUAGES: Record<string, string> = {
   "🇺🇸": "EN-US",
@@ -633,7 +634,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 type TranslationResult = {
   text: string;
   detectedSourceLanguage: string;
-  provider: "LibreTranslate" | "DeepLX";
+  provider: "LibreTranslate" | "DeepLX" | "MyMemory";
 };
 
 function addEmbedText(embed: EmbedBuilder, label: string, text: string): void {
@@ -737,6 +738,80 @@ async function translateWithDeepLX(
   };
 }
 
+function splitTextByBytes(text: string, maxBytes: number): string[] {
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const character of text) {
+    if (current && Buffer.byteLength(current + character, "utf8") > maxBytes) {
+      chunks.push(current);
+      current = "";
+    }
+    current += character;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function translateWithMyMemory(
+  text: string,
+  targetLanguage: string,
+): Promise<TranslationResult> {
+  const target = targetLanguage.split("-")[0]!.toLowerCase();
+  const chunks = splitTextByBytes(text, 450);
+  if (chunks.length > 12) {
+    throw new Error("MYMEMORY_TEXT_TOO_LONG");
+  }
+
+  const translatedChunks: string[] = [];
+  let detectedSourceLanguage = "AUTO";
+
+  for (const chunk of chunks) {
+    const url = new URL(MYMEMORY_URL);
+    url.searchParams.set("q", chunk);
+    url.searchParams.set("langpair", `autodetect|${target}`);
+    url.searchParams.set("mt", "1");
+
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(15_000),
+    });
+    let data: {
+      responseData?: {
+        translatedText?: string;
+        detectedLanguage?: string;
+      };
+      responseStatus?: number;
+      quotaFinished?: boolean;
+    } = {};
+    try {
+      data = await response.json() as typeof data;
+    } catch {
+      data = {};
+    }
+
+    const translatedText = data.responseData?.translatedText?.trim();
+    if (
+      !response.ok ||
+      data.quotaFinished ||
+      data.responseStatus !== 200 ||
+      !translatedText
+    ) {
+      throw new Error(`MYMEMORY_HTTP_${response.status}`);
+    }
+
+    translatedChunks.push(translatedText);
+    if (detectedSourceLanguage === "AUTO" && data.responseData?.detectedLanguage) {
+      detectedSourceLanguage = data.responseData.detectedLanguage.toUpperCase();
+    }
+  }
+
+  return {
+    text: translatedChunks.join(""),
+    detectedSourceLanguage,
+    provider: "MyMemory",
+  };
+}
+
 async function translateWithFreeProviders(
   text: string,
   targetLanguage: string,
@@ -757,7 +832,19 @@ async function translateWithFreeProviders(
   try {
     return await translateWithDeepLX(text, targetLanguage);
   } catch (deepLXError) {
-    logger.error({ error: deepLXError }, "LibreTranslate and DeepLX failed");
+    logger.warn({ error: deepLXError }, "DeepLX failed, trying MyMemory");
+  }
+
+  try {
+    return await translateWithMyMemory(text, targetLanguage);
+  } catch (myMemoryError) {
+    logger.error(
+      { error: myMemoryError },
+      "LibreTranslate, DeepLX, and MyMemory failed",
+    );
+    if (myMemoryError instanceof Error && myMemoryError.message === "MYMEMORY_TEXT_TOO_LONG") {
+      throw myMemoryError;
+    }
     throw new Error("FREE_TRANSLATORS_UNAVAILABLE");
   }
 }
