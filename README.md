@@ -1,20 +1,11 @@
 <div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
+<img width="1200" height="475" alt="GHBanner" src="https://i.pinimg.com/736x/e2/bc/e7/e2bce72cea4d970889719e22b2cbb549.jpg" />
 </div>
 
-# Run and deploy your AI Studio app
+# H-hmph... It's just my private project, okay?
 
-This contains everything you need to run your app locally.
+D-don't get the wrong idea. I'm not sharing this with anyone. This is... just a personal project for my own bot server. I made it so my server wouldn't be lonely and the bot could run the way I want. T-that's all.
 
-View your app in AI Studio: https://ai.studio/apps/83889bf8-870b-4a23-8817-d7cb622b5a45
+I-it's not like I made this for you or anything. So... don't expect me to explain how to set it up. If you somehow ended up here, then... f-fine, look around if you want. But don't go touching anything weird, okay?
 
-## Run Locally
-
-**Prerequisites:**  Node.js
-
-
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+Hmph... that's all. Don't ask me for more.
