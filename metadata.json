@@ -1,0 +1,6 @@
+{
+  "name": "Porsche-chan Bot",
+  "description": "Discord bot and interactive dashboard for Porsche-chan with multi-provider AI (Gemini, Groq, Mistral, DeepSeek, Pollinations), translation, and media features.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
