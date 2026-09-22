@@ -1,5 +1,5 @@
 <div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://i.pinimg.com/736x/e2/bc/e7/e2bce72cea4d970889719e22b2cbb549.jpg" />
+<img alt="GHBanner" src="https://i.pinimg.com/736x/e2/bc/e7/e2bce72cea4d970889719e22b2cbb549.jpg" />
 </div>
 
 # H-hmph... It's just my private project, okay?
