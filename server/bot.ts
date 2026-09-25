@@ -3142,6 +3142,15 @@ client.on(Events.MessageCreate, async (message: Message) => {
       return;
     }
   }
+
+  // Auto-play when user directly pastes a music link while in a voice channel
+  const directLinkRegex = /^(?:https?:\/\/)?(?:www\.)?(?:music\.youtube\.com\/watch\?v=|youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/|open\.spotify\.com\/(?:track|album|playlist)\/|soundcloud\.com\/\S+)\S*$/i;
+  if (directLinkRegex.test(rawContent)) {
+    if (message.member?.voice?.channel) {
+      await MusicService.playFromMessage(message, rawContent);
+      return;
+    }
+  }
   if (rawContent === "!stop" || rawContent === "!henti") {
     await MusicService.stopFromMessage(message);
     return;
@@ -3184,6 +3193,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
   if (!isMentioned && !isDM) return;
 
   const userText = message.content.replace(/<@!?\d+>/g, "").trim();
+
+  // If bot is mentioned or sent a direct music link, immediately play it
+  const mentionLinkMatch = userText.match(/(https?:\/\/(?:www\.)?(?:music\.youtube\.com|youtube\.com|youtu\.be|open\.spotify\.com|soundcloud\.com)\/\S+)/i);
+  if (mentionLinkMatch) {
+    await MusicService.playFromMessage(message, mentionLinkMatch[1]);
+    return;
+  }
 
   // Mentions with play / stop / pause / resume / seek commands
   if (/^(?:play|putar|setel)\s+/i.test(userText)) {

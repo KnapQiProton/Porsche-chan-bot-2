@@ -1346,6 +1346,7 @@ export async function createAudioResourceFromYtDlp(
   fallbackSearchQuery?: string
 ): Promise<any> {
   const cookieArgs = getYtDlpCookieArgs();
+  const isDirectYouTubeLink = /https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com)\//i.test(urlOrQuery);
 
   // Tier 1: Direct yt-dlp stdout pipe into FFmpeg raw PCM (Primary, fastest)
   try {
@@ -1389,17 +1390,43 @@ export async function createAudioResourceFromYtDlp(
     logger.warn({ err }, "Tier 2 tv_embedded pipe stream failed, trying Tier 3");
   }
 
-  // Tier 3: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
+  // Tier 3: Try alternate android client directly
+  try {
+    const ytdlpArgs = [
+      "--js-runtimes", "node",
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=android",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", "ba/ba*/b/best",
+      "--no-playlist",
+      urlOrQuery,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp android pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err }, "Tier 3 android pipe stream failed, trying Tier 4 direct HTTPS URL");
+  }
+
+  // Tier 4: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
   try {
     const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 8000);
     if (directUrl) {
-      logger.info({ urlOrQuery }, "Attempting Tier 3 yt-dlp direct HTTPS audio URL");
+      logger.info({ urlOrQuery }, "Attempting Tier 4 yt-dlp direct HTTPS audio URL");
       const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
-      logger.info({ urlOrQuery }, "Streaming via Tier 3 yt-dlp direct HTTPS audio URL");
+      logger.info({ urlOrQuery }, "Streaming via Tier 4 yt-dlp direct HTTPS audio URL");
       return resource;
     }
   } catch (err) {
-    logger.warn({ err }, "Tier 3 direct URL failed, proceeding to Tier 4 SoundCloud fallback");
+    logger.warn({ err }, "Tier 4 direct URL failed");
+  }
+
+  // If this was a direct YouTube link sent by the user, DO NOT substitute with SoundCloud!
+  if (isDirectYouTubeLink) {
+    throw new Error("Gagal memutar audio dari link video YouTube tersebut (video mungkin bersifat privat, dibatasi usia, atau tidak tersedia).");
   }
 
   // Tier 4: SoundCloud fallback audio stream (ultra-reliable when YouTube IP is challenged, scored for accuracy)
