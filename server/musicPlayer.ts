@@ -24,14 +24,24 @@ import {
   TextBasedChannel,
   VoiceBasedChannel,
 } from "discord.js";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import { PassThrough } from "stream";
 import playdl from "play-dl";
 import ytdl from "@distube/ytdl-core";
+import ffmpegStatic from "ffmpeg-static";
 import { logger } from "./logger";
+
+// Resolve FFmpeg path (support both bundled ffmpeg-static and system binary)
+export const FFMPEG_BIN = (ffmpegStatic && fs.existsSync(ffmpegStatic) ? ffmpegStatic : "ffmpeg") as string;
+if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
+  const ffmpegDir = path.dirname(ffmpegStatic);
+  if (!process.env.PATH?.includes(ffmpegDir)) {
+    process.env.PATH = `${ffmpegDir}${path.delimiter}${process.env.PATH || ""}`;
+  }
+}
 
 export type MusicSource = "youtube" | "youtube_music" | "spotify" | "soundcloud" | "search";
 
@@ -80,31 +90,59 @@ export function safeDestroyVoiceConnection(conn?: VoiceConnection | null): void 
   }
 }
 
+// Cached yt-dlp path to avoid repeated checks / downloads
+let cachedYtDlpPath: string | null = null;
+
 // Ensure yt-dlp binary is available
 export async function getOrDownloadYtDlp(): Promise<string> {
-  const isWin = process.platform === "win32";
-  const binDir = path.join(process.cwd(), "bin");
-  const binName = isWin ? "yt-dlp.exe" : "yt-dlp";
-  const localYtDlp = path.join(binDir, binName);
+  if (cachedYtDlpPath) return cachedYtDlpPath;
 
+  const isWin = process.platform === "win32";
+  const cmdName = isWin ? "yt-dlp.exe" : "yt-dlp";
+
+  // 1. Check if yt-dlp is available in system PATH directly
+  try {
+    const test = spawnSync(cmdName, ["--version"], { timeout: 2000, stdio: "ignore" });
+    if (test.status === 0) {
+      cachedYtDlpPath = cmdName;
+      logger.info({ cmd: cmdName }, "Found working yt-dlp in system PATH");
+      return cmdName;
+    }
+  } catch {}
+
+  // 2. Check local bin/ directory
+  const binDir = path.join(process.cwd(), "bin");
+  const localYtDlp = path.join(binDir, cmdName);
   if (fs.existsSync(localYtDlp)) {
     try {
       if (!isWin) fs.chmodSync(localYtDlp, 0o755);
     } catch {}
+    cachedYtDlpPath = localYtDlp;
     return localYtDlp;
   }
 
-  // Check system PATH
+  // 3. Check known Linux paths (pipx, nixpacks, standard)
   const sysCandidates = isWin
-    ? ["yt-dlp.exe", "yt-dlp"]
-    : ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "yt-dlp"];
+    ? [path.join(process.env.APPDATA || "", "Python", "Scripts", "yt-dlp.exe")]
+    : [
+        "/root/.local/bin/yt-dlp",
+        "/usr/local/bin/yt-dlp",
+        "/usr/bin/yt-dlp",
+        "/bin/yt-dlp",
+      ];
 
   for (const sysPath of sysCandidates) {
-    if (sysPath.startsWith("/")) {
-      if (fs.existsSync(sysPath)) return sysPath;
+    if (sysPath && fs.existsSync(sysPath)) {
+      try {
+        if (!isWin) fs.chmodSync(sysPath, 0o755);
+      } catch {}
+      cachedYtDlpPath = sysPath;
+      logger.info({ path: sysPath }, "Found existing yt-dlp binary");
+      return sysPath;
     }
   }
 
+  // 4. Fallback: download if not found anywhere
   if (!fs.existsSync(binDir)) {
     fs.mkdirSync(binDir, { recursive: true });
   }
@@ -118,6 +156,7 @@ export async function getOrDownloadYtDlp(): Promise<string> {
     const res = await fetch(downloadUrl, {
       headers: { "User-Agent": "Mozilla/5.0" },
       redirect: "follow",
+      signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) throw new Error(`Failed to download yt-dlp binary (HTTP ${res.status})`);
     const buffer = await res.arrayBuffer();
@@ -128,11 +167,11 @@ export async function getOrDownloadYtDlp(): Promise<string> {
       } catch {}
     }
     logger.info("yt-dlp downloaded and ready!");
+    cachedYtDlpPath = localYtDlp;
     return localYtDlp;
   } catch (err) {
     logger.error({ err }, "Failed to download yt-dlp binary");
-    // Fall back to system command name
-    return isWin ? "yt-dlp.exe" : "yt-dlp";
+    return cmdName;
   }
 }
 
@@ -574,7 +613,7 @@ export function createPCMStreamFromUrl(audioUrl: string, seekSeconds: number = 0
   }
   args.push("-i", audioUrl, "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "pipe:1");
 
-  const ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+  const ffmpeg = spawn(FFMPEG_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
   ffmpeg.stderr.on("data", (d) => {
     logger.debug({ msg: d.toString() }, "FFmpeg PCM stderr");
   });
@@ -594,7 +633,7 @@ export async function createAudioResourceFromTrackUrl(trackUrl: string, seekSeco
     } catch {
       // Fallback: spawn FFmpeg with -ss to seek into the stream
       const s = await playdl.stream(trackUrl);
-      const ffmpeg = spawn("ffmpeg", [
+      const ffmpeg = spawn(FFMPEG_BIN, [
         "-ss", seekSeconds.toString(),
         "-i", "pipe:0",
         "-ar", "48000",
@@ -877,6 +916,29 @@ export async function searchYouTubeWithYtDlp(
     } catch (fallbackErr) {
       logger.error({ fallbackErr }, "play-dl search fallback also failed");
     }
+
+    // Secondary fallback: search SoundCloud directly (highly reliable on datacenter IPs)
+    try {
+      const scClientId = await playdl.getFreeClientID();
+      await playdl.setToken({ soundcloud: { client_id: scClientId } });
+      const scResults = await playdl.search(query, { source: { soundcloud: "tracks" }, limit: 1 });
+      if (scResults && scResults.length > 0) {
+        const scTrack: any = scResults[0];
+        logger.info({ title: scTrack.name || scTrack.title }, "Found track via SoundCloud search fallback");
+        return {
+          id: String(scTrack.id || ""),
+          url: scTrack.url,
+          title: scTrack.name || scTrack.title || query,
+          artist: scTrack.user?.name || scTrack.artist || "SoundCloud Artist",
+          duration: scTrack.durationRaw || formatDuration(scTrack.durationInSec) || "3:30",
+          durationSec: scTrack.durationInSec,
+          thumbnail: scTrack.thumbnail || scTrack.thumbnails?.[0]?.url,
+        };
+      }
+    } catch (scSearchErr) {
+      logger.warn({ scSearchErr }, "SoundCloud search fallback failed");
+    }
+
     throw err;
   }
 }
@@ -903,7 +965,7 @@ function tryPipedStream(
         ffmpegArgs.push("-ss", seekSeconds.toString());
       }
       ffmpegArgs.push("-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
-      ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: ["pipe", "pipe", "ignore"] });
+      ffmpeg = spawn(FFMPEG_BIN, ffmpegArgs, { stdio: ["pipe", "pipe", "ignore"] });
     } catch (spawnErr) {
       return reject(spawnErr);
     }
@@ -965,6 +1027,73 @@ function tryPipedStream(
   });
 }
 
+// Helper for validating direct HTTPS stream piped through FFmpeg with fast failover
+function tryPipedUrlStream(
+  audioUrl: string,
+  seekSeconds: number,
+  timeoutMs: number = 3500
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let ffmpeg: any;
+
+    try {
+      const args = [
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "3",
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      ];
+      if (seekSeconds > 0) {
+        args.push("-ss", seekSeconds.toString());
+      }
+      args.push("-i", audioUrl, "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "pipe:1");
+      ffmpeg = spawn(FFMPEG_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
+    } catch (spawnErr) {
+      return reject(spawnErr);
+    }
+
+    ffmpeg.stdout.on("error", () => {});
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try { ffmpeg.kill("SIGKILL"); } catch {}
+        reject(new Error("Direct URL stream timeout / HTTP 403"));
+      }
+    }, timeoutMs);
+
+    ffmpeg.on("error", (err: any) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+
+    ffmpeg.on("close", (code: number) => {
+      if (!settled && code !== 0) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error(`FFmpeg exited with error code ${code}`));
+      }
+    });
+
+    const onData = (chunk: Buffer) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        ffmpeg.stdout.removeListener("data", onData);
+        const pt = new PassThrough();
+        pt.write(chunk);
+        ffmpeg.stdout.pipe(pt);
+        resolve(createAudioResource(pt, { inputType: StreamType.Raw }));
+      }
+    };
+    ffmpeg.stdout.on("data", onData);
+  });
+}
+
 // Create AudioResource from YouTube with multi-tier streaming architecture (Piped yt-dlp -> FFmpeg -> Direct URL -> SoundCloud fallback)
 export async function createAudioResourceFromYtDlp(
   urlOrQuery: string,
@@ -988,7 +1117,7 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 4000);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 3500);
     logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp stdout pipe stream");
     return resource;
   } catch (err) {
@@ -1009,7 +1138,7 @@ export async function createAudioResourceFromYtDlp(
         "--no-playlist",
         urlOrQuery,
       ];
-      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 4000);
+      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 3500);
       logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp clean session pipe stream");
       return resource;
     } catch (err) {
@@ -1017,13 +1146,14 @@ export async function createAudioResourceFromYtDlp(
     }
   }
 
-  // Tier 3: Direct HTTPS audio URL extracted by yt-dlp with FFmpeg reconnect
+  // Tier 3: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 8000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 5000);
     if (directUrl) {
+      logger.info({ urlOrQuery }, "Attempting Tier 3 yt-dlp direct HTTPS audio URL");
+      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 3500);
       logger.info({ urlOrQuery }, "Streaming via Tier 3 yt-dlp direct HTTPS audio URL");
-      const ffmpeg = createPCMStreamFromUrl(directUrl, seekSeconds);
-      return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+      return resource;
     }
   } catch (err) {
     logger.warn({ err }, "Tier 3 direct URL failed, proceeding to Tier 4 SoundCloud fallback");
@@ -1194,13 +1324,16 @@ export async function resolveMusicTrack(
     durationSec: ytMatch.durationSec,
     url: ytMatch.url,
     thumbnail: ytMatch.thumbnail,
-    source: "youtube",
-    sourceBadge: "🔴 YouTube",
-    sourceColor: 0xff0000,
+    source: ytMatch.url.includes("soundcloud.com") ? "soundcloud" : "youtube",
+    sourceBadge: ytMatch.url.includes("soundcloud.com") ? "🟠 SoundCloud" : "🔴 YouTube",
+    sourceColor: ytMatch.url.includes("soundcloud.com") ? 0xff5500 : 0xff0000,
     requesterName: requester.name,
     requesterId: requester.id,
     rawTrackUrl: ytMatch.url,
     createStream: async (seekSeconds: number = 0) => {
+      if (ytMatch.url.includes("soundcloud.com")) {
+        return createAudioResourceFromTrackUrl(ytMatch.url, seekSeconds);
+      }
       return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, `${ytMatch.title} ${ytMatch.artist}`);
     },
   };
@@ -1308,9 +1441,9 @@ export class MusicService {
       });
 
       try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+        await entersState(connection, VoiceConnectionStatus.Ready, 7_000);
       } catch (connErr) {
-        logger.warn({ connErr, guildId: guild.id }, "Voice connection takes longer than 15s to become Ready");
+        logger.warn({ connErr, guildId: guild.id }, "Voice connection takes longer than 7s to become Ready");
       }
     }
 
@@ -1404,7 +1537,7 @@ export class MusicService {
     try {
       if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
         try {
-          await entersState(session.connection, VoiceConnectionStatus.Ready, 10_000);
+          await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
         } catch {}
       }
       session.connection.subscribe(session.player);
@@ -1469,7 +1602,7 @@ export class MusicService {
       } else {
         if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
           try {
-            await entersState(session.connection, VoiceConnectionStatus.Ready, 10_000);
+            await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
           } catch {}
         }
         session.connection.subscribe(session.player);
@@ -1753,7 +1886,7 @@ export class MusicService {
       } else {
         if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
           try {
-            await entersState(session.connection, VoiceConnectionStatus.Ready, 10_000);
+            await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
           } catch {}
         }
         session.connection.subscribe(session.player);
