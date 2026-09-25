@@ -16,23 +16,21 @@ RUN apt-get update && apt-get install -y \
 
 ENV PATH="/root/.local/bin:$PATH"
 
-# Install pnpm
-RUN npm install -g pnpm@10
-
 WORKDIR /app
 
-# Copy workspace config files first (better layer caching)
-COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.json tsconfig.base.json ./
+# Copy configuration files
+COPY package.json tsconfig.json tsconfig.base.json vite.config.ts ./
 
-# Copy all needed packages
-COPY lib/ ./lib/
-COPY artifacts/api-server/ ./artifacts/api-server/
-COPY scripts/ ./scripts/
+# Copy source code and assets
+COPY server/ ./server/
+COPY src/ ./src/
+COPY public/ ./public/
+COPY server.ts index.html ./
 
-# Install dependencies (skip frozen lockfile to avoid version mismatch)
-RUN pnpm install --no-frozen-lockfile
+# Install dependencies and build
+RUN npm install
+RUN npm run build
 
-# Build the API server
-RUN pnpm --filter @workspace/api-server run build
+EXPOSE 3000
 
-CMD ["pnpm", "--filter", "@workspace/api-server", "run", "start"]
+CMD ["npm", "start"]

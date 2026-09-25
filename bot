@@ -4,8 +4,7 @@
 #  Usage: ./bot <command>
 # =============================================================
 
-WORKFLOW_NAME="artifacts/api-server: API Server"
-BOT_FILTER="@workspace/api-server"
+WORKFLOW_NAME="Porsche-chan Discord Bot"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -25,30 +24,36 @@ cmd_help() {
   echo -e "${BOLD}Usage:${RESET}  ./bot <command>"
   echo ""
   echo -e "${BOLD}Commands:${RESET}"
-  echo -e "  ${GREEN}start${RESET}      Jalankan bot (build + start server)"
+  echo -e "  ${GREEN}start${RESET}      Jalankan bot (dev mode tsx server.ts)"
+  echo -e "  ${GREEN}prod${RESET}       Jalankan bot production (node dist/server.cjs)"
   echo -e "  ${YELLOW}stop${RESET}       Matikan bot"
   echo -e "  ${CYAN}restart${RESET}    Restart bot (stop lalu start)"
-  echo -e "  ${CYAN}logs${RESET}       Lihat log bot secara live (Ctrl+C untuk keluar)"
+  echo -e "  ${CYAN}logs${RESET}       Lihat log bot"
   echo -e "  ${CYAN}status${RESET}     Cek apakah bot sedang berjalan"
-  echo -e "  ${CYAN}build${RESET}      Build ulang tanpa restart server"
-  echo -e "  ${CYAN}typecheck${RESET}  Cek TypeScript errors"
+  echo -e "  ${CYAN}build${RESET}      Build frontend dan bundle server.cjs"
+  echo -e "  ${CYAN}typecheck${RESET}  Cek TypeScript errors (lint)"
   echo -e "  ${CYAN}help${RESET}       Tampilkan pesan ini"
   echo ""
   echo -e "${BOLD}Contoh:${RESET}"
   echo "  ./bot start"
   echo "  ./bot restart"
-  echo "  ./bot logs"
+  echo "  ./bot build"
   echo ""
 }
 
 cmd_start() {
   echo -e "${GREEN}▶ Menjalankan bot...${RESET}"
-  pnpm --filter "$BOT_FILTER" run dev
+  pnpm run dev
+}
+
+cmd_prod() {
+  echo -e "${GREEN}▶ Menjalankan bot production...${RESET}"
+  pnpm run start
 }
 
 cmd_stop() {
   echo -e "${YELLOW}■ Menghentikan bot...${RESET}"
-  PID=$(pgrep -f "dist/index.mjs" 2>/dev/null)
+  PID=$(pgrep -f "dist/server.cjs|server.ts" 2>/dev/null)
   if [ -z "$PID" ]; then
     echo -e "${RED}Bot tidak sedang berjalan.${RESET}"
   else
@@ -65,20 +70,13 @@ cmd_restart() {
 }
 
 cmd_logs() {
-  echo -e "${CYAN}📋 Menampilkan log bot (Ctrl+C untuk keluar)...${RESET}"
-  LOG_FILE=$(ls -t /tmp/logs/artifactsapi-server_API_Server_*.log 2>/dev/null | head -1)
-  if [ -n "$LOG_FILE" ]; then
-    tail -f "$LOG_FILE"
-  else
-    echo -e "${YELLOW}Log file belum ada. Jalankan ./bot start terlebih dahulu.${RESET}"
-    echo -e "Menampilkan output langsung..."
-    pnpm --filter "$BOT_FILTER" run dev
-  fi
+  echo -e "${CYAN}📋 Menjalankan bot dengan log output langsung (Ctrl+C untuk keluar)...${RESET}"
+  pnpm run dev
 }
 
 cmd_status() {
   echo -e "${BOLD}Status Bot:${RESET}"
-  PID=$(pgrep -f "dist/index.mjs" 2>/dev/null)
+  PID=$(pgrep -f "dist/server.cjs|server.ts" 2>/dev/null)
   if [ -n "$PID" ]; then
     echo -e "  ${GREEN}● RUNNING${RESET} (PID: $PID)"
   else
@@ -99,17 +97,17 @@ cmd_status() {
   check_secret "MISTRAL_API_KEY"
   check_secret "DEEPSEEK_API_KEY"
   check_secret "OPENROUTER_API_KEY"
-  check_secret "SESSION_SECRET"
+  check_secret "PORT"
 }
 
 cmd_build() {
-  echo -e "${CYAN}🔨 Building bot...${RESET}"
-  pnpm --filter "$BOT_FILTER" run build
+  echo -e "${CYAN}🔨 Building bot & frontend...${RESET}"
+  pnpm run build
 }
 
 cmd_typecheck() {
   echo -e "${CYAN}🔍 Mengecek TypeScript...${RESET}"
-  pnpm --filter "$BOT_FILTER" run typecheck
+  pnpm run lint
 }
 
 COMMAND="${1:-help}"

@@ -120,6 +120,27 @@ export const BotCommandsGuide: React.FC<Props> = ({ status }) => {
       badgeColor: "bg-indigo-50 text-indigo-700 border-indigo-200",
     },
     {
+      name: "/skip",
+      args: "",
+      desc: "Lewati lagu yang sedang diputar dan mainkan lagu berikutnya di antrean (atau tekan tombol ⏭️).",
+      category: "Music Player",
+      badgeColor: "bg-indigo-50 text-indigo-700 border-indigo-200",
+    },
+    {
+      name: "/queue",
+      args: "",
+      desc: "Lihat daftar lengkap lagu dalam antrean pemutaran musik server.",
+      category: "Music Player",
+      badgeColor: "bg-indigo-50 text-indigo-700 border-indigo-200",
+    },
+    {
+      name: "/nowplaying",
+      args: "",
+      desc: "Tampilkan informasi lagu yang sedang diputar lengkap dengan visual progress bar durasi.",
+      category: "Music Player",
+      badgeColor: "bg-indigo-50 text-indigo-700 border-indigo-200",
+    },
+    {
       name: "/clear",
       args: "",
       desc: "Hapus riwayat memori percakapan Porsche-chan di channel tersebut.",
@@ -291,22 +312,27 @@ export const BotCommandsGuide: React.FC<Props> = ({ status }) => {
         <p className="text-xs text-slate-600 leading-relaxed">
           Porsche-chan memutar musik dengan output jernih <strong>48kHz Stereo Raw PCM</strong>. Setiap lagu yang diputar menyertakan pesan kontrol interaktif langsung di Discord:
         </p>
-        <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div className="p-3 bg-indigo-50 border border-indigo-200 rounded-xl text-center">
             <div className="text-xl mb-1">⏸️ / ▶️</div>
             <div className="text-xs font-semibold text-indigo-900">Pause / Resume</div>
             <div className="text-[11px] text-indigo-600 mt-0.5">Jeda & lanjutkan musik secara instan</div>
           </div>
+          <div className="p-3 bg-violet-50 border border-violet-200 rounded-xl text-center">
+            <div className="text-xl mb-1">⏭️</div>
+            <div className="text-xs font-semibold text-violet-900">Skip</div>
+            <div className="text-[11px] text-violet-600 mt-0.5">Lewati lagu ke antrean berikutnya</div>
+          </div>
           <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-center">
             <div className="text-xl mb-1">⏹️</div>
             <div className="text-xs font-semibold text-rose-900">Stop</div>
-            <div className="text-[11px] text-rose-600 mt-0.5">Hentikan musik & bersihkan antrean (bot tetap di VC)</div>
+            <div className="text-[11px] text-rose-600 mt-0.5">Hentikan musik & bersihkan antrean</div>
           </div>
         </div>
-        <div className="mt-3 text-xs text-slate-500 flex items-center gap-1.5">
+        <div className="mt-3 text-xs text-slate-500 flex items-center gap-1.5 flex-wrap">
           <span>💡</span>
           <span>
-            Bisa juga menggunakan command teks: <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!play &lt;link/judul&gt;</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!pause</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!resume</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!stop</code>.
+            Bisa juga menggunakan command teks: <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!play &lt;link/judul&gt;</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!skip</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!queue</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!np</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!pause</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!resume</code>, <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">!stop</code>.
           </span>
         </div>
       </div>

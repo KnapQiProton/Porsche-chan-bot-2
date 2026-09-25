@@ -2,10 +2,10 @@
 nixPkgs = ["yt-dlp", "ffmpeg"]
 
 [phases.install]
-cmds = ["npm install -g pnpm", "pnpm install --frozen-lockfile"]
+cmds = ["npm install"]
 
 [phases.build]
-cmds = ["pnpm --filter @workspace/api-server run build"]
+cmds = ["npm run build"]
 
 [start]
-cmd = "pnpm --filter @workspace/api-server run start"
+cmd = "npm start"

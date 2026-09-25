@@ -395,9 +395,20 @@ export async function searchDuckDuckGo(query: string): Promise<{ title: string; 
     const titleEl = $(row).find("a.result-link");
     const snippetEl = $(row).next("tr").find("td.result-snippet");
     const title = titleEl.text().trim();
-    const url = titleEl.attr("href") ?? "";
+    const rawUrl = titleEl.attr("href") ?? "";
     const snippet = snippetEl.text().trim();
-    if (title && snippet) results.push({ title, url, snippet });
+    let cleanUrl = rawUrl;
+    if (cleanUrl.includes("uddg=")) {
+      const match = cleanUrl.match(/uddg=([^&]+)/);
+      if (match && match[1]) {
+        try {
+          cleanUrl = decodeURIComponent(match[1]);
+        } catch {}
+      }
+    } else if (cleanUrl.startsWith("//")) {
+      cleanUrl = `https:${cleanUrl}`;
+    }
+    if (title && snippet) results.push({ title, url: cleanUrl, snippet });
   });
   return results;
 }
@@ -1782,6 +1793,16 @@ async function translateWithWebScraperBackup(text: string, targetLanguage: strin
   throw new Error("FREE_TRANSLATORS_UNAVAILABLE");
 }
 
+function safeParseTranslationJson(rawText: string): { translatedText?: string; detectedSourceLanguage?: string } | null {
+  const match = rawText.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
 export async function translateWithAI(text: string, targetLanguage: string): Promise<TranslationResult> {
   if (text.length > 128_000) {
     throw new Error("TRANSLATION_TEXT_TOO_LONG");
@@ -1817,9 +1838,8 @@ Do NOT include any markdown codeblocks or conversational text around the JSON.`;
         })
       );
       const rawText = response.text?.trim() || "";
-      const cleaned = rawText.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
-      const parsed = JSON.parse(cleaned);
-      if (parsed.translatedText) {
+      const parsed = safeParseTranslationJson(rawText);
+      if (parsed?.translatedText) {
         return {
           text: parsed.translatedText,
           detectedSourceLanguage: parsed.detectedSourceLanguage || "Auto",
@@ -1844,9 +1864,8 @@ Do NOT include any markdown codeblocks or conversational text around the JSON.`;
           { role: "user", content: text },
         ]
       );
-      const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
-      const parsed = JSON.parse(cleaned);
-      if (parsed.translatedText) {
+      const parsed = safeParseTranslationJson(raw);
+      if (parsed?.translatedText) {
         return {
           text: parsed.translatedText,
           detectedSourceLanguage: parsed.detectedSourceLanguage || "Auto",
@@ -1871,9 +1890,8 @@ Do NOT include any markdown codeblocks or conversational text around the JSON.`;
           { role: "user", content: text },
         ]
       );
-      const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
-      const parsed = JSON.parse(cleaned);
-      if (parsed.translatedText) {
+      const parsed = safeParseTranslationJson(raw);
+      if (parsed?.translatedText) {
         return {
           text: parsed.translatedText,
           detectedSourceLanguage: parsed.detectedSourceLanguage || "Auto",
@@ -1898,9 +1916,8 @@ Do NOT include any markdown codeblocks or conversational text around the JSON.`;
           { role: "user", content: text },
         ]
       );
-      const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
-      const parsed = JSON.parse(cleaned);
-      if (parsed.translatedText) {
+      const parsed = safeParseTranslationJson(raw);
+      if (parsed?.translatedText) {
         return {
           text: parsed.translatedText,
           detectedSourceLanguage: parsed.detectedSourceLanguage || "Auto",
@@ -1995,7 +2012,7 @@ Jika ada referensi web di atas yang relevan, gunakan untuk memperkuat keakuratan
           model: "gemini-2.5-flash",
           contents: [{ role: "user", parts: [{ text: deepPrompt }] }],
           config: {
-            thinkingConfig: { thinkingBudget: -1 },
+            thinkingConfig: { thinkingBudget: 2048 },
             maxOutputTokens: 8192,
           },
         })
@@ -2454,6 +2471,18 @@ export const COMMANDS = [
       opt.setName("detik").setDescription("Jumlah detik untuk memundurkan musik (default: 10)").setRequired(false)
     )
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("skip")
+    .setDescription("Skip lagu yang sedang diputar ke lagu berikutnya")
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("queue")
+    .setDescription("Lihat daftar lagu dalam antrean musik")
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("nowplaying")
+    .setDescription("Lihat lagu yang sedang diputar beserta progress bar")
+    .toJSON(),
 ];
 
 // Discord Client
@@ -2515,6 +2544,107 @@ client.once(Events.ClientReady, async (c) => {
 
 client.on("error", (err) => {
   logger.error({ err }, "Discord client error (non-fatal)");
+});
+
+client.on(Events.ShardDisconnect, (_event, id) => {
+  logger.warn({ shardId: id }, "Discord bot shard disconnected");
+  botStatusInfo.isLoggedIn = false;
+});
+
+client.on(Events.ShardReconnecting, (id) => {
+  logger.info({ shardId: id }, "Discord bot shard reconnecting");
+});
+
+export const VOICEMASTER_CATEGORY_ID = process.env.VOICEMASTER_CATEGORY_ID?.trim();
+export const stayChannels = new Map<string, string>();
+const reconnectTimers = new Map<string, NodeJS.Timeout>();
+
+export function scheduleStayReconnect(guildId: string, channelId: string) {
+  if (reconnectTimers.has(guildId)) clearTimeout(reconnectTimers.get(guildId)!);
+  const timer = setTimeout(async () => {
+    reconnectTimers.delete(guildId);
+    await reconnectStayChannel(guildId, channelId);
+  }, 4000);
+  reconnectTimers.set(guildId, timer);
+}
+
+export async function reconnectStayChannel(guildId: string, channelId: string): Promise<void> {
+  if (stayChannels.get(guildId) !== channelId) return;
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return;
+
+  let channel: any;
+  try {
+    channel = await guild.channels.fetch(channelId);
+  } catch {
+    logger.warn({ guildId, channelId }, "Stay voice channel no longer exists; clearing stay watchdog");
+    stayChannels.delete(guildId);
+    return;
+  }
+  if (!channel || !channel.isVoiceBased()) {
+    stayChannels.delete(guildId);
+    return;
+  }
+
+  const existing = getVoiceConnection(guildId);
+  if (existing && existing.joinConfig.channelId === channelId && existing.state.status === VoiceConnectionStatus.Ready) return;
+  if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) {
+    safeDestroyVoiceConnection(existing);
+  }
+
+  try {
+    const connection = joinVoiceChannel({
+      channelId,
+      guildId,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: true,
+      selfMute: false,
+    });
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    logger.info({ guildId, channelId, channelName: channel.name }, "Successfully reconnected to stay voice channel");
+  } catch (err) {
+    logger.warn({ err, guildId, channelId }, "Failed to reconnect to stay voice channel, will retry in 10s");
+    scheduleStayReconnect(guildId, channelId);
+  }
+}
+
+// Watchdog for voice state updates (VoiceMaster auto-join & reconnect)
+client.on(Events.VoiceStateUpdate, async (_oldState, newState) => {
+  // If the bot itself was disconnected or moved from a stayChannel, schedule reconnect
+  if (newState.member?.user?.id === client.user?.id) {
+    const targetChannelId = stayChannels.get(newState.guild.id);
+    if (targetChannelId && newState.channelId !== targetChannelId) {
+      logger.warn(
+        { guild: newState.guild.id, targetChannelId, actualChannelId: newState.channelId },
+        "Bot left stay voice channel; scheduling watchdog reconnect"
+      );
+      scheduleStayReconnect(newState.guild.id, targetChannelId);
+    }
+    return;
+  }
+
+  // VoiceMaster auto-join temporary VC when a user enters
+  if (VOICEMASTER_CATEGORY_ID && newState.channel && newState.channel.parentId === VOICEMASTER_CATEGORY_ID) {
+    const channel = newState.channel;
+    const existing = getVoiceConnection(newState.guild.id);
+    if (existing && existing.joinConfig.channelId === channel.id) return;
+    if (existing) return; // Keep existing active VC connection
+
+    try {
+      const connection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId: newState.guild.id,
+        adapterCreator: newState.guild.voiceAdapterCreator,
+        selfDeaf: true,
+        selfMute: false,
+      });
+      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+      stayChannels.set(newState.guild.id, channel.id);
+      logger.info({ channel: channel.name, guild: newState.guild.id }, "Bot auto-joined VoiceMaster temporary channel");
+    } catch (err) {
+      logger.error({ err, channel: channel.name }, "Failed to auto-join VoiceMaster channel");
+    }
+  }
 });
 
 // Slash Command & Button Interaction Handler
@@ -2783,6 +2913,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     });
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      stayChannels.set(interaction.guild.id, voiceChannel.id);
       await interaction.reply({
         content: `✅ Porsche-chan sekarang ada di **${voiceChannel.name}** dan akan STAY di sana! (๑˃ᴗ˂)ﻌ`,
       });
@@ -2811,6 +2942,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     });
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      stayChannels.set(guild.id, targetChannel.id);
       await interaction.reply({
         content: `✅ Porsche-chan sekarang stay di voice channel **${targetChannel.name}**! (๑˃ᴗ˂)ﻌ`,
       });
@@ -2821,6 +2953,9 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
   }
 
   if (interaction.commandName === "leave-vc") {
+    if (interaction.guild) {
+      stayChannels.delete(interaction.guild.id);
+    }
     await MusicService.handleLeave(interaction);
   }
 
@@ -2848,6 +2983,18 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
   if (interaction.commandName === "rewind") {
     const sec = interaction.options.getInteger("detik") ?? 10;
     await MusicService.handleSeekCommand(interaction, -Math.abs(sec));
+  }
+
+  if (interaction.commandName === "skip") {
+    await MusicService.handleSkip(interaction);
+  }
+
+  if (interaction.commandName === "queue") {
+    await MusicService.handleQueue(interaction);
+  }
+
+  if (interaction.commandName === "nowplaying") {
+    await MusicService.handleNowPlaying(interaction);
   }
 }
 
@@ -2948,6 +3095,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
     await MusicService.rewindFromMessage(message, sec);
     return;
   }
+  if (rawContent === "!skip" || rawContent === "!lewati") {
+    await MusicService.skipFromMessage(message);
+    return;
+  }
+  if (rawContent === "!queue" || rawContent === "!antrean" || rawContent === "!antrian" || rawContent === "!q") {
+    await MusicService.queueFromMessage(message);
+    return;
+  }
+  if (rawContent === "!np" || rawContent === "!nowplaying" || rawContent === "!lagu") {
+    await MusicService.nowPlayingFromMessage(message);
+    return;
+  }
 
   const isMentioned = client.user ? message.mentions.has(client.user.id) : false;
   const isDM = message.channel.type === ChannelType.DM || (message.channel.type as number) === 1;
@@ -2973,6 +3132,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
   }
   if (/^(?:resume|lanjut|lanjutkan|lanjut musik)$/i.test(userText)) {
     await MusicService.resumeFromMessage(message);
+    return;
+  }
+  if (/^(?:skip|lewati|skip lagu)$/i.test(userText)) {
+    await MusicService.skipFromMessage(message);
+    return;
+  }
+  if (/^(?:queue|antrean|antrian|daftar lagu)$/i.test(userText)) {
+    await MusicService.queueFromMessage(message);
+    return;
+  }
+  if (/^(?:np|now playing|lagu apa|lagu apa ini)$/i.test(userText)) {
+    await MusicService.nowPlayingFromMessage(message);
     return;
   }
   if (/^(?:forward|maju)(?:\s+\d+(?:\s*detik)?)?$/i.test(userText)) {
@@ -3131,7 +3302,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         try {
           await message.reply({ embeds: [embed] });
         } catch {
-          await message.reply(truncated);
+          await message.reply(truncated.length > 2000 ? truncated.slice(0, 1997) + "..." : truncated);
         }
       }
       return;
@@ -3277,11 +3448,17 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
       conversationHistory.set(channelId, finalHistory);
 
-      const truncatedReply = reply.length > 4000 ? reply.slice(0, 4000) + "…" : reply;
-      try {
-        await message.reply(truncatedReply);
-      } catch {
-        await channel.send(truncatedReply);
+      const chunks = splitMessage(reply);
+      for (let i = 0; i < chunks.length; i++) {
+        if (i === 0) {
+          try {
+            await message.reply(chunks[i]);
+          } catch {
+            await channel.send(chunks[i]);
+          }
+        } else {
+          await channel.send(chunks[i]);
+        }
       }
     } catch (error) {
       logger.error({ error, userText }, "Error in text chat");

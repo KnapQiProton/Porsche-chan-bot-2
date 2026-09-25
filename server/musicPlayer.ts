@@ -27,6 +27,8 @@ import {
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
+import os from "os";
+import { PassThrough } from "stream";
 import playdl from "play-dl";
 import ytdl from "@distube/ytdl-core";
 import { logger } from "./logger";
@@ -80,19 +82,26 @@ export function safeDestroyVoiceConnection(conn?: VoiceConnection | null): void 
 
 // Ensure yt-dlp binary is available
 export async function getOrDownloadYtDlp(): Promise<string> {
+  const isWin = process.platform === "win32";
   const binDir = path.join(process.cwd(), "bin");
-  const localYtDlp = path.join(binDir, "yt-dlp");
+  const binName = isWin ? "yt-dlp.exe" : "yt-dlp";
+  const localYtDlp = path.join(binDir, binName);
 
   if (fs.existsSync(localYtDlp)) {
     try {
-      fs.chmodSync(localYtDlp, 0o755);
+      if (!isWin) fs.chmodSync(localYtDlp, 0o755);
     } catch {}
     return localYtDlp;
   }
 
-  for (const sysPath of ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp"]) {
-    if (fs.existsSync(sysPath)) {
-      return sysPath;
+  // Check system PATH
+  const sysCandidates = isWin
+    ? ["yt-dlp.exe", "yt-dlp"]
+    : ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "yt-dlp"];
+
+  for (const sysPath of sysCandidates) {
+    if (sysPath.startsWith("/")) {
+      if (fs.existsSync(sysPath)) return sysPath;
     }
   }
 
@@ -100,21 +109,30 @@ export async function getOrDownloadYtDlp(): Promise<string> {
     fs.mkdirSync(binDir, { recursive: true });
   }
 
-  logger.info("yt-dlp not found locally, downloading latest release...");
+  const downloadUrl = isWin
+    ? "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+    : "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+
+  logger.info({ isWin, downloadUrl }, "yt-dlp not found locally, downloading latest release...");
   try {
-    const res = await fetch("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp", {
+    const res = await fetch(downloadUrl, {
       headers: { "User-Agent": "Mozilla/5.0" },
       redirect: "follow",
     });
     if (!res.ok) throw new Error(`Failed to download yt-dlp binary (HTTP ${res.status})`);
     const buffer = await res.arrayBuffer();
     fs.writeFileSync(localYtDlp, Buffer.from(buffer));
-    fs.chmodSync(localYtDlp, 0o755);
+    if (!isWin) {
+      try {
+        fs.chmodSync(localYtDlp, 0o755);
+      } catch {}
+    }
     logger.info("yt-dlp downloaded and ready!");
     return localYtDlp;
   } catch (err) {
     logger.error({ err }, "Failed to download yt-dlp binary");
-    throw err;
+    // Fall back to system command name
+    return isWin ? "yt-dlp.exe" : "yt-dlp";
   }
 }
 
@@ -508,20 +526,37 @@ export async function getYouTubeMetadata(urlOrVideoId: string, ytdlpPath?: strin
 
 // Helper to check for YouTube cookies (from file or environment variable)
 function getYtDlpCookieArgs(): string[] {
-  const fullCookies = path.join(process.cwd(), "cookies.full.txt");
-  if (fs.existsSync(fullCookies)) {
-    return ["--cookies", fullCookies];
-  }
+  // 1. Check cookies.txt first (standard filename used by users and browser extensions)
   const localCookies = path.join(process.cwd(), "cookies.txt");
   if (fs.existsSync(localCookies)) {
-    return ["--cookies", localCookies];
+    try {
+      const stats = fs.statSync(localCookies);
+      if (stats.size > 10) {
+        return ["--cookies", localCookies];
+      }
+    } catch {}
   }
+
+  // 2. Check cookies.full.txt as secondary fallback
+  const fullCookies = path.join(process.cwd(), "cookies.full.txt");
+  if (fs.existsSync(fullCookies)) {
+    try {
+      const stats = fs.statSync(fullCookies);
+      if (stats.size > 10) {
+        return ["--cookies", fullCookies];
+      }
+    } catch {}
+  }
+
+  // 3. Check environment variable (cross-platform temp path)
   if (process.env.YOUTUBE_COOKIE && process.env.YOUTUBE_COOKIE.trim()) {
-    const tmpCookiePath = "/tmp/youtube_cookies.txt";
+    const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
     try {
       fs.writeFileSync(tmpCookiePath, process.env.YOUTUBE_COOKIE.trim(), "utf-8");
       return ["--cookies", tmpCookiePath];
-    } catch {}
+    } catch (err) {
+      logger.warn({ err }, "Could not write temporary youtube cookie file");
+    }
   }
   return [];
 }
@@ -846,6 +881,90 @@ export async function searchYouTubeWithYtDlp(
   }
 }
 
+// Helper for validating piped yt-dlp -> ffmpeg stream with fast failover
+function tryPipedStream(
+  ytdlpPath: string,
+  ytdlpArgs: string[],
+  seekSeconds: number,
+  timeoutMs: number = 4000
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let ytdlp: any;
+    let ffmpeg: any;
+
+    try {
+      ytdlp = spawn(ytdlpPath, ytdlpArgs, { stdio: ["ignore", "pipe", "ignore"] });
+      const ffmpegArgs: string[] = [
+        "-analyzeduration", "0",
+        "-loglevel", "error",
+      ];
+      if (seekSeconds > 0) {
+        ffmpegArgs.push("-ss", seekSeconds.toString());
+      }
+      ffmpegArgs.push("-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
+      ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: ["pipe", "pipe", "ignore"] });
+    } catch (spawnErr) {
+      return reject(spawnErr);
+    }
+
+    ytdlp.stdout.on("error", () => {});
+    ffmpeg.stdin.on("error", () => {});
+    ffmpeg.stdout.on("error", () => {});
+
+    ytdlp.stdout.pipe(ffmpeg.stdin);
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try { ytdlp.kill("SIGKILL"); } catch {}
+        try { ffmpeg.kill("SIGKILL"); } catch {}
+        reject(new Error("Piped audio stream timeout"));
+      }
+    }, timeoutMs);
+
+    ytdlp.on("error", (err: any) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        try { ffmpeg.kill("SIGKILL"); } catch {}
+        reject(err);
+      }
+    });
+
+    ffmpeg.on("error", (err: any) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        try { ytdlp.kill("SIGKILL"); } catch {}
+        reject(err);
+      }
+    });
+
+    ytdlp.on("close", (code: number) => {
+      if (!settled && code !== 0) {
+        settled = true;
+        clearTimeout(timer);
+        try { ffmpeg.kill("SIGKILL"); } catch {}
+        reject(new Error(`yt-dlp exited with error code ${code}`));
+      }
+    });
+
+    const onData = (chunk: Buffer) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        ffmpeg.stdout.removeListener("data", onData);
+        const pt = new PassThrough();
+        pt.write(chunk);
+        ffmpeg.stdout.pipe(pt);
+        resolve(createAudioResource(pt, { inputType: StreamType.Raw }));
+      }
+    };
+    ffmpeg.stdout.on("data", onData);
+  });
+}
+
 // Create AudioResource from YouTube with multi-tier streaming architecture (Piped yt-dlp -> FFmpeg -> Direct URL -> SoundCloud fallback)
 export async function createAudioResourceFromYtDlp(
   urlOrQuery: string,
@@ -855,7 +974,7 @@ export async function createAudioResourceFromYtDlp(
 ): Promise<any> {
   const cookieArgs = getYtDlpCookieArgs();
 
-  // Tier 1: Direct yt-dlp stdout pipe into FFmpeg raw PCM (Primary, fastest, bypasses HTTP header limits)
+  // Tier 1: Direct yt-dlp stdout pipe into FFmpeg raw PCM (Primary, fastest)
   try {
     const ytdlpArgs = [
       "--js-runtimes", "node",
@@ -869,26 +988,9 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       urlOrQuery,
     ];
-    const ytdlp = spawn(ytdlpPath, ytdlpArgs, { stdio: ["ignore", "pipe", "ignore"] });
-    const ffmpegArgs: string[] = [
-      "-analyzeduration", "0",
-      "-loglevel", "error",
-    ];
-    if (seekSeconds > 0) {
-      ffmpegArgs.push("-ss", seekSeconds.toString());
-    }
-    ffmpegArgs.push("-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
-    const ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: ["pipe", "pipe", "ignore"] });
-
-    ytdlp.stdout.on("error", () => {});
-    ytdlp.on("error", (err) => logger.warn({ err }, "yt-dlp Tier 1 pipe process error"));
-    ffmpeg.stdin.on("error", () => {});
-    ffmpeg.stdout.on("error", () => {});
-    ffmpeg.on("error", (err) => logger.warn({ err }, "FFmpeg Tier 1 pipe process error"));
-
-    ytdlp.stdout.pipe(ffmpeg.stdin);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 4000);
     logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp stdout pipe stream");
-    return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+    return resource;
   } catch (err) {
     logger.warn({ err }, "Tier 1 yt-dlp pipe stream failed, trying Tier 2");
   }
@@ -907,26 +1009,9 @@ export async function createAudioResourceFromYtDlp(
         "--no-playlist",
         urlOrQuery,
       ];
-      const ytdlp = spawn(ytdlpPath, ytdlpArgs, { stdio: ["ignore", "pipe", "ignore"] });
-      const ffmpegArgs: string[] = [
-        "-analyzeduration", "0",
-        "-loglevel", "error",
-      ];
-      if (seekSeconds > 0) {
-        ffmpegArgs.push("-ss", seekSeconds.toString());
-      }
-      ffmpegArgs.push("-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
-      const ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: ["pipe", "pipe", "ignore"] });
-
-      ytdlp.stdout.on("error", () => {});
-      ytdlp.on("error", (err) => logger.warn({ err }, "yt-dlp Tier 2 pipe process error"));
-      ffmpeg.stdin.on("error", () => {});
-      ffmpeg.stdout.on("error", () => {});
-      ffmpeg.on("error", (err) => logger.warn({ err }, "FFmpeg Tier 2 pipe process error"));
-
-      ytdlp.stdout.pipe(ffmpeg.stdin);
+      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 4000);
       logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp clean session pipe stream");
-      return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+      return resource;
     } catch (err) {
       logger.warn({ err }, "Tier 2 clean session pipe stream failed, trying Tier 3");
     }
@@ -934,7 +1019,7 @@ export async function createAudioResourceFromYtDlp(
 
   // Tier 3: Direct HTTPS audio URL extracted by yt-dlp with FFmpeg reconnect
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 6000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 8000);
     if (directUrl) {
       logger.info({ urlOrQuery }, "Streaming via Tier 3 yt-dlp direct HTTPS audio URL");
       const ffmpeg = createPCMStreamFromUrl(directUrl, seekSeconds);
@@ -1143,13 +1228,29 @@ export function buildNowPlayingEmbed(track: TrackMetadata, isQueue: boolean = fa
   return embed;
 }
 
-// Interactive Music Playback Buttons: [ ⏸️ Pause / ▶️ Resume ] [ ⏹️ Stop ]
+// Helper to generate visual progress bar for Now Playing
+export function buildProgressBar(currentSec: number, totalSec: number, length: number = 16): string {
+  if (!totalSec || totalSec <= 0) return "🔘" + "─".repeat(length - 1);
+  const progress = Math.min(1, Math.max(0, currentSec / totalSec));
+  const progressIndex = Math.round(progress * (length - 1));
+  const bar = "─".repeat(progressIndex) + "🔘" + "─".repeat(length - 1 - progressIndex);
+  return bar;
+}
+
+// Interactive Music Playback Buttons: [ ⏸️ Pause / ▶️ Resume ] [ ⏭️ Skip ] [ ⏹️ Stop ]
 export function buildMusicControlRow(isPaused: boolean = false, disabled: boolean = false): ActionRowBuilder<ButtonBuilder> {
   const pauseResumeBtn = new ButtonBuilder()
     .setCustomId("music_pause_resume")
     .setLabel(isPaused ? "Resume" : "Pause")
     .setEmoji(isPaused ? "▶️" : "⏸️")
     .setStyle(isPaused ? ButtonStyle.Success : ButtonStyle.Primary)
+    .setDisabled(disabled);
+
+  const skipBtn = new ButtonBuilder()
+    .setCustomId("music_skip")
+    .setLabel("Skip")
+    .setEmoji("⏭️")
+    .setStyle(ButtonStyle.Secondary)
     .setDisabled(disabled);
 
   const stopBtn = new ButtonBuilder()
@@ -1159,7 +1260,7 @@ export function buildMusicControlRow(isPaused: boolean = false, disabled: boolea
     .setStyle(ButtonStyle.Danger)
     .setDisabled(disabled);
 
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(pauseResumeBtn, stopBtn);
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(pauseResumeBtn, skipBtn, stopBtn);
 }
 
 // Music Player Session Management
@@ -1588,6 +1689,12 @@ export class MusicService {
       }).catch(() => {});
       return;
     }
+
+    // 5. Skip
+    if (customId === "music_skip") {
+      await MusicService.handleSkip(interaction);
+      return;
+    }
   }
 
   public static async handleLeave(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1757,5 +1864,182 @@ export class MusicService {
     const targetPos = Math.max(0, currentPos - deltaSec);
     await MusicService.seekTrackInSession(session, targetPos);
     await message.reply(`⏪ **-${deltaSec}s**: Posisi musik sekarang di **${formatDuration(targetPos)}** (๑˃ᴗ˂)ﻌ`);
+  }
+
+  public static async handleSkip(interaction: ChatInputCommandInteraction | ButtonInteraction): Promise<void> {
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+    const session = sessions.get(guild.id);
+    if (!session || (!session.isPlaying && !session.currentTrack)) {
+      await interaction.reply({ content: "❌ Tidak ada musik yang sedang diputar untuk di-skip~ (๑•́ ₃ •̀๑)", ephemeral: true });
+      return;
+    }
+
+    const skippedTitle = session.currentTrack?.title || "Lagu";
+    if (session.queue.length > 0) {
+      const nextTrack = session.queue.shift()!;
+      session.isSeeking = false;
+      session.seekOffsetSec = 0;
+      session.player.stop(true);
+      await MusicService.playTrackInSession(session, nextTrack);
+      const replyContent = `⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTrack.title}** (๑˃ᴗ˂)ﻌ`;
+      if (interaction.isButton()) {
+        await interaction.reply({ content: replyContent });
+      } else {
+        await interaction.reply({ content: replyContent });
+      }
+    } else {
+      session.player.stop(true);
+      session.isPlaying = false;
+      session.currentTrack = null;
+      session.currentResource = null;
+      const replyContent = `⏭️ Berhasil skip **${skippedTitle}**. Antrean sudah kosong! (◡ ω ◡)`;
+      if (interaction.isButton()) {
+        await interaction.reply({ content: replyContent });
+      } else {
+        await interaction.reply({ content: replyContent });
+      }
+    }
+  }
+
+  public static async handleQueue(interaction: ChatInputCommandInteraction): Promise<void> {
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+    const session = sessions.get(guild.id);
+    if (!session || (!session.isPlaying && !session.currentTrack && session.queue.length === 0)) {
+      await interaction.reply({ content: "❌ Tidak ada antrean musik saat ini~ (๑•́ ₃ •̀๑)", ephemeral: true });
+      return;
+    }
+
+    const current = session.currentTrack;
+    const embed = new EmbedBuilder()
+      .setColor(0x8b5cf6)
+      .setTitle("📋 Antrean Musik Porsche-chan ✨")
+      .setDescription(current ? `🎶 **Sedang Memutar:**\n**[${current.title}](${current.url})** | \`${current.duration}\` (diminta oleh ${current.requesterName})` : "Tidak ada lagu yang sedang aktif.")
+      .setFooter({ text: `Total lagu di antrean: ${session.queue.length}` })
+      .setTimestamp();
+
+    if (session.queue.length > 0) {
+      const list = session.queue.slice(0, 10).map((t, idx) => `**${idx + 1}.** [${t.title}](${t.url}) - \`${t.duration}\` (${t.requesterName})`).join("\n");
+      const extra = session.queue.length > 10 ? `\n*...dan ${session.queue.length - 10} lagu lainnya.*` : "";
+      embed.addFields([{ name: "Lagu Berikutnya", value: list + extra, inline: false }]);
+    }
+
+    await interaction.reply({ embeds: [embed] });
+  }
+
+  public static async handleNowPlaying(interaction: ChatInputCommandInteraction): Promise<void> {
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+    const session = sessions.get(guild.id);
+    if (!session || !session.isPlaying || !session.currentTrack) {
+      await interaction.reply({ content: "❌ Tidak ada musik yang sedang diputar saat ini~ (๑•́ ₃ •̀๑)", ephemeral: true });
+      return;
+    }
+
+    const track = session.currentTrack;
+    const elapsed = session.currentResource ? Math.floor(session.currentResource.playbackDuration / 1000) : 0;
+    const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
+    const totalSec = track.durationSec || 0;
+    const bar = buildProgressBar(currentPos, totalSec);
+
+    const embed = buildNowPlayingEmbed(track, false);
+    embed.addFields([
+      {
+        name: "⏱️ Progres",
+        value: `\`${formatDuration(currentPos)}\` ${bar} \`${track.duration}\``,
+        inline: false,
+      },
+    ]);
+
+    await interaction.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
+  }
+
+  public static async skipFromMessage(message: Message): Promise<void> {
+    const guild = message.guild;
+    if (!guild) return;
+    const session = sessions.get(guild.id);
+    if (!session || (!session.isPlaying && !session.currentTrack)) {
+      await message.reply("❌ Tidak ada musik yang sedang diputar untuk di-skip~ (๑•́ ₃ •̀๑)");
+      return;
+    }
+
+    const skippedTitle = session.currentTrack?.title || "Lagu";
+    if (session.queue.length > 0) {
+      const nextTrack = session.queue.shift()!;
+      session.isSeeking = false;
+      session.seekOffsetSec = 0;
+      session.player.stop(true);
+      await MusicService.playTrackInSession(session, nextTrack);
+      await message.reply(`⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTrack.title}** (๑˃ᴗ˂)ﻌ`);
+    } else {
+      session.player.stop(true);
+      session.isPlaying = false;
+      session.currentTrack = null;
+      session.currentResource = null;
+      await message.reply(`⏭️ Berhasil skip **${skippedTitle}**. Antrean sudah kosong! (◡ ω ◡)`);
+    }
+  }
+
+  public static async queueFromMessage(message: Message): Promise<void> {
+    const guild = message.guild;
+    if (!guild) return;
+    const session = sessions.get(guild.id);
+    if (!session || (!session.isPlaying && !session.currentTrack && session.queue.length === 0)) {
+      await message.reply("❌ Tidak ada antrean musik saat ini~ (๑•́ ₃ •̀๑)");
+      return;
+    }
+
+    const current = session.currentTrack;
+    const embed = new EmbedBuilder()
+      .setColor(0x8b5cf6)
+      .setTitle("📋 Antrean Musik Porsche-chan ✨")
+      .setDescription(current ? `🎶 **Sedang Memutar:**\n**[${current.title}](${current.url})** | \`${current.duration}\` (diminta oleh ${current.requesterName})` : "Tidak ada lagu yang sedang aktif.")
+      .setFooter({ text: `Total lagu di antrean: ${session.queue.length}` })
+      .setTimestamp();
+
+    if (session.queue.length > 0) {
+      const list = session.queue.slice(0, 10).map((t, idx) => `**${idx + 1}.** [${t.title}](${t.url}) - \`${t.duration}\` (${t.requesterName})`).join("\n");
+      const extra = session.queue.length > 10 ? `\n*...dan ${session.queue.length - 10} lagu lainnya.*` : "";
+      embed.addFields([{ name: "Lagu Berikutnya", value: list + extra, inline: false }]);
+    }
+
+    await message.reply({ embeds: [embed] });
+  }
+
+  public static async nowPlayingFromMessage(message: Message): Promise<void> {
+    const guild = message.guild;
+    if (!guild) return;
+    const session = sessions.get(guild.id);
+    if (!session || !session.isPlaying || !session.currentTrack) {
+      await message.reply("❌ Tidak ada musik yang sedang diputar saat ini~ (๑•́ ₃ •̀๑)");
+      return;
+    }
+
+    const track = session.currentTrack;
+    const elapsed = session.currentResource ? Math.floor(session.currentResource.playbackDuration / 1000) : 0;
+    const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
+    const totalSec = track.durationSec || 0;
+    const bar = buildProgressBar(currentPos, totalSec);
+
+    const embed = buildNowPlayingEmbed(track, false);
+    embed.addFields([
+      {
+        name: "⏱️ Progres",
+        value: `\`${formatDuration(currentPos)}\` ${bar} \`${track.duration}\``,
+        inline: false,
+      },
+    ]);
+
+    await message.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
   }
 }
