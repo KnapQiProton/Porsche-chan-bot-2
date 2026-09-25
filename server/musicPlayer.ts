@@ -43,8 +43,8 @@ if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
   }
 }
 
-// Optimal yt-dlp extractor args for YouTube on datacenter IPs (android + tv_embedded avoids bot detection and format errors)
-const YT_EXTRACTOR_ARGS = ["--extractor-args", "youtube:player_client=android,tv_embedded"];
+// Optimal yt-dlp extractor args for YouTube on datacenter IPs (android + tv_embedded + android_creator avoids bot detection and format errors)
+const YT_EXTRACTOR_ARGS = ["--extractor-args", "youtube:player_client=android,tv_embedded,android_creator"];
 
 export type MusicSource = "youtube" | "youtube_music" | "spotify" | "soundcloud" | "search";
 
@@ -324,6 +324,20 @@ export function formatDuration(secOrStr: number | string | undefined | null): st
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+// Parse duration string (e.g. "3:59", "3.59", "1:02:15") into total seconds
+export function parseDurationToSec(str?: string | null): number | undefined {
+  if (!str) return undefined;
+  const clean = str.trim();
+  const parts = clean.split(/[:.]/).map((p) => parseInt(p, 10));
+  if (parts.some(isNaN)) return undefined;
+  if (parts.length === 2) {
+    return parts[0] * 60 + parts[1];
+  } else if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  return undefined;
+}
+
 // Parse Title & Artist accurately so artist name never stays as generic "Artist" or "Artis"
 export function parseTitleAndArtist(rawTitle: string, fallbackAuthor?: string): { title: string; artist: string } {
   const t = rawTitle.trim();
@@ -591,8 +605,13 @@ function getYtDlpCookieArgs(): string[] {
   }
 
   // 3. Check environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
-  if (process.env.YOUTUBE_COOKIE && process.env.YOUTUBE_COOKIE.trim()) {
-    let cookieContent = process.env.YOUTUBE_COOKIE.trim();
+  const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES;
+  if (envCookie && envCookie.trim()) {
+    let cookieContent = envCookie.trim();
+    // Strip quotes if user entered them in Railway variable value
+    if ((cookieContent.startsWith('"') && cookieContent.endsWith('"')) || (cookieContent.startsWith("'") && cookieContent.endsWith("'"))) {
+      cookieContent = cookieContent.slice(1, -1).trim();
+    }
     // If user passed base64 encoded cookies to avoid newline formatting issues in Railway
     if (!cookieContent.includes("\t") && !cookieContent.startsWith("#") && cookieContent.length > 50) {
       try {
@@ -902,6 +921,90 @@ async function searchYouTubeInternal(
   });
 }
 
+// Fast, direct HTML scraper for YouTube search results (executes in <1s, 100% genuine YouTube, avoids bot-check and Python startup overhead)
+async function searchYouTubeViaDirectScrape(
+  query: string,
+  targetTitle?: string,
+  targetArtist?: string,
+  targetDurationSec?: number
+): Promise<YouTubeSearchResult | null> {
+  try {
+    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    const match = text.match(/ytInitialData\s*=\s*({.+?});<\/script>/);
+    if (!match) return null;
+
+    const data = JSON.parse(match[1]);
+    const sections = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
+    const entries: any[] = [];
+    for (const s of sections) {
+      const items = s.itemSectionRenderer?.contents || [];
+      for (const item of items) {
+        const v = item.videoRenderer;
+        if (v && v.videoId) {
+          const rawTitle = v.title?.runs?.[0]?.text || "";
+          const rawAuthor = v.ownerText?.runs?.[0]?.text || "";
+          const durText = v.lengthText?.simpleText || "";
+          const durSec = durText ? parseDurationToSec(durText) : undefined;
+          const thumb = v.thumbnail?.thumbnails?.[v.thumbnail.thumbnails.length - 1]?.url || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`;
+          entries.push({
+            id: v.videoId,
+            title: rawTitle,
+            uploader: rawAuthor,
+            duration: durSec,
+            durationRaw: durText || "Audio",
+            thumbnail: thumb,
+            url: `https://www.youtube.com/watch?v=${v.videoId}`,
+          });
+          if (entries.length >= 8) break;
+        }
+      }
+      if (entries.length >= 8) break;
+    }
+
+    if (entries.length === 0) return null;
+
+    const candidateTargetTitle = targetTitle || cleanTrackTitle(query);
+    const candidateTargetArtist = targetArtist || "";
+
+    const scored = entries
+      .map((e) => ({
+        entry: e,
+        score: scoreTrackCandidate(candidateTargetTitle, candidateTargetArtist, targetDurationSec, {
+          name: e.title,
+          user: { name: e.uploader },
+          durationInSec: e.duration,
+        }),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const best = scored[0].entry;
+    const parsed = parseTitleAndArtist(best.title, best.uploader);
+
+    logger.info({ id: best.id, title: best.title }, "Found YouTube track via direct fast search");
+    return {
+      id: best.id,
+      url: best.url,
+      title: parsed.title || best.title,
+      artist: parsed.artist && !isRecordLabelOrLyricChannel(parsed.artist) ? parsed.artist : best.uploader || "Artis YouTube",
+      duration: best.durationRaw || (best.duration ? formatDuration(best.duration) : "3:30"),
+      durationSec: best.duration,
+      thumbnail: best.thumbnail,
+    };
+  } catch (err) {
+    logger.debug({ err }, "Direct YouTube search scrape error");
+    return null;
+  }
+}
+
 export async function searchYouTubeWithYtDlp(
   query: string,
   ytdlpPath: string,
@@ -909,6 +1012,17 @@ export async function searchYouTubeWithYtDlp(
   targetArtist?: string,
   targetDurationSec?: number
 ): Promise<YouTubeSearchResult> {
+  // 1. Primary: Direct Fast YouTube Scrape (<1s, pure YouTube, high precision, no bot checks)
+  try {
+    const directResult = await searchYouTubeViaDirectScrape(query, targetTitle, targetArtist, targetDurationSec);
+    if (directResult) {
+      return directResult;
+    }
+  } catch (err) {
+    logger.debug({ err }, "Direct YouTube fast search failed, trying yt-dlp internal search");
+  }
+
+  // 2. Secondary: yt-dlp internal search
   try {
     return await searchYouTubeInternal(query, ytdlpPath, targetTitle, targetArtist, targetDurationSec);
   } catch (err) {
@@ -966,7 +1080,7 @@ function tryPipedStream(
   ytdlpPath: string,
   ytdlpArgs: string[],
   seekSeconds: number,
-  timeoutMs: number = 4000
+  timeoutMs: number = 15000
 ): Promise<any> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1056,7 +1170,7 @@ function tryPipedStream(
 function tryPipedUrlStream(
   audioUrl: string,
   seekSeconds: number,
-  timeoutMs: number = 3500
+  timeoutMs: number = 12000
 ): Promise<any> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1142,7 +1256,7 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 3500);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
     logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp stdout pipe stream");
     return resource;
   } catch (err) {
@@ -1162,7 +1276,7 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 3500);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
     logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp tv_embedded pipe stream");
     return resource;
   } catch (err) {
@@ -1171,10 +1285,10 @@ export async function createAudioResourceFromYtDlp(
 
   // Tier 3: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 4500);
+    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 8000);
     if (directUrl) {
       logger.info({ urlOrQuery }, "Attempting Tier 3 yt-dlp direct HTTPS audio URL");
-      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 3500);
+      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
       logger.info({ urlOrQuery }, "Streaming via Tier 3 yt-dlp direct HTTPS audio URL");
       return resource;
     }

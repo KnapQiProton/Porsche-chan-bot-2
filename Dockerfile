@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     git \
     build-essential \
     python3-dev \
-    && pipx install yt-dlp \
+    && pipx install "yt-dlp[default]" \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.local/bin:$PATH"
