@@ -15,13 +15,14 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.local/bin:$PATH"
-ENV NODE_ENV="production"
-ENV NODE_OPTIONS="--max-old-space-size=384"
 
 WORKDIR /app
 
 # Copy configuration files
 COPY package.json .npmrc tsconfig.json tsconfig.base.json vite.config.ts ./
+
+# Install dependencies (including dev tools needed for building)
+RUN npm install --legacy-peer-deps --include=dev
 
 # Copy source code and assets
 COPY server/ ./server/
@@ -29,9 +30,12 @@ COPY src/ ./src/
 COPY public/ ./public/
 COPY server.ts index.html ./
 
-# Install dependencies and build
-RUN npm install --legacy-peer-deps
+# Build frontend and backend
 RUN npm run build
+
+# Runtime environment
+ENV NODE_ENV="production"
+ENV NODE_OPTIONS="--max-old-space-size=384"
 
 EXPOSE 3000
 
