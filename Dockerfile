@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.local/bin:$PATH"
+ENV NODE_ENV="production"
+ENV NODE_OPTIONS="--max-old-space-size=384"
 
 WORKDIR /app
 

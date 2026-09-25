@@ -1159,7 +1159,18 @@ function tryPipedStream(
         const pt = new PassThrough();
         pt.write(chunk);
         ffmpeg.stdout.pipe(pt);
-        resolve(createAudioResource(pt, { inputType: StreamType.Raw }));
+
+        const cleanup = () => {
+          try { ytdlp.kill("SIGKILL"); } catch {}
+          try { ffmpeg.kill("SIGKILL"); } catch {}
+        };
+        pt.on("close", cleanup);
+        pt.on("end", cleanup);
+        pt.on("error", cleanup);
+
+        const resource = createAudioResource(pt, { inputType: StreamType.Raw });
+        (resource as any)._cleanupProcesses = cleanup;
+        resolve(resource);
       }
     };
     ffmpeg.stdout.on("data", onData);
@@ -1226,7 +1237,17 @@ function tryPipedUrlStream(
         const pt = new PassThrough();
         pt.write(chunk);
         ffmpeg.stdout.pipe(pt);
-        resolve(createAudioResource(pt, { inputType: StreamType.Raw }));
+
+        const cleanup = () => {
+          try { ffmpeg.kill("SIGKILL"); } catch {}
+        };
+        pt.on("close", cleanup);
+        pt.on("end", cleanup);
+        pt.on("error", cleanup);
+
+        const resource = createAudioResource(pt, { inputType: StreamType.Raw });
+        (resource as any)._cleanupProcesses = cleanup;
+        resolve(resource);
       }
     };
     ffmpeg.stdout.on("data", onData);
@@ -1551,6 +1572,15 @@ export class MusicService {
     return sessions.get(guildId);
   }
 
+  public static cleanupSessionProcesses(session?: GuildSession | null): void {
+    if (!session) return;
+    if (session.currentResource && typeof (session.currentResource as any)._cleanupProcesses === "function") {
+      try {
+        (session.currentResource as any)._cleanupProcesses();
+      } catch {}
+    }
+  }
+
   public static async joinOrGetVoice(
     guild: Guild,
     voiceChannel: VoiceBasedChannel,
@@ -1584,6 +1614,8 @@ export class MusicService {
             entersState(connection!, VoiceConnectionStatus.Connecting, 5_000),
           ]);
         } catch {
+          const currentSession = sessions.get(guild.id);
+          MusicService.cleanupSessionProcesses(currentSession);
           safeDestroyVoiceConnection(connection);
           sessions.delete(guild.id);
         }
@@ -1625,6 +1657,7 @@ export class MusicService {
           session!.isSeeking = false;
           return;
         }
+        MusicService.cleanupSessionProcesses(session);
         logger.info({ guildId: guild.id }, "Audio player is idle, advancing queue");
         session!.isPlaying = false;
         session!.isPaused = false;
@@ -1639,6 +1672,7 @@ export class MusicService {
       });
 
       player.on("error", (error) => {
+        MusicService.cleanupSessionProcesses(session);
         logger.error({ guildId: guild.id, error }, "Audio player error encountered");
         if (session!.isSeeking) {
           session!.isSeeking = false;
@@ -1684,6 +1718,7 @@ export class MusicService {
 
   private static async playTrackInSession(session: GuildSession, track: TrackMetadata): Promise<void> {
     try {
+      MusicService.cleanupSessionProcesses(session);
       if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
         try {
           await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
@@ -1793,6 +1828,7 @@ export class MusicService {
       return;
     }
 
+    MusicService.cleanupSessionProcesses(session);
     session.queue = [];
     session.currentTrack = null;
     session.currentResource = null;
@@ -1957,6 +1993,7 @@ export class MusicService {
 
     // 4. Stop
     if (customId === "music_stop") {
+      MusicService.cleanupSessionProcesses(session);
       session.queue = [];
       session.currentTrack = null;
       session.currentResource = null;
@@ -1988,6 +2025,7 @@ export class MusicService {
 
     const session = sessions.get(guild.id);
     if (session) {
+      MusicService.cleanupSessionProcesses(session);
       session.queue = [];
       session.currentTrack = null;
       session.currentResource = null;
@@ -2073,6 +2111,7 @@ export class MusicService {
       await message.reply("❌ Tidak ada musik yang sedang diputar saat ini~ (๑•́ ₃ •̀๑)");
       return;
     }
+    MusicService.cleanupSessionProcesses(session);
     session.queue = [];
     session.currentTrack = null;
     session.currentResource = null;
@@ -2160,6 +2199,7 @@ export class MusicService {
       return;
     }
 
+    MusicService.cleanupSessionProcesses(session);
     const skippedTitle = session.currentTrack?.title || "Lagu";
     if (session.queue.length > 0) {
       const nextTrack = session.queue.shift()!;
@@ -2255,6 +2295,7 @@ export class MusicService {
       return;
     }
 
+    MusicService.cleanupSessionProcesses(session);
     const skippedTitle = session.currentTrack?.title || "Lagu";
     if (session.queue.length > 0) {
       const nextTrack = session.queue.shift()!;
