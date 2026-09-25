@@ -368,7 +368,7 @@ export const BotCommandsGuide: React.FC<Props> = ({ status }) => {
           </h3>
         </div>
         <p className="text-xs text-slate-600 leading-relaxed">
-          Beri reaksi emoji bendera negara pada pesan mana pun di server Discord, dan Porsche-chan akan otomatis membalas dengan terjemahan berkualitas tinggi menggunakan model AI <strong>Gemini 2.5 Flash</strong> (dengan fallback Groq Llama 3.3 70B & Mistral):
+          Beri reaksi emoji bendera negara pada pesan mana pun di server Discord, dan Porsche-chan akan otomatis membalas dengan terjemahan berkualitas tinggi menggunakan model AI <strong>Gemini 3.8 Flash</strong> (dengan fallback Groq Llama 3.3 70B & Mistral):
         </p>
         <div className="mt-3 flex flex-wrap gap-2 text-xs">
           {[

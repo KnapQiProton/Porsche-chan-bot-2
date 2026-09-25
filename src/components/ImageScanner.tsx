@@ -122,7 +122,7 @@ export const ImageScanner: React.FC = () => {
                 AI Vision & Opinion Scanner
               </h2>
               <span className="text-[10px] bg-rose-100 text-rose-800 font-semibold px-2 py-0.5 rounded-full flex items-center gap-1">
-                <Sparkles className="w-3 h-3 text-rose-600" /> Powered by Gemini 2.5 Flash
+                <Sparkles className="w-3 h-3 text-rose-600" /> Powered by Gemini 3.8 Flash
               </span>
             </div>
             <p className="text-xs text-slate-500 mt-0.5">

@@ -175,6 +175,43 @@ function getGeminiClient(): GoogleGenAI | null {
   return geminiAi;
 }
 
+export const GEMINI_PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+export const GEMINI_FALLBACK_MODEL = "gemini-2.5-flash";
+
+async function callGeminiWithFallback(
+  ai: GoogleGenAI,
+  params: {
+    contents: any;
+    config?: any;
+  }
+) {
+  try {
+    return await withRetry(() =>
+      ai.models.generateContent({
+        model: GEMINI_PRIMARY_MODEL,
+        contents: params.contents,
+        config: params.config,
+      })
+    );
+  } catch (primaryErr) {
+    if (GEMINI_PRIMARY_MODEL !== GEMINI_FALLBACK_MODEL) {
+      logger.warn(
+        { primaryErr, model: GEMINI_PRIMARY_MODEL },
+        `Gemini ${GEMINI_PRIMARY_MODEL} error, falling back to ${GEMINI_FALLBACK_MODEL}...`
+      );
+      return await withRetry(() =>
+        ai.models.generateContent({
+          model: GEMINI_FALLBACK_MODEL,
+          contents: params.contents,
+          config: params.config,
+        })
+      );
+    }
+    throw primaryErr;
+  }
+}
+
+
 const conversationHistory: Map<string, { role: "user" | "model"; text: string }[]> = new Map();
 const MAX_HISTORY = 20;
 const DISCORD_LIMIT = 2000;
@@ -254,20 +291,17 @@ export async function generateText(
   const oai = toOAIMessages(messages);
   const oaiWithSystem: OAIMessage[] = systemPrompt ? [{ role: "system", content: systemPrompt }, ...oai] : oai;
 
-  // 1. Gemini (primary)
+  // 1. Gemini (primary: gemini-3.8-flash with fallback)
   const ai = getGeminiClient();
   if (ai) {
     try {
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: messages.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
-          config: {
-            maxOutputTokens: 8192,
-            ...(systemPrompt ? { systemInstruction: systemPrompt } : {}),
-          },
-        })
-      );
+      const response = await callGeminiWithFallback(ai, {
+        contents: messages.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
+        config: {
+          maxOutputTokens: 8192,
+          ...(systemPrompt ? { systemInstruction: systemPrompt } : {}),
+        },
+      });
       return { text: response.text ?? "", provider: "gemini" };
     } catch (err) {
       logger.warn({ err }, "Gemini failed, trying Groq...");
@@ -1822,28 +1856,25 @@ CRITICAL TRANSLATION RULES:
 }
 Do NOT include any markdown codeblocks or conversational text around the JSON.`;
 
-  // 1. Primary: Gemini 2.5 Flash
+  // 1. Primary: Gemini (gemini-3.8-flash with fallback)
   const ai = getGeminiClient();
   if (ai) {
     try {
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: [{ role: "user", parts: [{ text }] }],
-          config: {
-            systemInstruction,
-            responseMimeType: "application/json",
-            temperature: 0.2,
-          },
-        })
-      );
+      const response = await callGeminiWithFallback(ai, {
+        contents: [{ role: "user", parts: [{ text }] }],
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          temperature: 0.2,
+        },
+      });
       const rawText = response.text?.trim() || "";
       const parsed = safeParseTranslationJson(rawText);
       if (parsed?.translatedText) {
         return {
           text: parsed.translatedText,
           detectedSourceLanguage: parsed.detectedSourceLanguage || "Auto",
-          provider: "Gemini 2.5 Flash",
+          provider: `Gemini (${GEMINI_PRIMARY_MODEL})`,
         };
       }
     } catch (err) {
@@ -2002,21 +2033,18 @@ Berikan penalaran mendalam (deep reasoning), komprehensif, dan terstruktur denga
 Jika ada referensi web di atas yang relevan, gunakan untuk memperkuat keakuratan jawaban faktualmu. Jawab dalam Bahasa Indonesia secara mendalam dan jelas.`;
 
   let answer = "";
-  let provider = "Gemini 2.5 Flash (Thinking Mode)";
+  let provider = `Gemini (${GEMINI_PRIMARY_MODEL} - Thinking Mode)`;
 
   const ai = getGeminiClient();
   if (ai) {
     try {
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: [{ role: "user", parts: [{ text: deepPrompt }] }],
-          config: {
-            thinkingConfig: { thinkingBudget: 2048 },
-            maxOutputTokens: 8192,
-          },
-        })
-      );
+      const response = await callGeminiWithFallback(ai, {
+        contents: [{ role: "user", parts: [{ text: deepPrompt }] }],
+        config: {
+          thinkingConfig: { thinkingBudget: 2048 },
+          maxOutputTokens: 8192,
+        },
+      });
       if (response.text) {
         answer = response.text.trim();
       }
@@ -2193,31 +2221,28 @@ PANDUAN MENGENALI GAMBAR & MEMBERIKAN PENDAPAT:
       : "Perhatikan gambar ini baik-baik. Kenali apa yang ada di dalamnya dan berikan pengamatan serta pendapat pribadimu yang hidup dan jujur!";
   }
 
-  // 1. Primary: Gemini 2.5 Flash
+  // 1. Primary: Gemini Vision (gemini-3.8-flash with fallback)
   const ai = getGeminiClient();
   if (ai) {
     try {
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { text: promptText },
-                { inlineData: { mimeType: safeType, data: base64 } },
-              ],
-            },
-          ],
-          config: {
-            systemInstruction: visionSystemInstruction,
-            temperature: 0.7,
-            maxOutputTokens: 4096,
+      const response = await callGeminiWithFallback(ai, {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: promptText },
+              { inlineData: { mimeType: safeType, data: base64 } },
+            ],
           },
-        })
-      );
+        ],
+        config: {
+          systemInstruction: visionSystemInstruction,
+          temperature: 0.7,
+          maxOutputTokens: 4096,
+        },
+      });
       if (response.text) {
-        return { text: response.text, provider: "Gemini 2.5 Flash Vision" };
+        return { text: response.text, provider: `Gemini (${GEMINI_PRIMARY_MODEL} Vision)` };
       }
     } catch (err) {
       logger.warn({ err }, "Gemini vision failed, trying fallback...");

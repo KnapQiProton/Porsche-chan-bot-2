@@ -88,9 +88,9 @@ export const Header: React.FC<HeaderProps> = ({
                     ? "text-emerald-600"
                     : "text-slate-400"
                 }`}
-                title="Gemini 2.5 Flash"
+                title="Gemini 3.8 Flash"
               >
-                Gemini
+                Gemini 3.8
               </span>
               <span className="text-slate-300">•</span>
               <span
