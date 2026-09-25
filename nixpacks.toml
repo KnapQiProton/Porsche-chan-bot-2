@@ -2,7 +2,7 @@
 nixPkgs = ["yt-dlp", "ffmpeg"]
 
 [phases.install]
-cmds = ["npm install"]
+cmds = ["npm install --legacy-peer-deps"]
 
 [phases.build]
 cmds = ["npm run build"]

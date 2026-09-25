@@ -19,7 +19,7 @@ ENV PATH="/root/.local/bin:$PATH"
 WORKDIR /app
 
 # Copy configuration files
-COPY package.json tsconfig.json tsconfig.base.json vite.config.ts ./
+COPY package.json .npmrc tsconfig.json tsconfig.base.json vite.config.ts ./
 
 # Copy source code and assets
 COPY server/ ./server/
@@ -28,7 +28,7 @@ COPY public/ ./public/
 COPY server.ts index.html ./
 
 # Install dependencies and build
-RUN npm install
+RUN npm install --legacy-peer-deps
 RUN npm run build
 
 EXPOSE 3000
