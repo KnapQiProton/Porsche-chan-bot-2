@@ -743,13 +743,14 @@ async function getDirectAudioUrlWithYtDlp(url: string, ytdlpPath: string, timeou
   });
 }
 
-// Terms indicating unofficial versions, covers, or altered speeds
+// Terms indicating unofficial versions, covers, live concert, or altered speeds
 const UNWANTED_TERMS = [
   "remix", "tik tok", "tiktok", "pop punk", "rock cover", "cover", "slowed",
   "reverb", "sped up", "speed up", "nightcore", "instrumental", "karaoke",
-  "amapiano", "hardstyle", "mashup", "parodi", "guitar cover", "drum cover",
-  "fingerstyle", "1 hour", "1hour", "loop", "bass boosted", "edit", "dj",
-  "x dj", "prod.", "ft. dj", "bootleg", "full album", "compilation", "playlist"
+  "amapiano", "hardstyle", "mashup", "parodi", "parody", "guitar cover", "drum cover",
+  "fingerstyle", "1 hour", "1hour", "loop", "bass boosted", "bootleg",
+  "full album", "compilation", "playlist", "live", "concert", "tour",
+  "festival", "fancam", "amv", "reaction", "tutorial", "how to play", "chords"
 ];
 
 // Precision candidate scoring algorithm to pick the true original song
@@ -757,62 +758,83 @@ export function scoreTrackCandidate(
   targetTitle: string,
   targetArtist: string,
   targetDurationSec: number | undefined,
-  candidate: any
+  candidate: any,
+  rank: number = 0
 ): number {
   const cName = (candidate.name || (candidate as any).title || "").toLowerCase();
   const cUser = ((candidate.user?.name || candidate.user?.username || candidate.publisher?.artist || "")).toLowerCase();
-  const dur = candidate.durationInSec || Math.round(((candidate as any).durationInMs || 0) / 1000) || 0;
-
-  // Rule 0: Discard extreme outliers (snippets < 50s or loops/compilations > 720s)
-  if (dur > 0 && (dur < 50 || dur > 720)) return -1000;
-
-  let score = 100;
+  const dur = candidate.durationInSec || Math.round(((candidate as any).durationInMs || 0) / 1000) || candidate.duration || 0;
   const targetLower = `${targetTitle} ${targetArtist}`.toLowerCase();
 
-  // 1. Heavy penalty for unwanted keywords if not requested by user
+  // Rule 0a: Discard active live streams (unless user explicitly requested "live" or "radio")
+  if ((candidate.isLive || dur === 0) && !targetLower.includes("live") && !targetLower.includes("radio")) {
+    return -1000;
+  }
+
+  // Rule 0b: Discard extreme outliers (<40s snippets or >900s compilations unless requested)
+  if (dur > 0 && (dur < 40 || dur > 900) && !/\b(mix|compilation|loop|1 hour|1hour|full album|extended|mashup)\b/i.test(targetLower)) {
+    return -1000;
+  }
+
+  // Base score with natural YouTube ranking advantage (higher position from search gets a head start)
+  let score = 100 + (rank >= 0 ? Math.max(0, 60 - rank * 15) : 0);
+
+  // 1. Heavy penalty for unwanted keywords with regex word boundaries (avoids false positives on "edition", "discover", etc.)
   for (const junk of UNWANTED_TERMS) {
-    if (!targetLower.includes(junk) && cName.includes(junk)) {
+    const escaped = junk.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+    const regex = new RegExp(`(?:^|[^a-z0-9])${escaped}(?:$|[^a-z0-9])`, "i");
+    if (!regex.test(targetLower) && regex.test(cName)) {
       score -= 100;
     }
   }
 
-  // 2. Penalty for unnecessary bracket clutter if original title has none
-  if (!targetLower.includes("[") && cName.includes("[")) score -= 25;
-  if (!targetLower.includes("(") && cName.includes("(")) score -= 15;
+  // 2. Official release title bonuses
+  if (/\b(official\s+music\s+video|official\s+video|official\s+audio|official\s+mv|\bmv\b)\b/i.test(cName)) {
+    score += 50;
+  } else if (/\b(official\s+lyric\s+video|lyric\s+video)\b/i.test(cName)) {
+    score += 35;
+  } else if (/\b(visualizer|audio)\b/i.test(cName)) {
+    score += 20;
+  } else if (/\blyrics?\b/i.test(cName)) {
+    score += 10;
+  }
 
-  // 3. Match title keywords
-  const cleanT = targetTitle.toLowerCase().replace(/[^a-z0-9 ]/g, " ");
-  const tWords = cleanT.split(/\s+/).filter((w) => w.length >= 2);
-  let matchedTitleWords = 0;
+  // 3. Official Artist Channel / Verified Channel / Topic Channel BONUS
+  const isTopic = cUser.endsWith(" - topic") || cUser.endsWith("-topic");
+  const isVevo = cUser.includes("vevo");
+  if (candidate.isOfficialArtist || isTopic || isVevo) {
+    score += 80;
+  } else if (candidate.isVerified) {
+    score += 40;
+  }
+
+  // 4. Keyword matching from target title and artist
+  const cleanT = `${targetTitle} ${targetArtist}`.toLowerCase().replace(/[^a-z0-9 ]/g, " ");
+  const tWords = cleanT.split(/\s+/).filter((w) => w.length >= 2 && !/^(the|and|dan|with|feat|ft|official|audio|video|lyrics?)$/i.test(w));
+  let matchedWords = 0;
   for (const w of tWords) {
-    if (cName.includes(w)) matchedTitleWords++;
+    if (cName.includes(w) || cUser.includes(w)) matchedWords++;
   }
   if (tWords.length > 0) {
-    score += Math.round((matchedTitleWords / tWords.length) * 70);
-  }
-
-  // 4. Match artist keywords
-  if (targetArtist && !/^(artis musik|unknown)$/i.test(targetArtist)) {
-    const cleanA = targetArtist.toLowerCase().replace(/[^a-z0-9 ]/g, " ");
-    const aWords = cleanA.split(/\s+/).filter((w) => w.length >= 2);
-    let matchedArtistWords = 0;
-    for (const w of aWords) {
-      if (cName.includes(w) || cUser.includes(w)) matchedArtistWords++;
-    }
-    if (aWords.length > 0) {
-      score += Math.round((matchedArtistWords / aWords.length) * 60);
+    score += Math.round((matchedWords / tWords.length) * 50);
+    if (matchedWords === tWords.length) {
+      score += 25; // Bonus for 100% keyword match
     }
   }
 
   // 5. Duration matching with high precision
   if (targetDurationSec && targetDurationSec > 30) {
     const diff = Math.abs(dur - targetDurationSec);
-    if (diff <= 12) score += 50;
-    else if (diff <= 30) score += 25;
-    else if (diff > 60) score -= 90;
-    else if (diff > 120) score -= 180;
+    if (diff <= 6) score += 60;
+    else if (diff <= 15) score += 40;
+    else if (diff <= 30) score += 20;
+    else if (diff > 50) score -= 60;
+    else if (diff > 90) score -= 140;
   } else {
-    if (dur >= 130 && dur <= 310) score += 25;
+    // Standard song duration bonus (approx 1m50s to 6m30s)
+    if (dur >= 110 && dur <= 390) {
+      score += 20;
+    }
   }
 
   return score;
@@ -845,7 +867,7 @@ async function searchYouTubeInternal(
       "--dump-single-json",
       "--no-warnings",
       "--flat-playlist",
-      `ytsearch5:${query}`,
+      `ytsearch8:${query}`,
     ]);
 
     let raw = "";
@@ -872,13 +894,16 @@ async function searchYouTubeInternal(
         const candidateTargetArtist = targetArtist || "";
 
         const scored = entries
-          .map((e) => ({
+          .map((e, index) => ({
             entry: e,
             score: scoreTrackCandidate(candidateTargetTitle, candidateTargetArtist, targetDurationSec, {
               name: e.title,
               user: { name: e.uploader || e.channel },
               durationInSec: e.duration,
-            }),
+              isOfficialArtist: Boolean(e.channel_is_verified || (e.uploader || e.channel || "").endsWith(" - Topic") || (e.uploader || e.channel || "").toLowerCase().includes("vevo")),
+              isVerified: Boolean(e.channel_is_verified),
+              isLive: Boolean(e.is_live || e.live_status === "is_live"),
+            }, index),
           }))
           .sort((a, b) => b.score - a.score);
 
@@ -939,10 +964,17 @@ async function searchYouTubeViaDirectScrape(
     });
     if (!res.ok) return null;
     const text = await res.text();
-    const match = text.match(/ytInitialData\s*=\s*({.+?});<\/script>/);
-    if (!match) return null;
+    let jsonStr: string | null = null;
+    const match = text.match(/(?:window\[['"]ytInitialData['"]\]|ytInitialData)\s*=\s*({.+?});\s*(?:<\/script>|var\s+)/);
+    if (match) {
+      jsonStr = match[1];
+    } else {
+      const altMatch = text.match(/ytInitialData\s*=\s*({.+?});/);
+      if (altMatch) jsonStr = altMatch[1];
+    }
+    if (!jsonStr) return null;
 
-    const data = JSON.parse(match[1]);
+    const data = JSON.parse(jsonStr);
     const sections = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
     const entries: any[] = [];
     for (const s of sections) {
@@ -954,20 +986,32 @@ async function searchYouTubeViaDirectScrape(
           const rawAuthor = v.ownerText?.runs?.[0]?.text || "";
           const durText = v.lengthText?.simpleText || "";
           const durSec = durText ? parseDurationToSec(durText) : undefined;
+          const badgeText = (v.ownerBadges?.[0]?.metadataBadgeRenderer?.tooltip || "").toLowerCase();
+          const badgeStyle = (v.ownerBadges?.[0]?.metadataBadgeRenderer?.style || "").toLowerCase();
+          const isOfficialArtist = badgeText.includes("artis") || badgeText.includes("artist") || badgeStyle.includes("artist");
+          const isVerified = badgeText.includes("verified") || badgeText.includes("terverifikasi") || badgeStyle.includes("verified");
+          const isLive = v.badges?.some((b: any) =>
+            b.metadataBadgeRenderer?.style === "BADGE_STYLE_TYPE_LIVE_NOW" ||
+            (b.metadataBadgeRenderer?.label || "").toLowerCase().includes("live")
+          ) || false;
           const thumb = v.thumbnail?.thumbnails?.[v.thumbnail.thumbnails.length - 1]?.url || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`;
+
           entries.push({
             id: v.videoId,
             title: rawTitle,
             uploader: rawAuthor,
             duration: durSec,
-            durationRaw: durText || "Audio",
+            durationRaw: durText ? durText.replace(".", ":") : "Audio",
             thumbnail: thumb,
             url: `https://www.youtube.com/watch?v=${v.videoId}`,
+            isOfficialArtist,
+            isVerified,
+            isLive,
           });
-          if (entries.length >= 8) break;
+          if (entries.length >= 10) break;
         }
       }
-      if (entries.length >= 8) break;
+      if (entries.length >= 10) break;
     }
 
     if (entries.length === 0) return null;
@@ -976,13 +1020,16 @@ async function searchYouTubeViaDirectScrape(
     const candidateTargetArtist = targetArtist || "";
 
     const scored = entries
-      .map((e) => ({
+      .map((e, index) => ({
         entry: e,
         score: scoreTrackCandidate(candidateTargetTitle, candidateTargetArtist, targetDurationSec, {
           name: e.title,
           user: { name: e.uploader },
           durationInSec: e.duration,
-        }),
+          isOfficialArtist: e.isOfficialArtist,
+          isVerified: e.isVerified,
+          isLive: e.isLive,
+        }, index),
       }))
       .sort((a, b) => b.score - a.score);
 
@@ -1028,44 +1075,81 @@ export async function searchYouTubeWithYtDlp(
   } catch (err) {
     logger.warn({ err, query }, "yt-dlp search failed or timed out, trying play-dl search fallback");
     try {
-      const searchResults = await playdl.search(query, { limit: 5 });
+      const searchResults = await playdl.search(query, { limit: 8 });
       if (searchResults && searchResults.length > 0) {
-        const first = searchResults[0];
-        const rawTitle = first.title || query;
-        const rawUploader = first.channel?.name || "";
+        const candidateTargetTitle = targetTitle || cleanTrackTitle(query);
+        const candidateTargetArtist = targetArtist || "";
+
+        const scored = searchResults
+          .map((item, index) => {
+            const rawTitle = item.title || query;
+            const rawUploader = item.channel?.name || "";
+            const isTopic = rawUploader.endsWith(" - Topic") || rawUploader.endsWith("-Topic");
+            const isVevo = rawUploader.toLowerCase().includes("vevo");
+            return {
+              item,
+              score: scoreTrackCandidate(candidateTargetTitle, candidateTargetArtist, targetDurationSec, {
+                name: rawTitle,
+                user: { name: rawUploader },
+                durationInSec: item.durationInSec,
+                isOfficialArtist: Boolean(isTopic || isVevo),
+                isVerified: false,
+                isLive: item.live || false,
+              }, index),
+            };
+          })
+          .sort((a, b) => b.score - a.score);
+
+        const best = scored[0].item;
+        const rawTitle = best.title || query;
+        const rawUploader = best.channel?.name || "";
         const parsed = parseTitleAndArtist(rawTitle, rawUploader);
-        const durSec = first.durationInSec || 210;
+        const durSec = best.durationInSec || 210;
         return {
-          id: first.id || "",
-          url: first.url,
+          id: best.id || "",
+          url: best.url,
           title: parsed.title || rawTitle,
           artist: parsed.artist && !isRecordLabelOrLyricChannel(parsed.artist) ? parsed.artist : rawUploader || "Artis YouTube",
           duration: formatDuration(durSec),
           durationSec: durSec,
-          thumbnail: first.thumbnails?.[0]?.url,
+          thumbnail: best.thumbnails?.[0]?.url,
         };
       }
     } catch (fallbackErr) {
       logger.error({ fallbackErr }, "play-dl search fallback also failed");
     }
 
-    // Secondary fallback: search SoundCloud directly (highly reliable on datacenter IPs)
+    // Tertiary fallback: search SoundCloud directly (with candidate scoring to prevent inaccurate songs)
     try {
       const scClientId = await playdl.getFreeClientID();
       await playdl.setToken({ soundcloud: { client_id: scClientId } });
-      const scResults = await playdl.search(query, { source: { soundcloud: "tracks" }, limit: 1 });
+      const scResults = await playdl.search(query, { source: { soundcloud: "tracks" }, limit: 5 });
       if (scResults && scResults.length > 0) {
-        const scTrack: any = scResults[0];
-        logger.info({ title: scTrack.name || scTrack.title }, "Found track via SoundCloud search fallback");
-        return {
-          id: String(scTrack.id || ""),
-          url: scTrack.url,
-          title: scTrack.name || scTrack.title || query,
-          artist: scTrack.user?.name || scTrack.artist || "SoundCloud Artist",
-          duration: scTrack.durationRaw || formatDuration(scTrack.durationInSec) || "3:30",
-          durationSec: scTrack.durationInSec,
-          thumbnail: scTrack.thumbnail || scTrack.thumbnails?.[0]?.url,
-        };
+        const scoredSc = scResults
+          .map((scTrack: any, idx: number) => ({
+            scTrack,
+            score: scoreTrackCandidate(query, "", targetDurationSec, {
+              name: scTrack.name || scTrack.title,
+              user: { name: scTrack.user?.name || scTrack.artist },
+              durationInSec: scTrack.durationInSec,
+            }, idx),
+          }))
+          .filter(s => s.score >= 120)
+          .sort((a, b) => b.score - a.score);
+
+        if (scoredSc.length > 0) {
+          const bestSc: any = scoredSc[0].scTrack;
+          logger.info({ title: bestSc.name || bestSc.title, score: scoredSc[0].score }, "Found verified track via SoundCloud search fallback");
+          return {
+            id: String(bestSc.id || ""),
+            url: bestSc.url,
+            title: bestSc.name || bestSc.title || query,
+            artist: bestSc.user?.name || bestSc.artist || "SoundCloud Artist",
+            duration: bestSc.durationRaw || formatDuration(bestSc.durationInSec) || "3:30",
+            durationSec: bestSc.durationInSec,
+            thumbnail: bestSc.thumbnail || bestSc.thumbnails?.[0]?.url,
+          };
+        }
       }
     } catch (scSearchErr) {
       logger.warn({ scSearchErr }, "SoundCloud search fallback failed");
@@ -1288,6 +1372,7 @@ export async function createAudioResourceFromYtDlp(
   try {
     const ytdlpArgs = [
       "--js-runtimes", "node",
+      ...cookieArgs,
       "--extractor-args", "youtube:player_client=tv_embedded",
       "-q",
       "--no-warnings",
@@ -1317,7 +1402,7 @@ export async function createAudioResourceFromYtDlp(
     logger.warn({ err }, "Tier 3 direct URL failed, proceeding to Tier 4 SoundCloud fallback");
   }
 
-  // Tier 4: SoundCloud fallback audio stream (ultra-reliable when YouTube IP is challenged)
+  // Tier 4: SoundCloud fallback audio stream (ultra-reliable when YouTube IP is challenged, scored for accuracy)
   const candidatesToSearch = [
     fallbackSearchQuery,
     urlOrQuery,
@@ -1357,10 +1442,24 @@ export async function createAudioResourceFromYtDlp(
     try {
       const scClientId = await playdl.getFreeClientID();
       await playdl.setToken({ soundcloud: { client_id: scClientId } });
-      const res = await playdl.search(q, { source: { soundcloud: "tracks" }, limit: 1 });
-      if (res && res.length > 0 && res[0].url) {
-        logger.info({ query: q, scUrl: res[0].url }, "Streaming via SoundCloud fallback audio stream");
-        return await createAudioResourceFromTrackUrl(res[0].url, seekSeconds);
+      const res = await playdl.search(q, { source: { soundcloud: "tracks" }, limit: 5 });
+      if (res && res.length > 0) {
+        const scoredSc = res
+          .map((item: any, idx: number) => ({
+            item,
+            score: scoreTrackCandidate(q, "", undefined, {
+              name: item.name || item.title || "",
+              user: { name: item.user?.name || item.artist || "" },
+              durationInSec: item.durationInSec,
+            }, idx),
+          }))
+          .filter((s) => s.score >= 120)
+          .sort((a, b) => b.score - a.score);
+
+        if (scoredSc.length > 0 && scoredSc[0].item.url) {
+          logger.info({ query: q, scUrl: scoredSc[0].item.url, score: scoredSc[0].score }, "Streaming via verified SoundCloud fallback");
+          return await createAudioResourceFromTrackUrl(scoredSc[0].item.url, seekSeconds);
+        }
       }
     } catch (scErr) {
       logger.warn({ scErr }, "SoundCloud fallback candidate search failed");
