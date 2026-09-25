@@ -2508,6 +2508,10 @@ export const COMMANDS = [
     .setName("nowplaying")
     .setDescription("Lihat lagu yang sedang diputar beserta progress bar")
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("sync")
+    .setDescription("Sinkronkan slash commands & bersihkan command lokal server yang berpotensi menimpa opsi /illust")
+    .toJSON(),
 ];
 
 // Discord Client
@@ -2555,6 +2559,23 @@ client.once(Events.ClientReady, async (c) => {
       logger.info("Slash commands registered globally with Discord API");
     } catch (err) {
       logger.error({ err }, "Failed to register slash commands");
+    }
+
+    // Auto-clean any stale guild-level commands that shadow global commands (e.g. old /illust without options)
+    for (const [guildId, guild] of c.guilds.cache) {
+      try {
+        const guildCmds = await guild.commands.fetch();
+        if (guildCmds.size > 0) {
+          logger.info(
+            { guildId, guildName: guild.name, count: guildCmds.size },
+            "Menemukan command guild spesifik yang berpotensi menimpa command global. Membersihkan..."
+          );
+          await guild.commands.set([]);
+          logger.info({ guildId }, "Command guild berhasil dibersihkan.");
+        }
+      } catch (gErr) {
+        logger.debug({ gErr, guildId }, "Guild command fetch/cleanup skipped");
+      }
     }
   }
 
@@ -2745,6 +2766,31 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     const aspectRatio = (interaction.options.getString("aspect_ratio") as AspectRatioType) || "1:1";
     await interaction.deferReply();
     await generateAndSendImage({ interaction, prompt, model, aspectRatio });
+  }
+
+  if (interaction.commandName === "sync") {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      if (interaction.guild) {
+        await interaction.guild.commands.set([]);
+      }
+      const token = process.env.DISCORD_BOT_TOKEN;
+      if (token && client.user) {
+        const rest = new REST({ version: "10" }).setToken(token);
+        await rest.put(Routes.applicationCommands(client.user.id), { body: COMMANDS });
+      }
+      await interaction.editReply(
+        "✨ **Sinkronisasi Berhasil!**\n" +
+        "Semua slash command global telah didaftarkan ulang dan command lokal server (guild commands) yang berpotensi menimpa opsi `/illust` telah dibersihkan.\n\n" +
+        "💡 **Jika opsi masih belum muncul di aplikasi Discord Anda:**\n" +
+        "• **PC/Desktop:** Tekan `Ctrl + R` untuk me-refresh cache Discord.\n" +
+        "• **Mobile (HP):** Tutup penuh aplikasi Discord lalu buka kembali."
+      );
+    } catch (err) {
+      logger.error({ err }, "Error syncing slash commands");
+      await interaction.editReply("❌ Gagal menyinkronkan command: " + (err instanceof Error ? err.message : String(err)));
+    }
+    return;
   }
 
   if (interaction.commandName === "illust") {
@@ -3352,6 +3398,29 @@ client.on(Events.MessageCreate, async (message: Message) => {
     const turnFilterOff = ["off", "disable", "matikan", "nonaktifkan"].includes(action);
     const result = setNsfwFilterState(!turnFilterOff, pass || NSFW_PASSCODE, isCreator);
     await message.reply(result.message);
+    return;
+  }
+
+  if (userText === "!sync" || userText === "/sync") {
+    try {
+      if (message.guild) {
+        await message.guild.commands.set([]);
+      }
+      const token = process.env.DISCORD_BOT_TOKEN;
+      if (token && client.user) {
+        const rest = new REST({ version: "10" }).setToken(token);
+        await rest.put(Routes.applicationCommands(client.user.id), { body: COMMANDS });
+      }
+      await message.reply(
+        "✨ **Sinkronisasi Berhasil!**\n" +
+        "Command guild lokal yang menimpa `/illust` telah dibersihkan dan slash commands global telah disinkronkan ke Discord.\n\n" +
+        "💡 **Jika opsi masih belum muncul di aplikasi Discord Anda:**\n" +
+        "• **Desktop (PC):** Tekan `Ctrl + R` untuk me-refresh cache Discord.\n" +
+        "• **Mobile (HP):** Tutup penuh aplikasi Discord lalu buka kembali."
+      );
+    } catch (err) {
+      await message.reply("❌ Gagal menyinkronkan: " + (err instanceof Error ? err.message : String(err)));
+    }
     return;
   }
 
