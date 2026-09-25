@@ -43,6 +43,9 @@ if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
   }
 }
 
+// Optimal yt-dlp extractor args for YouTube on datacenter IPs (android + tv_embedded avoids bot detection and format errors)
+const YT_EXTRACTOR_ARGS = ["--extractor-args", "youtube:player_client=android,tv_embedded"];
+
 export type MusicSource = "youtube" | "youtube_music" | "spotify" | "soundcloud" | "search";
 
 export interface TrackMetadata {
@@ -430,7 +433,7 @@ async function getYtDlpMetadata(url: string, ytdlpPath: string, timeoutMs: numbe
     const proc = spawn(ytdlpPath, [
       "--js-runtimes", "node",
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android,web,mweb",
+      ...YT_EXTRACTOR_ARGS,
       "--dump-single-json",
       "--no-playlist",
       "--no-warnings",
@@ -587,11 +590,26 @@ function getYtDlpCookieArgs(): string[] {
     } catch {}
   }
 
-  // 3. Check environment variable (cross-platform temp path)
+  // 3. Check environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
   if (process.env.YOUTUBE_COOKIE && process.env.YOUTUBE_COOKIE.trim()) {
+    let cookieContent = process.env.YOUTUBE_COOKIE.trim();
+    // If user passed base64 encoded cookies to avoid newline formatting issues in Railway
+    if (!cookieContent.includes("\t") && !cookieContent.startsWith("#") && cookieContent.length > 50) {
+      try {
+        const decoded = Buffer.from(cookieContent, "base64").toString("utf-8");
+        if (decoded.includes("\t") || decoded.includes("youtube.com")) {
+          cookieContent = decoded;
+        }
+      } catch {}
+    }
+    // Handle escaped \n or \t from environment variables
+    if (cookieContent.includes("\\n")) {
+      cookieContent = cookieContent.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+    }
+
     const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
     try {
-      fs.writeFileSync(tmpCookiePath, process.env.YOUTUBE_COOKIE.trim(), "utf-8");
+      fs.writeFileSync(tmpCookiePath, cookieContent, "utf-8");
       return ["--cookies", tmpCookiePath];
     } catch (err) {
       logger.warn({ err }, "Could not write temporary youtube cookie file");
@@ -661,7 +679,7 @@ async function getDirectAudioUrlWithYtDlp(url: string, ytdlpPath: string, timeou
     const procArgs = [
       "--js-runtimes", "node",
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android,web,mweb",
+      ...YT_EXTRACTOR_ARGS,
       "-g", "-f", "bestaudio/ba/ba*/b/best",
       "--no-playlist",
       "--no-warnings",
@@ -804,7 +822,7 @@ async function searchYouTubeInternal(
     const proc = spawn(ytdlpPath, [
       "--js-runtimes", "node",
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android,web,mweb",
+      ...YT_EXTRACTOR_ARGS,
       "--dump-single-json",
       "--no-warnings",
       "--flat-playlist",
@@ -955,8 +973,14 @@ function tryPipedStream(
     let ytdlp: any;
     let ffmpeg: any;
 
+    let ytdlpStderr = "";
+
     try {
-      ytdlp = spawn(ytdlpPath, ytdlpArgs, { stdio: ["ignore", "pipe", "ignore"] });
+      ytdlp = spawn(ytdlpPath, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
+      ytdlp.stderr.on("data", (d: Buffer) => {
+        ytdlpStderr += d.toString();
+      });
+
       const ffmpegArgs: string[] = [
         "-analyzeduration", "0",
         "-loglevel", "error",
@@ -1008,7 +1032,8 @@ function tryPipedStream(
         settled = true;
         clearTimeout(timer);
         try { ffmpeg.kill("SIGKILL"); } catch {}
-        reject(new Error(`yt-dlp exited with error code ${code}`));
+        const detail = ytdlpStderr.trim() ? `: ${ytdlpStderr.trim().slice(0, 300)}` : "";
+        reject(new Error(`yt-dlp exited with error code ${code}${detail}`));
       }
     });
 
@@ -1108,7 +1133,7 @@ export async function createAudioResourceFromYtDlp(
     const ytdlpArgs = [
       "--js-runtimes", "node",
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android,web,mweb",
+      ...YT_EXTRACTOR_ARGS,
       "-q",
       "--no-warnings",
       "--no-progress",
@@ -1124,31 +1149,29 @@ export async function createAudioResourceFromYtDlp(
     logger.warn({ err }, "Tier 1 yt-dlp pipe stream failed, trying Tier 2");
   }
 
-  // Tier 2: Clean session without cookies (in case cookies are expired or challenged)
-  if (cookieArgs.length > 0) {
-    try {
-      const ytdlpArgs = [
-        "--js-runtimes", "node",
-        "--extractor-args", "youtube:player_client=android,web,mweb",
-        "-q",
-        "--no-warnings",
-        "--no-progress",
-        "-o", "-",
-        "-f", "ba/ba*/b/best",
-        "--no-playlist",
-        urlOrQuery,
-      ];
-      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 3500);
-      logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp clean session pipe stream");
-      return resource;
-    } catch (err) {
-      logger.warn({ err }, "Tier 2 clean session pipe stream failed, trying Tier 3");
-    }
+  // Tier 2: Try alternate tv_embedded client (bypasses bot challenges on datacenter IPs)
+  try {
+    const ytdlpArgs = [
+      "--js-runtimes", "node",
+      "--extractor-args", "youtube:player_client=tv_embedded",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", "ba/ba*/b/best",
+      "--no-playlist",
+      urlOrQuery,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 3500);
+    logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp tv_embedded pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err }, "Tier 2 tv_embedded pipe stream failed, trying Tier 3");
   }
 
   // Tier 3: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 5000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 4500);
     if (directUrl) {
       logger.info({ urlOrQuery }, "Attempting Tier 3 yt-dlp direct HTTPS audio URL");
       const resource = await tryPipedUrlStream(directUrl, seekSeconds, 3500);
@@ -1169,11 +1192,11 @@ export async function createAudioResourceFromYtDlp(
   for (const raw of candidatesToSearch) {
     const stripped = raw
       .replace(/https?:\/\/\S+/gi, "")
-      .replace(/\b(Artis YouTube|Official Video|Official Music Video|Official Audio|Lyric Video|Full Album|Audio|Video)\b/gi, "")
+      .replace(/\b(Artis YouTube|YouTube Audio|Official Video|Official Music Video|Official Audio|Lyric Video|Full Album|Audio|Video)\b/gi, "")
       .replace(/[|•\-_\[\]\(\)#]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (stripped) {
+    if (stripped && stripped.length > 2) {
       cleanCandidates.push(stripped);
       // Also add just the first 3-5 words if long title
       const words = stripped.split(" ");
@@ -1181,6 +1204,18 @@ export async function createAudioResourceFromYtDlp(
         cleanCandidates.push(words.slice(0, 3).join(" "));
       }
     }
+  }
+
+  // If candidate list is empty and user passed a YouTube URL, resolve title via public oEmbed
+  if (cleanCandidates.length === 0 && (urlOrQuery.includes("youtube.com") || urlOrQuery.includes("youtu.be"))) {
+    try {
+      const oembed = await getYouTubeOEmbed(urlOrQuery);
+      if (oembed && oembed.title) {
+        const parsed = parseTitleAndArtist(oembed.title, oembed.author);
+        cleanCandidates.push(`${parsed.title} ${parsed.artist}`.trim());
+        cleanCandidates.push(parsed.title);
+      }
+    } catch {}
   }
 
   for (const q of cleanCandidates) {
