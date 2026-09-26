@@ -2519,17 +2519,17 @@ export const COMMANDS = [
     .toJSON(),
   new SlashCommandBuilder()
     .setName("cookies")
-    .setDescription("Upload atau set cookies YouTube agar bot bisa memutar video YouTube di Railway")
+    .setDescription("Upload file cookies.txt YouTube agar bot bisa memutar video YouTube di Railway")
     .addAttachmentOption((opt) =>
       opt
         .setName("file")
-        .setDescription("File cookies.txt dari browser (format Netscape)")
+        .setDescription("Upload file cookies.txt langsung dari browser (format Netscape)")
         .setRequired(false)
     )
-    .addStringOption((opt) =>
+    .addAttachmentOption((opt) =>
       opt
-        .setName("base64")
-        .setDescription("Atau masukkan string Base64 dari cookies.txt")
+        .setName("file_base64")
+        .setDescription("Atau upload file .txt yang berisi teks Base64 cookies")
         .setRequired(false)
     )
     .toJSON(),
@@ -3096,46 +3096,31 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
   if (interaction.commandName === "cookies") {
     await interaction.deferReply({ ephemeral: true });
     try {
-      const fileAttachment = interaction.options.getAttachment("file");
-      const base64Input = interaction.options.getString("base64");
+      const fileAttachment = interaction.options.getAttachment("file") || interaction.options.getAttachment("file_base64");
 
-      if (!fileAttachment && !base64Input) {
+      if (!fileAttachment) {
         const status = getCookieStatus();
         const embed = new EmbedBuilder()
           .setColor(status.active ? 0x22c55e : 0xf59e0b)
           .setTitle("🍪 Panduan Autentikasi Cookies YouTube")
           .setDescription(
             `Status saat ini: **${status.active ? "🟢 Aktif (Siap)" : "🔴 Belum Ada"}**\nSumber: \`${status.source}\`\n\n` +
-            `**Cara mudah memasang Cookies YouTube:**\n` +
+            `**Cara mudah memasang Cookies YouTube (Opsi Upload File):**\n` +
             `1. Pasang ekstensi browser **Get cookies.txt LOCALLY** (tersedia di Chrome Web Store, Edge, & Firefox).\n` +
             `2. Buka [YouTube](https://www.youtube.com) di browser dan pastikan akun Google/YouTube kamu sudah login.\n` +
-            `3. Klik icon ekstensi tersebut -> klik tombol **Export** (file \`cookies.txt\` akan otomatis terdownload).\n` +
-            `4. Jalankan perintah ini lagi: \`/cookies\` lalu lampirkan file \`cookies.txt\` tersebut!\n\n` +
+            `3. Klik icon ekstensi tersebut -> klik tombol **Export** (file \`cookies.txt\` akan terunduh).\n` +
+            `4. Jalankan perintah ini lagi: \`/cookies\` lalu upload file \`cookies.txt\` tersebut pada opsi **file** (atau opsi **file_base64** jika punya file txt base64)!\n\n` +
             `🔒 *Cookies bersifat privat & ephemeral — tidak akan dibagikan ke publik.*`
           );
         await interaction.editReply({ embeds: [embed] });
         return;
       }
 
-      let cookieContent = "";
-      if (fileAttachment) {
-        const response = await fetch(fileAttachment.url);
-        if (!response.ok) {
-          throw new Error(`Gagal mengunduh file lampiran: HTTP ${response.status}`);
-        }
-        cookieContent = await response.text();
-      } else if (base64Input) {
-        const raw = base64Input.trim();
-        try {
-          cookieContent = Buffer.from(raw, "base64").toString("utf-8");
-          if (!cookieContent.includes("youtube.com")) {
-            cookieContent = raw;
-          }
-        } catch {
-          cookieContent = raw;
-        }
+      const response = await fetch(fileAttachment.url);
+      if (!response.ok) {
+        throw new Error(`Gagal mengunduh file lampiran: HTTP ${response.status}`);
       }
-
+      const cookieContent = await response.text();
       const result = saveUploadedCookies(cookieContent);
 
       const embed = new EmbedBuilder()

@@ -722,9 +722,20 @@ export function saveUploadedCookies(cookieData: string | Buffer): {
     ? cookieData.toString("utf-8")
     : cookieData;
 
-  const trimmed = content.trim();
+  let trimmed = content.trim();
+
+  // If user uploaded a .txt file containing base64 encoded cookies, decode it first
+  if (!trimmed.includes("\t") && !trimmed.includes("youtube.com") && trimmed.length > 50) {
+    try {
+      const decoded = Buffer.from(trimmed, "base64").toString("utf-8");
+      if (decoded.includes("youtube.com") || decoded.includes("\t") || decoded.includes("# Netscape")) {
+        trimmed = decoded.trim();
+      }
+    } catch {}
+  }
+
   if (!trimmed.includes("youtube.com") && !trimmed.includes(".youtube.com") && !trimmed.includes("# Netscape")) {
-    throw new Error("File cookies tidak valid. Pastikan file diekspor dari situs youtube.com dalam format Netscape HTTP Cookie File.");
+    throw new Error("File cookies tidak valid. Pastikan file berformat Netscape cookies.txt atau file .txt berisi kode base64 cookies yang valid.");
   }
 
   const cookiePath = path.join(process.cwd(), "cookies.txt");
