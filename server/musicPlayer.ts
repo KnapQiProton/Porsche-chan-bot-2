@@ -78,6 +78,15 @@ export interface TrackMetadata {
   createStream: (seekSeconds?: number) => Promise<any>;
 }
 
+export interface ResolvedMusicResult {
+  isPlaylist: boolean;
+  playlistTitle?: string;
+  playlistUrl?: string;
+  playlistThumbnail?: string;
+  playlistCount?: number;
+  tracks: TrackMetadata[];
+}
+
 export interface GuildSession {
   guildId: string;
   voiceChannelId: string;
@@ -267,6 +276,64 @@ async function getSpotifyTrackInfo(url: string): Promise<{ title: string; artist
     return { title: parsed.title, artist: parsed.artist, duration, durationSec, thumbnail };
   }
   return null;
+}
+
+// Extract Spotify Playlist or Album Metadata & Track List via Embed API
+export async function getSpotifyPlaylistOrAlbum(url: string): Promise<{
+  title: string;
+  type: "playlist" | "album";
+  thumbnail?: string;
+  tracks: Array<{ title: string; artist: string; durationSec?: number; url: string }>;
+} | null> {
+  const match = url.match(/spotify\.com(?:\/intl-[a-z]{2})?\/(playlist|album)\/([a-zA-Z0-9]+)/i);
+  if (!match) return null;
+
+  const type = match[1].toLowerCase() as "playlist" | "album";
+  const id = match[2];
+
+  try {
+    const res = await fetch(`https://open.spotify.com/embed/${type}/${id}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!res.ok) return null;
+    const html = await res.text();
+    const nextMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([^<]+)<\/script>/);
+    if (!nextMatch) return null;
+
+    const data = JSON.parse(nextMatch[1]);
+    const entity = data.props?.pageProps?.state?.data?.entity;
+    if (!entity) return null;
+
+    const title = entity.name || (type === "album" ? "Spotify Album" : "Spotify Playlist");
+    const thumbnail = entity.coverArt?.sources?.[0]?.url || entity.images?.[0]?.url;
+    const rawTrackList = (entity.trackList || []) as any[];
+
+    const tracks = rawTrackList.slice(0, 100).map((t) => {
+      const trackId = t.uri ? t.uri.replace("spotify:track:", "") : "";
+      const trackUrl = trackId ? `https://open.spotify.com/track/${trackId}` : url;
+      const durationSec = typeof t.duration === "number" && t.duration > 0 ? Math.round(t.duration / 1000) : undefined;
+      return {
+        title: t.title || "Spotify Track",
+        artist: t.subtitle || "",
+        durationSec,
+        url: trackUrl,
+      };
+    });
+
+    return {
+      title,
+      type,
+      thumbnail,
+      tracks,
+    };
+  } catch (err) {
+    logger.warn({ err, url }, "Failed to extract Spotify playlist/album via embed");
+    return null;
+  }
 }
 
 // Record labels and lyric channels that should not be used as the artist name
@@ -591,6 +658,92 @@ export async function getYouTubeMetadata(urlOrVideoId: string, ytdlpPath?: strin
     durationSec: undefined,
     thumbnail: videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : undefined,
   };
+}
+
+// Extract YouTube Playlist items using yt-dlp flat-playlist mode
+export async function getYouTubePlaylist(url: string, ytdlpPath: string, timeoutMs: number = 10000): Promise<{
+  title: string;
+  thumbnail?: string;
+  tracks: Array<{ id: string; title: string; artist: string; durationSec?: number; url: string }>;
+} | null> {
+  const isPlaylist = /youtube\.com\/(?:playlist\?list=|watch\?.*list=)|music\.youtube\.com\/(?:playlist\?list=|watch\?.*list=)/i.test(url);
+  if (!isPlaylist) return null;
+
+  return new Promise((resolve) => {
+    let resolved = false;
+    const cookieArgs = getYtDlpCookieArgs();
+    const extractorArgs = getYtExtractorArgs(cookieArgs.length > 0);
+
+    const proc = spawn(ytdlpPath, [
+      "--flat-playlist",
+      "--dump-single-json",
+      "--no-warnings",
+      "--playlist-end", "100",
+      ...cookieArgs,
+      ...extractorArgs,
+      url,
+    ]);
+
+    let stdout = "";
+    proc.stdout.on("data", (d) => (stdout += d.toString()));
+
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        try { proc.kill("SIGKILL"); } catch {}
+        resolve(null);
+      }
+    }, timeoutMs);
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (!resolved) {
+        resolved = true;
+        if (code === 0 && stdout.trim()) {
+          try {
+            const data = JSON.parse(stdout.trim());
+            const title = data.title || "YouTube Playlist";
+            const thumbnail = data.thumbnails?.[0]?.url;
+            const entries = (data.entries || []) as any[];
+
+            const tracks = entries
+              .filter((e) => e && (e.id || e.url))
+              .map((e) => {
+                const videoId = e.id || "";
+                const videoUrl = e.url && e.url.startsWith("http") ? e.url : (videoId ? `https://www.youtube.com/watch?v=${videoId}` : url);
+                const rawTitle = e.title || "YouTube Audio";
+                const rawUploader = e.uploader || e.channel || "Artis YouTube";
+                const parsed = parseTitleAndArtist(rawTitle, rawUploader);
+                const durationSec = typeof e.duration === "number" && e.duration > 0 ? Math.round(e.duration) : undefined;
+
+                return {
+                  id: videoId,
+                  title: parsed.title || rawTitle,
+                  artist: parsed.artist && !isRecordLabelOrLyricChannel(parsed.artist) ? parsed.artist : rawUploader,
+                  durationSec,
+                  url: videoUrl,
+                };
+              });
+
+            if (tracks.length > 0) {
+              return resolve({ title, thumbnail, tracks });
+            }
+          } catch (jsonErr) {
+            logger.warn({ jsonErr }, "Failed to parse YouTube playlist JSON from yt-dlp");
+          }
+        }
+        resolve(null);
+      }
+    });
+
+    proc.on("error", () => {
+      clearTimeout(timer);
+      if (!resolved) {
+        resolved = true;
+        resolve(null);
+      }
+    });
+  });
 }
 
 // Check if YouTube cookies or authentication is present
@@ -1694,34 +1847,77 @@ export async function createAudioResourceFromYtDlp(
 }
 
 // Main Track Resolver: handles YouTube, YouTube Music, Spotify, SoundCloud, and Text Query (Prioritizing User Links)
-export async function resolveMusicTrack(
+// Resolve single track or full playlist/album (YouTube, Spotify, SoundCloud, or text search)
+export async function resolveMusic(
   input: string,
   requester: { name: string; id: string }
-): Promise<TrackMetadata> {
+): Promise<ResolvedMusicResult> {
   const cleanInput = input.trim();
   const ytdlpPath = await getOrDownloadYtDlp();
 
-  // 0. SOUNDCLOUD DIRECT LINK
+  // 0. SOUNDCLOUD PLAYLIST / SET
+  if (cleanInput.includes("soundcloud.com") && cleanInput.includes("/sets/")) {
+    try {
+      const scInfo: any = await playdl.soundcloud(cleanInput);
+      if (scInfo && scInfo.tracks && Array.isArray(scInfo.tracks) && scInfo.tracks.length > 0) {
+        const tracks: TrackMetadata[] = scInfo.tracks.slice(0, 100).map((st: any) => ({
+          title: st.name || st.title || "SoundCloud Track",
+          artist: st.user?.name || st.artist || "SoundCloud Artist",
+          duration: st.durationRaw || (st.durationInSec ? formatDuration(st.durationInSec) : "Audio"),
+          durationSec: st.durationInSec,
+          url: st.url || cleanInput,
+          thumbnail: st.thumbnail || scInfo.thumbnail,
+          source: "soundcloud" as MusicSource,
+          sourceBadge: "🟠 SoundCloud Set",
+          sourceColor: 0xff5500,
+          requesterName: requester.name,
+          requesterId: requester.id,
+          rawTrackUrl: st.url || cleanInput,
+          createStream: async (seekSeconds: number = 0) => {
+            return createAudioResourceFromTrackUrl(st.url || cleanInput, seekSeconds);
+          },
+        }));
+
+        return {
+          isPlaylist: true,
+          playlistTitle: scInfo.name || scInfo.title || "SoundCloud Playlist",
+          playlistUrl: cleanInput,
+          playlistThumbnail: scInfo.thumbnail,
+          playlistCount: tracks.length,
+          tracks,
+        };
+      }
+    } catch (scErr) {
+      logger.warn({ scErr }, "SoundCloud playlist resolution failed");
+    }
+  }
+
+  // 1. SOUNDCLOUD DIRECT TRACK
   if (cleanInput.includes("soundcloud.com")) {
     try {
       const scInfo: any = await playdl.soundcloud(cleanInput);
       if (scInfo && (scInfo.name || scInfo.title)) {
         return {
-          title: scInfo.name || scInfo.title || "SoundCloud Track",
-          artist: scInfo.user?.name || scInfo.artist || "SoundCloud Artist",
-          duration: scInfo.durationRaw || formatDuration(scInfo.durationInSec) || "Audio",
-          durationSec: scInfo.durationInSec,
-          url: cleanInput,
-          thumbnail: scInfo.thumbnail || scInfo.thumbnails?.[0]?.url,
-          source: "soundcloud",
-          sourceBadge: "🟠 SoundCloud",
-          sourceColor: 0xff5500,
-          requesterName: requester.name,
-          requesterId: requester.id,
-          rawTrackUrl: cleanInput,
-          createStream: async (seekSeconds: number = 0) => {
-            return createAudioResourceFromTrackUrl(cleanInput, seekSeconds);
-          },
+          isPlaylist: false,
+          tracks: [
+            {
+              title: scInfo.name || scInfo.title || "SoundCloud Track",
+              artist: scInfo.user?.name || scInfo.artist || "SoundCloud Artist",
+              duration: scInfo.durationRaw || formatDuration(scInfo.durationInSec) || "Audio",
+              durationSec: scInfo.durationInSec,
+              url: cleanInput,
+              thumbnail: scInfo.thumbnail || scInfo.thumbnails?.[0]?.url,
+              source: "soundcloud",
+              sourceBadge: "🟠 SoundCloud",
+              sourceColor: 0xff5500,
+              requesterName: requester.name,
+              requesterId: requester.id,
+              rawTrackUrl: cleanInput,
+              createStream: async (seekSeconds: number = 0) => {
+                return createAudioResourceFromTrackUrl(cleanInput, seekSeconds);
+              },
+            },
+          ],
         };
       }
     } catch (scErr) {
@@ -1729,7 +1925,45 @@ export async function resolveMusicTrack(
     }
   }
 
-  // 1. SPOTIFY LINK (PRIORITAS LINK SPOTIFY USER -> RESOLVE METADATA & STREAM)
+  // 2. SPOTIFY PLAYLIST / ALBUM
+  if (cleanInput.includes("spotify.com") && (cleanInput.includes("/playlist/") || cleanInput.includes("/album/"))) {
+    const spPlaylist = await getSpotifyPlaylistOrAlbum(cleanInput);
+    if (spPlaylist && spPlaylist.tracks.length > 0) {
+      const isAlbum = spPlaylist.type === "album";
+      const tracks: TrackMetadata[] = spPlaylist.tracks.map((t) => {
+        const query = `${t.title} ${t.artist}`.trim();
+        return {
+          title: t.title,
+          artist: t.artist || "Spotify Artist",
+          duration: t.durationSec ? formatDuration(t.durationSec) : "3:30",
+          durationSec: t.durationSec,
+          url: t.url,
+          thumbnail: spPlaylist.thumbnail,
+          source: "spotify" as MusicSource,
+          sourceBadge: isAlbum ? "💿 Spotify Album" : "🟢 Spotify Playlist",
+          sourceColor: 0x1db954,
+          requesterName: requester.name,
+          requesterId: requester.id,
+          rawTrackUrl: t.url,
+          createStream: async (seekSeconds: number = 0) => {
+            const ytMatch = await searchYouTubeWithYtDlp(query, ytdlpPath, t.title, t.artist, t.durationSec);
+            return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, query);
+          },
+        };
+      });
+
+      return {
+        isPlaylist: true,
+        playlistTitle: spPlaylist.title,
+        playlistUrl: cleanInput,
+        playlistThumbnail: spPlaylist.thumbnail,
+        playlistCount: tracks.length,
+        tracks,
+      };
+    }
+  }
+
+  // 3. SPOTIFY SINGLE TRACK
   if (cleanInput.includes("spotify.com")) {
     const spInfo = await getSpotifyTrackInfo(cleanInput);
     const title = spInfo?.title || "Spotify Track";
@@ -1741,95 +1975,162 @@ export async function resolveMusicTrack(
     const ytMatch = await searchYouTubeWithYtDlp(query, ytdlpPath, title, artist, durationSec);
 
     return {
-      title,
-      artist: artist || ytMatch.artist,
-      duration: durationSec ? formatDuration(durationSec) : ytMatch.duration,
-      durationSec: durationSec || ytMatch.durationSec,
-      url: cleanInput,
-      thumbnail: thumbnail || ytMatch.thumbnail,
-      source: "spotify",
-      sourceBadge: "🟢 Spotify",
-      sourceColor: 0x1db954,
-      requesterName: requester.name,
-      requesterId: requester.id,
-      rawTrackUrl: ytMatch.url,
-      createStream: async (seekSeconds: number = 0) => {
-        return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, query);
-      },
+      isPlaylist: false,
+      tracks: [
+        {
+          title,
+          artist: artist || ytMatch.artist,
+          duration: durationSec ? formatDuration(durationSec) : ytMatch.duration,
+          durationSec: durationSec || ytMatch.durationSec,
+          url: cleanInput,
+          thumbnail: thumbnail || ytMatch.thumbnail,
+          source: "spotify",
+          sourceBadge: "🟢 Spotify",
+          sourceColor: 0x1db954,
+          requesterName: requester.name,
+          requesterId: requester.id,
+          rawTrackUrl: ytMatch.url,
+          createStream: async (seekSeconds: number = 0) => {
+            return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, query);
+          },
+        },
+      ],
     };
   }
 
-  // 2. YOUTUBE MUSIC LINK (PRIORITAS LINK YOUTUBE MUSIC USER)
+  // 4. YOUTUBE PLAYLIST (YouTube & YouTube Music)
+  const isYtPlaylist = /youtube\.com\/(?:playlist\?list=|watch\?.*list=)|music\.youtube\.com\/(?:playlist\?list=|watch\?.*list=)/i.test(cleanInput);
+  if (isYtPlaylist) {
+    const ytPlaylist = await getYouTubePlaylist(cleanInput, ytdlpPath);
+    if (ytPlaylist && ytPlaylist.tracks.length > 0) {
+      const isYtMusic = cleanInput.includes("music.youtube.com");
+      const tracks: TrackMetadata[] = ytPlaylist.tracks.map((t) => ({
+        title: t.title,
+        artist: t.artist,
+        duration: t.durationSec ? formatDuration(t.durationSec) : "Audio",
+        durationSec: t.durationSec,
+        url: t.url,
+        thumbnail: ytPlaylist.thumbnail || (t.id ? `https://i.ytimg.com/vi/${t.id}/hqdefault.jpg` : undefined),
+        source: (isYtMusic ? "youtube_music" : "youtube") as MusicSource,
+        sourceBadge: isYtMusic ? "🎵 YouTube Music Playlist" : "🔴 YouTube Playlist",
+        sourceColor: isYtMusic ? 0xff334b : 0xff0000,
+        requesterName: requester.name,
+        requesterId: requester.id,
+        rawTrackUrl: t.url,
+        createStream: async (seekSeconds: number = 0) => {
+          return createAudioResourceFromYtDlp(t.url, seekSeconds, ytdlpPath, `${t.title} ${t.artist}`);
+        },
+      }));
+
+      return {
+        isPlaylist: true,
+        playlistTitle: ytPlaylist.title,
+        playlistUrl: cleanInput,
+        playlistThumbnail: ytPlaylist.thumbnail,
+        playlistCount: tracks.length,
+        tracks,
+      };
+    }
+  }
+
+  // 5. YOUTUBE MUSIC SINGLE TRACK
   if (cleanInput.includes("music.youtube.com")) {
     const ytMeta = await getYouTubeMetadata(cleanInput);
     const canonicalUrl = ytMeta.url;
 
     return {
-      title: ytMeta.title,
-      artist: ytMeta.artist,
-      duration: ytMeta.duration,
-      durationSec: ytMeta.durationSec,
-      url: cleanInput,
-      thumbnail: ytMeta.thumbnail,
-      source: "youtube_music",
-      sourceBadge: "🎵 YouTube Music",
-      sourceColor: 0xff334b,
-      requesterName: requester.name,
-      requesterId: requester.id,
-      rawTrackUrl: canonicalUrl,
-      createStream: async (seekSeconds: number = 0) => {
-        return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`);
-      },
+      isPlaylist: false,
+      tracks: [
+        {
+          title: ytMeta.title,
+          artist: ytMeta.artist,
+          duration: ytMeta.duration,
+          durationSec: ytMeta.durationSec,
+          url: cleanInput,
+          thumbnail: ytMeta.thumbnail,
+          source: "youtube_music",
+          sourceBadge: "🎵 YouTube Music",
+          sourceColor: 0xff334b,
+          requesterName: requester.name,
+          requesterId: requester.id,
+          rawTrackUrl: canonicalUrl,
+          createStream: async (seekSeconds: number = 0) => {
+            return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`);
+          },
+        },
+      ],
     };
   }
 
-  // 3. YOUTUBE DIRECT LINK (PRIORITAS LINK YOUTUBE USER)
+  // 6. YOUTUBE DIRECT SINGLE TRACK
   if (cleanInput.includes("youtube.com") || cleanInput.includes("youtu.be")) {
     const ytMeta = await getYouTubeMetadata(cleanInput);
     const canonicalUrl = ytMeta.url;
 
     return {
-      title: ytMeta.title,
-      artist: ytMeta.artist,
-      duration: ytMeta.duration,
-      durationSec: ytMeta.durationSec,
-      url: cleanInput,
-      thumbnail: ytMeta.thumbnail,
-      source: "youtube",
-      sourceBadge: "🔴 YouTube",
-      sourceColor: 0xff0000,
-      requesterName: requester.name,
-      requesterId: requester.id,
-      rawTrackUrl: canonicalUrl,
-      createStream: async (seekSeconds: number = 0) => {
-        return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`);
-      },
+      isPlaylist: false,
+      tracks: [
+        {
+          title: ytMeta.title,
+          artist: ytMeta.artist,
+          duration: ytMeta.duration,
+          durationSec: ytMeta.durationSec,
+          url: cleanInput,
+          thumbnail: ytMeta.thumbnail,
+          source: "youtube",
+          sourceBadge: "🔴 YouTube",
+          sourceColor: 0xff0000,
+          requesterName: requester.name,
+          requesterId: requester.id,
+          rawTrackUrl: canonicalUrl,
+          createStream: async (seekSeconds: number = 0) => {
+            return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`);
+          },
+        },
+      ],
     };
   }
 
-  // 4. QUERY PENCARIAN TEKS DENGAN YOUTUBE CANDIDATE SCORING
+  // 7. TEXT SEARCH WITH YOUTUBE CANDIDATE SCORING
   const ytMatch = await searchYouTubeWithYtDlp(cleanInput, ytdlpPath);
 
   return {
-    title: ytMatch.title,
-    artist: ytMatch.artist,
-    duration: ytMatch.duration,
-    durationSec: ytMatch.durationSec,
-    url: ytMatch.url,
-    thumbnail: ytMatch.thumbnail,
-    source: ytMatch.url.includes("soundcloud.com") ? "soundcloud" : "youtube",
-    sourceBadge: ytMatch.url.includes("soundcloud.com") ? "🟠 SoundCloud" : "🔴 YouTube",
-    sourceColor: ytMatch.url.includes("soundcloud.com") ? 0xff5500 : 0xff0000,
-    requesterName: requester.name,
-    requesterId: requester.id,
-    rawTrackUrl: ytMatch.url,
-    createStream: async (seekSeconds: number = 0) => {
-      if (ytMatch.url.includes("soundcloud.com")) {
-        return createAudioResourceFromTrackUrl(ytMatch.url, seekSeconds);
-      }
-      return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, `${ytMatch.title} ${ytMatch.artist}`);
-    },
+    isPlaylist: false,
+    tracks: [
+      {
+        title: ytMatch.title,
+        artist: ytMatch.artist,
+        duration: ytMatch.duration,
+        durationSec: ytMatch.durationSec,
+        url: ytMatch.url,
+        thumbnail: ytMatch.thumbnail,
+        source: ytMatch.url.includes("soundcloud.com") ? "soundcloud" : "youtube",
+        sourceBadge: ytMatch.url.includes("soundcloud.com") ? "🟠 SoundCloud" : "🔴 YouTube",
+        sourceColor: ytMatch.url.includes("soundcloud.com") ? 0xff5500 : 0xff0000,
+        requesterName: requester.name,
+        requesterId: requester.id,
+        rawTrackUrl: ytMatch.url,
+        createStream: async (seekSeconds: number = 0) => {
+          if (ytMatch.url.includes("soundcloud.com")) {
+            return createAudioResourceFromTrackUrl(ytMatch.url, seekSeconds);
+          }
+          return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, `${ytMatch.title} ${ytMatch.artist}`);
+        },
+      },
+    ],
   };
+}
+
+// Backward-compatible helper to resolve a single track
+export async function resolveMusicTrack(
+  input: string,
+  requester: { name: string; id: string }
+): Promise<TrackMetadata> {
+  const result = await resolveMusic(input, requester);
+  if (!result.tracks || result.tracks.length === 0) {
+    throw new Error("Tidak menemukan lagu dari sumber tersebut.");
+  }
+  return result.tracks[0];
 }
 
 // Build Music Embed
@@ -1850,6 +2151,58 @@ export function buildNowPlayingEmbed(track: TrackMetadata, isQueue: boolean = fa
   if (track.thumbnail) {
     embed.setThumbnail(track.thumbnail);
   }
+
+  return embed;
+}
+
+// Build Playlist Embed (Now Playing or Queued)
+export function buildPlaylistEmbed(
+  result: ResolvedMusicResult,
+  requesterName: string,
+  isQueue: boolean = false
+): EmbedBuilder {
+  const firstTrack = result.tracks[0];
+  const color = firstTrack?.sourceColor || 0x8b5cf6;
+  const embed = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(isQueue ? "📋 Playlist Ditambahkan ke Antrean ✨" : "🎶 Memutar Playlist Musik ✨")
+    .setDescription(`**[${result.playlistTitle || "Playlist"}](${result.playlistUrl || firstTrack.url})**`)
+    .addFields(
+      { name: "📊 Total Lagu", value: `${result.tracks.length} lagu`, inline: true },
+      { name: "🌐 Sumber", value: firstTrack?.sourceBadge || "Playlist", inline: true },
+      { name: "🙋 Diminta Oleh", value: requesterName || "Sahabat Porsche-chan", inline: true },
+      {
+        name: isQueue ? "🎵 Lagu Pertama Playlist" : "🎵 Sedang Memutar Lagu #1",
+        value: `**[${firstTrack.title}](${firstTrack.url})** \`${firstTrack.duration}\` (${firstTrack.artist})`,
+        inline: false,
+      }
+    );
+
+  if (result.tracks.length > 1) {
+    const previewCount = Math.min(5, result.tracks.length - 1);
+    const previewList = result.tracks
+      .slice(1, 1 + previewCount)
+      .map((t, idx) => `**${idx + 2}.** [${t.title}](${t.url}) - \`${t.duration}\` (${t.artist})`)
+      .join("\n");
+    const extra = result.tracks.length > 6 ? `\n*...dan ${result.tracks.length - 6} lagu lainnya di antrean.*
+` : "";
+    embed.addFields([
+      {
+        name: "📋 Daftar Lagu Berikutnya di Antrean",
+        value: previewList + extra,
+        inline: false,
+      },
+    ]);
+  }
+
+  const thumb = result.playlistThumbnail || firstTrack?.thumbnail;
+  if (thumb) {
+    embed.setThumbnail(thumb);
+  }
+
+  embed
+    .setFooter({ text: "Porsche-chan Music Engine • Putar Playlist Otomatis Tanpa Jeda" })
+    .setTimestamp();
 
   return embed;
 }
@@ -2094,7 +2447,7 @@ export class MusicService {
     await interaction.deferReply();
 
     try {
-      const track = await resolveMusicTrack(queryOrUrl, {
+      const musicResult = await resolveMusic(queryOrUrl, {
         name: interaction.user.displayName || interaction.user.username,
         id: interaction.user.id,
       });
@@ -2102,32 +2455,66 @@ export class MusicService {
       const textChannel = interaction.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
 
-      if (session.isPlaying && session.currentTrack) {
-        session.queue.push(track);
-        const embed = buildNowPlayingEmbed(track, true);
-        await interaction.editReply({ embeds: [embed] });
-      } else {
-        if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-          try {
-            await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-          } catch {}
+      if (musicResult.isPlaylist) {
+        if (session.isPlaying && session.currentTrack) {
+          session.queue.push(...musicResult.tracks);
+          const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, true);
+          await interaction.editReply({ embeds: [embed] });
+        } else {
+          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+            } catch {}
+          }
+          session.connection.subscribe(session.player);
+
+          const [firstTrack, ...queuedTracks] = musicResult.tracks;
+          session.queue.push(...queuedTracks);
+
+          const resource = await firstTrack.createStream(0);
+          session.currentTrack = firstTrack;
+          session.currentResource = resource;
+          session.isPlaying = true;
+          session.isPaused = false;
+          session.isSeeking = false;
+          session.seekOffsetSec = 0;
+          session.player.play(resource);
+
+          const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, false);
+          await interaction.editReply({
+            embeds: [embed],
+            components: [buildMusicControlRow(false)],
+          });
         }
-        session.connection.subscribe(session.player);
+      } else {
+        const track = musicResult.tracks[0];
+        if (session.isPlaying && session.currentTrack) {
+          session.queue.push(track);
+          const embed = buildNowPlayingEmbed(track, true);
+          await interaction.editReply({ embeds: [embed] });
+        } else {
+          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+            } catch {}
+          }
+          session.connection.subscribe(session.player);
 
-        const resource = await track.createStream(0);
-        session.currentTrack = track;
-        session.currentResource = resource;
-        session.isPlaying = true;
-        session.isPaused = false;
-        session.isSeeking = false;
-        session.seekOffsetSec = 0;
-        session.player.play(resource);
+          const resource = await track.createStream(0);
+          session.currentTrack = track;
+          session.currentResource = resource;
+          session.isPlaying = true;
+          session.isPaused = false;
+          session.isSeeking = false;
+          session.seekOffsetSec = 0;
+          session.player.play(resource);
 
-        const embed = buildNowPlayingEmbed(track, false);
-        await interaction.editReply({
-          embeds: [embed],
-          components: [buildMusicControlRow(false)],
-        });
+          const embed = buildNowPlayingEmbed(track, false);
+          await interaction.editReply({
+            embeds: [embed],
+            components: [buildMusicControlRow(false)],
+          });
+        }
       }
     } catch (err) {
       logger.error({ err, queryOrUrl }, "Error resolving and playing track");
@@ -2381,7 +2768,7 @@ export class MusicService {
 
     const loadingMsg = await message.reply("🔎 Mencari & menyiapkan audio... Tunggu sebentar ya~ (๑˃ᴗ˂)ﻌ");
     try {
-      const track = await resolveMusicTrack(queryOrUrl, {
+      const musicResult = await resolveMusic(queryOrUrl, {
         name: message.author.displayName || message.author.username,
         id: message.author.id,
       });
@@ -2389,33 +2776,68 @@ export class MusicService {
       const textChannel = message.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
 
-      if (session.isPlaying && session.currentTrack) {
-        session.queue.push(track);
-        const embed = buildNowPlayingEmbed(track, true);
-        await loadingMsg.edit({ content: null, embeds: [embed] });
-      } else {
-        if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-          try {
-            await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-          } catch {}
+      if (musicResult.isPlaylist) {
+        if (session.isPlaying && session.currentTrack) {
+          session.queue.push(...musicResult.tracks);
+          const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, true);
+          await loadingMsg.edit({ content: null, embeds: [embed] });
+        } else {
+          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+            } catch {}
+          }
+          session.connection.subscribe(session.player);
+
+          const [firstTrack, ...queuedTracks] = musicResult.tracks;
+          session.queue.push(...queuedTracks);
+
+          const resource = await firstTrack.createStream(0);
+          session.currentTrack = firstTrack;
+          session.currentResource = resource;
+          session.isPlaying = true;
+          session.isPaused = false;
+          session.isSeeking = false;
+          session.seekOffsetSec = 0;
+          session.player.play(resource);
+
+          const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, false);
+          await loadingMsg.edit({
+            content: null,
+            embeds: [embed],
+            components: [buildMusicControlRow(false)],
+          });
         }
-        session.connection.subscribe(session.player);
+      } else {
+        const track = musicResult.tracks[0];
+        if (session.isPlaying && session.currentTrack) {
+          session.queue.push(track);
+          const embed = buildNowPlayingEmbed(track, true);
+          await loadingMsg.edit({ content: null, embeds: [embed] });
+        } else {
+          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+            } catch {}
+          }
+          session.connection.subscribe(session.player);
 
-        const resource = await track.createStream(0);
-        session.currentTrack = track;
-        session.currentResource = resource;
-        session.isPlaying = true;
-        session.isPaused = false;
-        session.isSeeking = false;
-        session.seekOffsetSec = 0;
-        session.player.play(resource);
+          const resource = await track.createStream(0);
+          session.currentTrack = track;
+          session.currentResource = resource;
+          session.isPlaying = true;
+          session.isPaused = false;
+          session.isSeeking = false;
+          session.seekOffsetSec = 0;
+          session.player.play(resource);
 
-        const embed = buildNowPlayingEmbed(track, false);
-        await loadingMsg.edit({
-          content: null,
-          embeds: [embed],
-          components: [buildMusicControlRow(false)],
-        });
+          const embed = buildNowPlayingEmbed(track, false);
+          await loadingMsg.edit({
+            content: null,
+            embeds: [embed],
+            components: [buildMusicControlRow(false)],
+          });
+        }
       }
     } catch (err) {
       logger.error({ err, queryOrUrl }, "Error in playFromMessage");

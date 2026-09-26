@@ -2467,7 +2467,7 @@ export const COMMANDS = [
     .toJSON(),
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Putar musik dari YouTube, YouTube Music, Spotify, atau judul lagu di VC")
+    .setDescription("Putar lagu atau playlist dari YouTube, YouTube Music, Spotify, SoundCloud, atau judul lagu di VC")
     .addStringOption((opt) =>
       opt
         .setName("url")
@@ -3248,7 +3248,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
   }
 
   // Auto-play when user directly pastes a music link while in a voice channel
-  const directLinkRegex = /^(?:https?:\/\/)?(?:www\.)?(?:music\.youtube\.com\/watch\?v=|youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/|open\.spotify\.com\/(?:track|album|playlist)\/|soundcloud\.com\/\S+)\S*$/i;
+  const directLinkRegex = /^(?:https?:\/\/)?(?:www\.)?(?:music\.youtube\.com\/(?:watch\?v=|playlist\?list=)|youtube\.com\/(?:watch\?.*list=|watch\?v=|shorts\/|playlist\?list=)|youtu\.be\/|open\.spotify\.com\/(?:track|album|playlist)\/|soundcloud\.com\/\S+)\S*$/i;
   if (directLinkRegex.test(rawContent)) {
     if (message.member?.voice?.channel) {
       await MusicService.playFromMessage(message, rawContent);
