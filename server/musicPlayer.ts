@@ -1941,7 +1941,7 @@ export async function resolveMusic(
           thumbnail: spPlaylist.thumbnail,
           source: "spotify" as MusicSource,
           sourceBadge: isAlbum ? "💿 Spotify Album" : "🟢 Spotify Playlist",
-          sourceColor: 0x1db954,
+          sourceColor: 0x1ed760,
           requesterName: requester.name,
           requesterId: requester.id,
           rawTrackUrl: t.url,
@@ -1986,7 +1986,7 @@ export async function resolveMusic(
           thumbnail: thumbnail || ytMatch.thumbnail,
           source: "spotify",
           sourceBadge: "🟢 Spotify",
-          sourceColor: 0x1db954,
+          sourceColor: 0x1ed760,
           requesterName: requester.name,
           requesterId: requester.id,
           rawTrackUrl: ytMatch.url,
@@ -2013,7 +2013,7 @@ export async function resolveMusic(
         thumbnail: ytPlaylist.thumbnail || (t.id ? `https://i.ytimg.com/vi/${t.id}/hqdefault.jpg` : undefined),
         source: (isYtMusic ? "youtube_music" : "youtube") as MusicSource,
         sourceBadge: isYtMusic ? "🎵 YouTube Music Playlist" : "🔴 YouTube Playlist",
-        sourceColor: isYtMusic ? 0xff334b : 0xff0000,
+        sourceColor: isYtMusic ? 0xff2a54 : 0xff4655,
         requesterName: requester.name,
         requesterId: requester.id,
         rawTrackUrl: t.url,
@@ -2050,7 +2050,7 @@ export async function resolveMusic(
           thumbnail: ytMeta.thumbnail,
           source: "youtube_music",
           sourceBadge: "🎵 YouTube Music",
-          sourceColor: 0xff334b,
+          sourceColor: 0xff2a54,
           requesterName: requester.name,
           requesterId: requester.id,
           rawTrackUrl: canonicalUrl,
@@ -2079,7 +2079,7 @@ export async function resolveMusic(
           thumbnail: ytMeta.thumbnail,
           source: "youtube",
           sourceBadge: "🔴 YouTube",
-          sourceColor: 0xff0000,
+          sourceColor: 0xff4655,
           requesterName: requester.name,
           requesterId: requester.id,
           rawTrackUrl: canonicalUrl,
@@ -2106,7 +2106,7 @@ export async function resolveMusic(
         thumbnail: ytMatch.thumbnail,
         source: ytMatch.url.includes("soundcloud.com") ? "soundcloud" : "youtube",
         sourceBadge: ytMatch.url.includes("soundcloud.com") ? "🟠 SoundCloud" : "🔴 YouTube",
-        sourceColor: ytMatch.url.includes("soundcloud.com") ? 0xff5500 : 0xff0000,
+        sourceColor: ytMatch.url.includes("soundcloud.com") ? 0xff5500 : 0xff4655,
         requesterName: requester.name,
         requesterId: requester.id,
         rawTrackUrl: ytMatch.url,
@@ -2133,62 +2133,98 @@ export async function resolveMusicTrack(
   return result.tracks[0];
 }
 
-// Build Music Embed
-export function buildNowPlayingEmbed(track: TrackMetadata, isQueue: boolean = false): EmbedBuilder {
+// Aesthetic Now Playing & Queue Embed Builder
+export function buildNowPlayingEmbed(
+  track: TrackMetadata,
+  isQueue: boolean = false,
+  currentPosSec: number = 0
+): EmbedBuilder {
   const embed = new EmbedBuilder()
-    .setColor(track.sourceColor)
-    .setTitle(isQueue ? "📋 Ditambahkan ke Antrean Musik ✨" : "🎶 Sekarang Memutar Musik ✨")
-    .setDescription(`**[${track.title}](${track.url})**`)
-    .addFields(
-      { name: "👤 Artis / Channel", value: track.artist?.trim() ? track.artist : "Artis Musik", inline: true },
-      { name: "⏱️ Durasi", value: track.duration?.trim() ? track.duration : "3:30", inline: true },
-      { name: "🌐 Sumber", value: track.sourceBadge, inline: true },
-      { name: "🙋 Diminta Oleh", value: track.requesterName || "Sahabat Porsche-chan", inline: true }
-    )
-    .setFooter({ text: "Porsche-chan Music Engine • Suara Jernih 48kHz Stereo" })
-    .setTimestamp();
+    .setColor(track.sourceColor || 0xff4655)
+    .setAuthor({
+      name: isQueue ? "📋 Ditambahkan ke Antrean Musik ✨" : "🎶 Sekarang Memutar Musik ✨",
+    })
+    .setTitle(track.title ? (track.title.length > 250 ? track.title.substring(0, 247) + "..." : track.title) : "Musik")
+    .setURL(track.url);
+
+  const durationStr = track.duration?.trim() ? track.duration : "Audio";
+  const artistStr = track.artist?.trim() ? track.artist : "Artis Musik";
+  const requesterStr = track.requesterName || "Sahabat Porsche-chan";
+  const platformStr = track.sourceBadge || "Audio";
+
+  const totalSec = track.durationSec || 0;
+  const progressBar = buildProgressBar(currentPosSec, totalSec, 14);
+  const progressLine = !isQueue
+    ? "\n\n`" + formatDuration(currentPosSec) + "` " + progressBar + " `" + durationStr + "`"
+    : "";
+
+  embed.setDescription(
+    "> 👤 **Artis:** `" + artistStr + "`\n" +
+    "> ⏱️ **Durasi:** `" + durationStr + "`\n" +
+    "> 🌐 **Platform:** " + platformStr + "\n" +
+    "> 🙋 **Diminta Oleh:** " + requesterStr +
+    progressLine
+  );
 
   if (track.thumbnail) {
     embed.setThumbnail(track.thumbnail);
   }
 
+  embed
+    .setFooter({ text: "Porsche-chan Music Engine • 48kHz Hi-Fi Stereo" })
+    .setTimestamp();
+
   return embed;
 }
 
-// Build Playlist Embed (Now Playing or Queued)
+// Build Aesthetic Playlist Embed (Now Playing or Queued)
 export function buildPlaylistEmbed(
   result: ResolvedMusicResult,
   requesterName: string,
   isQueue: boolean = false
 ): EmbedBuilder {
   const firstTrack = result.tracks[0];
-  const color = firstTrack?.sourceColor || 0x8b5cf6;
+  const color = firstTrack?.sourceColor || 0xa78bfa;
+  const rawTitle = (result.playlistTitle || "Playlist Musik").trim();
+  const title = rawTitle.length > 250 ? rawTitle.substring(0, 247) + "..." : rawTitle;
+  const url = result.playlistUrl || firstTrack?.url || "https://music.youtube.com";
+
+  const firstTrackTitle = firstTrack?.title
+    ? (firstTrack.title.length > 60 ? firstTrack.title.substring(0, 57) + "..." : firstTrack.title)
+    : "Lagu";
+
   const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle(isQueue ? "📋 Playlist Ditambahkan ke Antrean ✨" : "🎶 Memutar Playlist Musik ✨")
-    .setDescription(`**[${result.playlistTitle || "Playlist"}](${result.playlistUrl || firstTrack.url})**`)
-    .addFields(
-      { name: "📊 Total Lagu", value: `${result.tracks.length} lagu`, inline: true },
-      { name: "🌐 Sumber", value: firstTrack?.sourceBadge || "Playlist", inline: true },
-      { name: "🙋 Diminta Oleh", value: requesterName || "Sahabat Porsche-chan", inline: true },
-      {
-        name: isQueue ? "🎵 Lagu Pertama Playlist" : "🎵 Sedang Memutar Lagu #1",
-        value: `**[${firstTrack.title}](${firstTrack.url})** \`${firstTrack.duration}\` (${firstTrack.artist})`,
-        inline: false,
-      }
+    .setAuthor({
+      name: isQueue ? "📋 Playlist Ditambahkan ke Antrean ✨" : "🎶 Memutar Playlist Musik ✨",
+    })
+    .setTitle(title)
+    .setURL(url)
+    .setDescription(
+      "> 📊 **Total Lagu:** `" + result.tracks.length + " lagu`\n" +
+      "> 🌐 **Platform:** " + (firstTrack?.sourceBadge || "Playlist") + "\n" +
+      "> 🙋 **Diminta Oleh:** " + (requesterName || "Sahabat Porsche-chan") + "\n\n" +
+      "**" + (isQueue ? "🎵 Lagu Pertama di Antrean:" : "▶️ Sedang Memutar (#1):") + "**\n" +
+      "[" + firstTrackTitle + "](" + firstTrack.url + ")\n" +
+      "`👤 " + (firstTrack.artist || "Unknown") + "` • `⏱️ " + (firstTrack.duration || "Audio") + "`"
     );
 
   if (result.tracks.length > 1) {
     const previewCount = Math.min(5, result.tracks.length - 1);
     const previewList = result.tracks
       .slice(1, 1 + previewCount)
-      .map((t, idx) => `**${idx + 2}.** [${t.title}](${t.url}) - \`${t.duration}\` (${t.artist})`)
+      .map((t, idx) => {
+        const shortT = t.title.length > 55 ? t.title.substring(0, 52) + "..." : t.title;
+        const shortA = (t.artist || "Unknown").length > 30 ? (t.artist || "Unknown").substring(0, 27) + "..." : (t.artist || "Unknown");
+        return "` " + (idx + 2) + " ` [" + shortT + "](" + t.url + ")\n　　└ `" + shortA + "` • `" + (t.duration || "Audio") + "`";
+      })
       .join("\n");
-    const extra = result.tracks.length > 6 ? `\n*...dan ${result.tracks.length - 6} lagu lainnya di antrean.*
-` : "";
+    const remaining = result.tracks.length - (1 + previewCount);
+    const extra = remaining > 0 ? "\n\n*...dan `" + remaining + "` lagu lainnya di antrean.*" : "";
+
     embed.addFields([
       {
-        name: "📋 Daftar Lagu Berikutnya di Antrean",
+        name: "📋 Lagu Berikutnya di Antrean",
         value: previewList + extra,
         inline: false,
       },
@@ -2208,21 +2244,36 @@ export function buildPlaylistEmbed(
 }
 
 // Helper to generate visual progress bar for Now Playing
-export function buildProgressBar(currentSec: number, totalSec: number, length: number = 16): string {
-  if (!totalSec || totalSec <= 0) return "🔘" + "─".repeat(length - 1);
+export function buildProgressBar(currentSec: number, totalSec: number, length: number = 14): string {
+  if (!totalSec || totalSec <= 0) return "🔘" + "▬".repeat(Math.max(1, length - 1));
   const progress = Math.min(1, Math.max(0, currentSec / totalSec));
-  const progressIndex = Math.round(progress * (length - 1));
-  const bar = "─".repeat(progressIndex) + "🔘" + "─".repeat(length - 1 - progressIndex);
-  return bar;
+  const progressIndex = Math.min(length - 1, Math.max(0, Math.round(progress * (length - 1))));
+  const left = "▬".repeat(progressIndex);
+  const right = "▬".repeat(length - 1 - progressIndex);
+  return left + "🔘" + right;
 }
 
-// Interactive Music Playback Buttons: [ ⏸️ Pause / ▶️ Resume ] [ ⏭️ Skip ] [ ⏹️ Stop ]
+// Interactive Music Playback Buttons: [ ⏪ -10s ] [ ⏸️ Jeda / ▶️ Lanjut ] [ ⏩ +10s ] [ ⏭️ Skip ] [ ⏹️ Berhenti ]
 export function buildMusicControlRow(isPaused: boolean = false, disabled: boolean = false): ActionRowBuilder<ButtonBuilder> {
+  const rewindBtn = new ButtonBuilder()
+    .setCustomId("music_rewind_10")
+    .setLabel("-10s")
+    .setEmoji("⏪")
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(disabled);
+
   const pauseResumeBtn = new ButtonBuilder()
     .setCustomId("music_pause_resume")
-    .setLabel(isPaused ? "Resume" : "Pause")
+    .setLabel(isPaused ? "Lanjut" : "Jeda")
     .setEmoji(isPaused ? "▶️" : "⏸️")
     .setStyle(isPaused ? ButtonStyle.Success : ButtonStyle.Primary)
+    .setDisabled(disabled);
+
+  const forwardBtn = new ButtonBuilder()
+    .setCustomId("music_forward_10")
+    .setLabel("+10s")
+    .setEmoji("⏩")
+    .setStyle(ButtonStyle.Secondary)
     .setDisabled(disabled);
 
   const skipBtn = new ButtonBuilder()
@@ -2234,12 +2285,62 @@ export function buildMusicControlRow(isPaused: boolean = false, disabled: boolea
 
   const stopBtn = new ButtonBuilder()
     .setCustomId("music_stop")
-    .setLabel("Stop")
+    .setLabel("Berhenti")
     .setEmoji("⏹️")
     .setStyle(ButtonStyle.Danger)
     .setDisabled(disabled);
 
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(pauseResumeBtn, skipBtn, stopBtn);
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(rewindBtn, pauseResumeBtn, forwardBtn, skipBtn, stopBtn);
+}
+
+// Build Aesthetic Music Queue Embed
+export function buildQueueEmbed(session: GuildSession): EmbedBuilder {
+  const current = session.currentTrack;
+  const embed = new EmbedBuilder()
+    .setColor(current?.sourceColor || 0xa78bfa)
+    .setAuthor({ name: "📋 ANTREAN MUSIK PORSCHE-CHAN" })
+    .setTitle("Daftar Putar Musik Server")
+    .setFooter({ text: "Total Antrean: " + session.queue.length + " lagu • Porsche-chan Music Engine" })
+    .setTimestamp();
+
+  if (current) {
+    const elapsed = session.currentResource ? Math.floor(session.currentResource.playbackDuration / 1000) : 0;
+    const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
+    const totalSec = current.durationSec || 0;
+    const bar = buildProgressBar(currentPos, totalSec, 14);
+
+    embed.setDescription(
+      "**▶️ Sedang Diputar:**\n" +
+      "[" + current.title + "](" + current.url + ")\n" +
+      "> 👤 `" + (current.artist || "Unknown") + "` • ⏱️ `" + (current.duration || "Audio") + "` • 🌐 " + current.sourceBadge + "\n" +
+      "> 🙋 Diminta oleh: **" + (current.requesterName || "Sahabat") + "**\n\n" +
+      "`" + formatDuration(currentPos) + "` " + bar + " `" + (current.duration || "0:00") + "`"
+    );
+    if (current.thumbnail) {
+      embed.setThumbnail(current.thumbnail);
+    }
+  } else {
+    embed.setDescription("*(Tidak ada lagu yang sedang diputar saat ini)*");
+  }
+
+  if (session.queue.length > 0) {
+    const previewCount = Math.min(8, session.queue.length);
+    const list = session.queue
+      .slice(0, previewCount)
+      .map((t, idx) => {
+        const shortT = t.title.length > 55 ? t.title.substring(0, 52) + "..." : t.title;
+        const shortA = (t.artist || "Unknown").length > 30 ? (t.artist || "Unknown").substring(0, 27) + "..." : (t.artist || "Unknown");
+        return "` " + (idx + 1) + " ` [" + shortT + "](" + t.url + ")\n　　└ `" + shortA + "` • `" + (t.duration || "Audio") + "` • Diminta: **" + (t.requesterName || "Sahabat") + "**";
+      })
+      .join("\n");
+    const remaining = session.queue.length - previewCount;
+    const extra = remaining > 0 ? "\n\n*...dan `" + remaining + "` lagu lainnya di antrean.*" : "";
+    embed.addFields([{ name: "⏳ Lagu Berikutnya di Antrean", value: list + extra, inline: false }]);
+  } else {
+    embed.addFields([{ name: "⏳ Antrean Berikutnya", value: "*Antrean kosong. Ketik `/play` untuk menambah lagu!*", inline: false }]);
+  }
+
+  return embed;
 }
 
 // Music Player Session Management
@@ -2984,20 +3085,7 @@ export class MusicService {
       return;
     }
 
-    const current = session.currentTrack;
-    const embed = new EmbedBuilder()
-      .setColor(0x8b5cf6)
-      .setTitle("📋 Antrean Musik Porsche-chan ✨")
-      .setDescription(current ? `🎶 **Sedang Memutar:**\n**[${current.title}](${current.url})** | \`${current.duration}\` (diminta oleh ${current.requesterName})` : "Tidak ada lagu yang sedang aktif.")
-      .setFooter({ text: `Total lagu di antrean: ${session.queue.length}` })
-      .setTimestamp();
-
-    if (session.queue.length > 0) {
-      const list = session.queue.slice(0, 10).map((t, idx) => `**${idx + 1}.** [${t.title}](${t.url}) - \`${t.duration}\` (${t.requesterName})`).join("\n");
-      const extra = session.queue.length > 10 ? `\n*...dan ${session.queue.length - 10} lagu lainnya.*` : "";
-      embed.addFields([{ name: "Lagu Berikutnya", value: list + extra, inline: false }]);
-    }
-
+    const embed = buildQueueEmbed(session);
     await interaction.reply({ embeds: [embed] });
   }
 
@@ -3016,18 +3104,8 @@ export class MusicService {
     const track = session.currentTrack;
     const elapsed = session.currentResource ? Math.floor(session.currentResource.playbackDuration / 1000) : 0;
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
-    const totalSec = track.durationSec || 0;
-    const bar = buildProgressBar(currentPos, totalSec);
 
-    const embed = buildNowPlayingEmbed(track, false);
-    embed.addFields([
-      {
-        name: "⏱️ Progres",
-        value: `\`${formatDuration(currentPos)}\` ${bar} \`${track.duration}\``,
-        inline: false,
-      },
-    ]);
-
+    const embed = buildNowPlayingEmbed(track, false, currentPos);
     await interaction.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
   }
 
@@ -3067,20 +3145,7 @@ export class MusicService {
       return;
     }
 
-    const current = session.currentTrack;
-    const embed = new EmbedBuilder()
-      .setColor(0x8b5cf6)
-      .setTitle("📋 Antrean Musik Porsche-chan ✨")
-      .setDescription(current ? `🎶 **Sedang Memutar:**\n**[${current.title}](${current.url})** | \`${current.duration}\` (diminta oleh ${current.requesterName})` : "Tidak ada lagu yang sedang aktif.")
-      .setFooter({ text: `Total lagu di antrean: ${session.queue.length}` })
-      .setTimestamp();
-
-    if (session.queue.length > 0) {
-      const list = session.queue.slice(0, 10).map((t, idx) => `**${idx + 1}.** [${t.title}](${t.url}) - \`${t.duration}\` (${t.requesterName})`).join("\n");
-      const extra = session.queue.length > 10 ? `\n*...dan ${session.queue.length - 10} lagu lainnya.*` : "";
-      embed.addFields([{ name: "Lagu Berikutnya", value: list + extra, inline: false }]);
-    }
-
+    const embed = buildQueueEmbed(session);
     await message.reply({ embeds: [embed] });
   }
 
@@ -3096,18 +3161,8 @@ export class MusicService {
     const track = session.currentTrack;
     const elapsed = session.currentResource ? Math.floor(session.currentResource.playbackDuration / 1000) : 0;
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
-    const totalSec = track.durationSec || 0;
-    const bar = buildProgressBar(currentPos, totalSec);
 
-    const embed = buildNowPlayingEmbed(track, false);
-    embed.addFields([
-      {
-        name: "⏱️ Progres",
-        value: `\`${formatDuration(currentPos)}\` ${bar} \`${track.duration}\``,
-        inline: false,
-      },
-    ]);
-
+    const embed = buildNowPlayingEmbed(track, false, currentPos);
     await message.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
   }
 }
