@@ -44,17 +44,31 @@ if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
 }
 
 // Dynamic extractor arguments:
-// When cookies are present: web,mweb,ios (so YouTube honors web session cookies)
-// When cookies are absent: ios,web,mweb (ios client avoids datacenter bot checks)
+// web_creator bypasses most datacenter bot blocks (Studio-like client)
+// android is fallback for when web_creator fails
 export function getYtExtractorArgs(hasCookies?: boolean): string[] {
   if (process.env.YOUTUBE_PLAYER_CLIENT && process.env.YOUTUBE_PLAYER_CLIENT.trim()) {
     return ["--extractor-args", `youtube:player_client=${process.env.YOUTUBE_PLAYER_CLIENT.trim()}`];
   }
   const cookiesPresent = hasCookies !== undefined ? hasCookies : hasYouTubeCookies();
   if (cookiesPresent) {
-    return ["--extractor-args", "youtube:player_client=android,web,mweb"];
+    return ["--extractor-args", "youtube:player_client=web_creator,android,web"];
   }
-  return ["--extractor-args", "youtube:player_client=android,web"];
+  return ["--extractor-args", "youtube:player_client=web_creator,android"];
+}
+
+// Common yt-dlp flags for Railway/datacenter environments
+function getCommonYtDlpFlags(): string[] {
+  const flags = [
+    "--force-ipv4",
+    "--no-check-certificates",
+  ];
+  // Only add --js-runtimes node on non-Python yt-dlp installations
+  // pipx installs have their own Python, so this flag isn't needed
+  if (process.platform === "win32") {
+    flags.push("--js-runtimes", "node");
+  }
+  return flags;
 }
 
 const YT_EXTRACTOR_ARGS = getYtExtractorArgs();
@@ -228,6 +242,33 @@ export async function getOrDownloadYtDlp(): Promise<string> {
   }
 }
 
+// Auto-update yt-dlp to nightly (latest YouTube anti-bot patches)
+let ytdlpUpdateAttempted = false;
+export async function autoUpdateYtDlp(): Promise<void> {
+  if (ytdlpUpdateAttempted) return;
+  ytdlpUpdateAttempted = true;
+  try {
+    const ytdlpPath = await getOrDownloadYtDlp();
+    logger.info("Attempting yt-dlp self-update to nightly...");
+    const proc = spawnSync(ytdlpPath, ["--update-to", "nightly"], {
+      timeout: 30_000,
+      stdio: "pipe",
+    });
+    const output = proc.stdout?.toString()?.trim() || "";
+    const errOutput = proc.stderr?.toString()?.trim() || "";
+    if (proc.status === 0) {
+      logger.info({ output }, "yt-dlp updated to nightly successfully");
+    } else {
+      logger.warn({ status: proc.status, errOutput }, "yt-dlp nightly update returned non-zero (may already be latest)");
+    }
+    // Log current version
+    const verProc = spawnSync(ytdlpPath, ["--version"], { timeout: 5000, stdio: "pipe" });
+    const version = verProc.stdout?.toString()?.trim() || "unknown";
+    logger.info({ version }, "Current yt-dlp version");
+  } catch (err) {
+    logger.warn({ err }, "Failed to auto-update yt-dlp (non-fatal)");
+  }
+}
 // Initialize SoundCloud free client id for play-dl
 let scInitialized = false;
 export async function initSoundCloud(): Promise<void> {
@@ -553,7 +594,7 @@ async function getYtDlpMetadata(url: string, ytdlpPath: string, timeoutMs: numbe
     let resolved = false;
     const cookieArgs = getYtDlpCookieArgs();
     const proc = spawn(ytdlpPath, [
-      "--js-runtimes", "node",
+      ...getCommonYtDlpFlags(),
       ...cookieArgs,
       ...YT_EXTRACTOR_ARGS,
       "--dump-single-json",
@@ -1042,11 +1083,12 @@ async function getDirectAudioUrlWithYtDlp(url: string, ytdlpPath: string, timeou
     let directUrl = "";
 
     const cookieArgs = getYtDlpCookieArgs();
+    const commonFlags = getCommonYtDlpFlags();
     const procArgs = [
-      "--js-runtimes", "node",
+      ...commonFlags,
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android",
-      "-g", "-f", "18/ba/b/best",
+      "--extractor-args", "youtube:player_client=web_creator,android",
+      "-g", "-f", "ba/ba*/18/b/best",
       "--no-playlist",
       "--no-warnings",
       url,
@@ -1208,7 +1250,7 @@ async function searchYouTubeInternal(
   return new Promise((resolve, reject) => {
     const cookieArgs = getYtDlpCookieArgs();
     const proc = spawn(ytdlpPath, [
-      "--js-runtimes", "node",
+      ...getCommonYtDlpFlags(),
       ...cookieArgs,
       ...YT_EXTRACTOR_ARGS,
       "--dump-single-json",
@@ -1527,14 +1569,15 @@ function tryPipedStream(
       });
 
       const ffmpegArgs: string[] = [
-        "-analyzeduration", "0",
+        "-analyzeduration", "2000000",
+        "-probesize", "32768",
         "-loglevel", "error",
       ];
       if (seekSeconds > 0) {
         ffmpegArgs.push("-ss", seekSeconds.toString());
       }
       ffmpegArgs.push("-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
-      ffmpeg = spawn(FFMPEG_BIN, ffmpegArgs, { stdio: ["pipe", "pipe", "ignore"] });
+      ffmpeg = spawn(FFMPEG_BIN, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
     } catch (spawnErr) {
       return reject(spawnErr);
     }
@@ -1542,6 +1585,12 @@ function tryPipedStream(
     ytdlp.stdout.on("error", () => {});
     ffmpeg.stdin.on("error", () => {});
     ffmpeg.stdout.on("error", () => {});
+
+    let ffmpegStderr = "";
+    ffmpeg.stderr.on("data", (d: Buffer) => {
+      ffmpegStderr += d.toString();
+    });
+    ffmpeg.stderr.on("error", () => {});
 
     ytdlp.stdout.pipe(ffmpeg.stdin);
 
@@ -1693,87 +1742,91 @@ export async function createAudioResourceFromYtDlp(
   fallbackSearchQuery?: string
 ): Promise<any> {
   const cookieArgs = getYtDlpCookieArgs();
+  const commonFlags = getCommonYtDlpFlags();
   const isDirectYouTubeLink = /https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com)\//i.test(urlOrQuery);
 
-  // Tier 1: Android Client (Primary, bypasses 403 Forbidden and datacenter bot blocks)
+  // Format priority: audio-only first (ba = best audio), then muxed format 18 (360p MP4+AAC), then any
+  const fmtSelector = "ba/ba*/18/b/best";
+
+  // Tier 1: web_creator client (Studio-like client, least blocked on datacenter IPs)
   try {
     const ytdlpArgs = [
-      "--js-runtimes", "node",
+      ...commonFlags,
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=web_creator",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", fmtSelector,
+      "--no-playlist",
+      urlOrQuery,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
+    logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp web_creator pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err }, "Tier 1 web_creator pipe failed, trying Tier 2 (android client)");
+  }
+
+  // Tier 2: Android Client (bypasses many bot blocks)
+  try {
+    const ytdlpArgs = [
+      ...commonFlags,
       ...cookieArgs,
       "--extractor-args", "youtube:player_client=android",
       "-q",
       "--no-warnings",
       "--no-progress",
       "-o", "-",
-      "-f", "18/ba/b/best",
+      "-f", fmtSelector,
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
-    logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp android pipe stream");
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
+    logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp android pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err }, "Tier 1 yt-dlp android pipe failed, trying Tier 2 (android,web client)");
+    logger.warn({ err }, "Tier 2 android pipe failed, trying Tier 3 (web_embedded client)");
   }
 
-  // Tier 2: Android + Web combo client
+  // Tier 3: web_embedded client (iframe-like embed client, another datacenter option)
   try {
     const ytdlpArgs = [
-      "--js-runtimes", "node",
+      ...commonFlags,
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android,web",
+      "--extractor-args", "youtube:player_client=web_embedded",
       "-q",
       "--no-warnings",
       "--no-progress",
       "-o", "-",
-      "-f", "18/ba/b/best",
+      "-f", fmtSelector,
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
-    logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp android,web pipe stream");
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
+    logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp web_embedded pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err }, "Tier 2 android,web pipe failed, trying Tier 3 (tv_embedded client)");
+    logger.warn({ err }, "Tier 3 web_embedded pipe failed, trying Tier 4 (default extractor args)");
   }
 
-  // Tier 3: tv_embedded / tv client (alternative datacenter bypass)
-  try {
-    const ytdlpArgs = [
-      "--js-runtimes", "node",
-      ...cookieArgs,
-      "--extractor-args", "youtube:player_client=tv_embedded,tv",
-      "-q",
-      "--no-warnings",
-      "--no-progress",
-      "-o", "-",
-      "-f", "18/ba/b/best",
-      "--no-playlist",
-      urlOrQuery,
-    ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
-    logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp tv_embedded pipe stream");
-    return resource;
-  } catch (err) {
-    logger.warn({ err }, "Tier 3 tv_embedded pipe failed, trying Tier 4 (default extractor args)");
-  }
-
-  // Tier 4: Default Extractor Args
+  // Tier 4: Default Extractor Args (combined web_creator + android)
   try {
     const extractorArgs = getYtExtractorArgs(cookieArgs.length > 0);
     const ytdlpArgs = [
-      "--js-runtimes", "node",
+      ...commonFlags,
       ...cookieArgs,
       ...extractorArgs,
       "-q",
       "--no-warnings",
       "--no-progress",
       "-o", "-",
-      "-f", "18/ba/b/best",
+      "-f", fmtSelector,
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
     logger.info({ urlOrQuery }, "Started Tier 4 yt-dlp default extractor pipe stream");
     return resource;
   } catch (err) {
@@ -1782,10 +1835,10 @@ export async function createAudioResourceFromYtDlp(
 
   // Tier 5: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 5000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 8000);
     if (directUrl) {
       logger.info({ urlOrQuery }, "Attempting Tier 5 yt-dlp direct HTTPS audio URL");
-      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 8000);
+      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 10000);
       logger.info({ urlOrQuery }, "Streaming via Tier 5 yt-dlp direct HTTPS audio URL");
       return resource;
     }
@@ -2613,6 +2666,9 @@ export class MusicService {
             session.player.play(resource);
           } catch (streamErr) {
             logger.error({ streamErr, track: firstTrack.title }, "Failed to start initial playlist stream");
+            session.isPlaying = false;
+            session.currentTrack = null;
+            session.currentResource = null;
             if (session.queue.length > 0) {
               const next = session.queue.shift()!;
               await MusicService.playTrackInSession(session, next);
@@ -2651,6 +2707,10 @@ export class MusicService {
             session.player.play(resource);
           } catch (streamErr) {
             logger.error({ streamErr, track: track.title }, "Failed to start track stream");
+            // Reset session state to prevent zombie lock
+            session.isPlaying = false;
+            session.currentTrack = null;
+            session.currentResource = null;
             if (textChannel && "send" in textChannel) {
               await (textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(streamErr as Error).message || "Stream error"}`).catch(() => {});
             }
@@ -3015,6 +3075,9 @@ const followMsg = await interaction.followUp({
             session.player.play(resource);
           } catch (streamErr) {
             logger.error({ streamErr, track: firstTrack.title }, "Failed to start initial playlist stream");
+            session.isPlaying = false;
+            session.currentTrack = null;
+            session.currentResource = null;
             if (session.queue.length > 0) {
               const next = session.queue.shift()!;
               await MusicService.playTrackInSession(session, next);
@@ -3054,6 +3117,9 @@ const followMsg = await interaction.followUp({
             session.player.play(resource);
           } catch (streamErr) {
             logger.error({ streamErr, track: track.title }, "Failed to start track stream");
+            session.isPlaying = false;
+            session.currentTrack = null;
+            session.currentResource = null;
             if (textChannel && "send" in textChannel) {
               await (textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(streamErr as Error).message || "Stream error"}`).catch(() => {});
             }

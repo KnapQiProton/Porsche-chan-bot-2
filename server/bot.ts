@@ -42,6 +42,8 @@ import {
   safeDestroyVoiceConnection,
   saveUploadedCookies,
   getCookieStatus,
+  autoUpdateYtDlp,
+  initSoundCloud,
 } from "./musicPlayer";
 import {
   parseSmartAnimeQuery,
@@ -2575,6 +2577,10 @@ client.once(Events.ClientReady, async (c) => {
   botStatusInfo.error = null;
 
   logger.info({ tag: c.user.tag, guilds: c.guilds.cache.size }, "Discord bot ready and connected!");
+
+  // Initialize music subsystems (non-blocking)
+  autoUpdateYtDlp().catch((err) => logger.warn({ err }, "yt-dlp auto-update failed (non-fatal)"));
+  initSoundCloud().catch((err) => logger.warn({ err }, "SoundCloud init failed (non-fatal)"));
 
   const token = process.env.DISCORD_BOT_TOKEN;
   if (token) {

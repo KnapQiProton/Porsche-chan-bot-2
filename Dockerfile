@@ -1,6 +1,6 @@
 FROM node:22-slim
 
-# Install system dependencies: ffmpeg (audio), python3 + pipx (yt-dlp), build tools (native modules)
+# Install system dependencies: ffmpeg (audio), python3 (for yt-dlp plugins), build tools (native modules)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     python3 \
@@ -11,10 +11,12 @@ RUN apt-get update && apt-get install -y \
     git \
     build-essential \
     python3-dev \
-    && pipx install "yt-dlp[default]" \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.local/bin:$PATH"
+
+# Install yt-dlp via pipx (Python-based, supports plugins and --update-to nightly)
+RUN pipx install "yt-dlp[default]"
 
 WORKDIR /app
 
@@ -32,6 +34,11 @@ COPY server.ts index.html ./
 
 # Build frontend and backend
 RUN npm run build
+
+# Update yt-dlp to nightly at the END so Docker doesn't cache stale version
+# (This layer runs after source copy, so it always rebuilds on code changes)
+RUN yt-dlp --update-to nightly 2>/dev/null || yt-dlp --update 2>/dev/null || true && \
+    echo "yt-dlp version:" && yt-dlp --version
 
 # Runtime environment
 ENV NODE_ENV="production"
