@@ -1794,28 +1794,7 @@ export async function createAudioResourceFromYtDlp(
   // Format priority: best audio, then format 18 (360p MP4+AAC), then best
   const fmtSelector = "ba/ba*/18/b/best";
 
-  // Tier 1: web,android client (primary for YouTube with Node.js n-sig challenge solving)
-  try {
-    const ytdlpArgs = [
-      ...commonFlags,
-      ...cookieArgs,
-      "--extractor-args", "youtube:player_client=web,android",
-      "-q",
-      "--no-warnings",
-      "--no-progress",
-      "-o", "-",
-      "-f", fmtSelector,
-      "--no-playlist",
-      targetUrl,
-    ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 8000);
-    logger.info({ targetUrl }, "Started Tier 1 yt-dlp web,android pipe stream");
-    return resource;
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 1 web,android pipe failed, trying Tier 2 (android client)");
-  }
-
-  // Tier 2: Android client alone
+  // Tier 1: Android client (fastest extraction ~3s, no n-sig JS challenge needed)
   try {
     const ytdlpArgs = [
       ...commonFlags,
@@ -1829,19 +1808,40 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       targetUrl,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
-    logger.info({ targetUrl }, "Started Tier 2 yt-dlp android pipe stream");
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    logger.info({ targetUrl }, "Started Tier 1 yt-dlp android pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 2 android pipe failed, trying Tier 3 direct audio URL");
+    logger.warn({ err: (err as Error).message }, "Tier 1 android pipe failed, trying Tier 2 (web,android client)");
+  }
+
+  // Tier 2: web,android client (Node.js n-sig challenge solving, more formats but slower ~8-9s)
+  try {
+    const ytdlpArgs = [
+      ...commonFlags,
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=web,android",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", fmtSelector,
+      "--no-playlist",
+      targetUrl,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 20000);
+    logger.info({ targetUrl }, "Started Tier 2 yt-dlp web,android pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "Tier 2 web,android pipe failed, trying Tier 3 direct audio URL");
   }
 
   // Tier 3: Direct HTTPS audio URL extracted by yt-dlp
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 5000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 15000);
     if (directUrl) {
       logger.info({ targetUrl }, "Attempting Tier 3 direct HTTPS audio URL");
-      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 6000);
+      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
       logger.info({ targetUrl }, "Streaming via Tier 3 direct HTTPS audio URL");
       return resource;
     }
