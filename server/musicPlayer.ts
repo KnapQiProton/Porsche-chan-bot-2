@@ -52,9 +52,9 @@ export function getYtExtractorArgs(hasCookies?: boolean): string[] {
   }
   const cookiesPresent = hasCookies !== undefined ? hasCookies : hasYouTubeCookies();
   if (cookiesPresent) {
-    return ["--extractor-args", "youtube:player_client=web,mweb,ios"];
+    return ["--extractor-args", "youtube:player_client=android,web,mweb"];
   }
-  return ["--extractor-args", "youtube:player_client=ios,web,mweb"];
+  return ["--extractor-args", "youtube:player_client=android,web"];
 }
 
 const YT_EXTRACTOR_ARGS = getYtExtractorArgs();
@@ -1045,8 +1045,8 @@ async function getDirectAudioUrlWithYtDlp(url: string, ytdlpPath: string, timeou
     const procArgs = [
       "--js-runtimes", "node",
       ...cookieArgs,
-      ...YT_EXTRACTOR_ARGS,
-      "-g", "-f", "bestaudio/ba/ba*/b/best",
+      "--extractor-args", "youtube:player_client=android",
+      "-g", "-f", "18/ba/b/best",
       "--no-playlist",
       "--no-warnings",
       url,
@@ -1695,10 +1695,72 @@ export async function createAudioResourceFromYtDlp(
   const cookieArgs = getYtDlpCookieArgs();
   const isDirectYouTubeLink = /https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com)\//i.test(urlOrQuery);
 
-  const extractorArgs = getYtExtractorArgs(cookieArgs.length > 0);
-
-  // Tier 1: Direct yt-dlp stdout pipe into FFmpeg raw PCM (Primary, fastest)
+  // Tier 1: Android Client (Primary, bypasses 403 Forbidden and datacenter bot blocks)
   try {
+    const ytdlpArgs = [
+      "--js-runtimes", "node",
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=android",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", "18/ba/b/best",
+      "--no-playlist",
+      urlOrQuery,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
+    logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp android pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err }, "Tier 1 yt-dlp android pipe failed, trying Tier 2 (android,web client)");
+  }
+
+  // Tier 2: Android + Web combo client
+  try {
+    const ytdlpArgs = [
+      "--js-runtimes", "node",
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=android,web",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", "18/ba/b/best",
+      "--no-playlist",
+      urlOrQuery,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
+    logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp android,web pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err }, "Tier 2 android,web pipe failed, trying Tier 3 (tv_embedded client)");
+  }
+
+  // Tier 3: tv_embedded / tv client (alternative datacenter bypass)
+  try {
+    const ytdlpArgs = [
+      "--js-runtimes", "node",
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=tv_embedded,tv",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", "18/ba/b/best",
+      "--no-playlist",
+      urlOrQuery,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
+    logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp tv_embedded pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err }, "Tier 3 tv_embedded pipe failed, trying Tier 4 (default extractor args)");
+  }
+
+  // Tier 4: Default Extractor Args
+  try {
+    const extractorArgs = getYtExtractorArgs(cookieArgs.length > 0);
     const ytdlpArgs = [
       "--js-runtimes", "node",
       ...cookieArgs,
@@ -1707,104 +1769,28 @@ export async function createAudioResourceFromYtDlp(
       "--no-warnings",
       "--no-progress",
       "-o", "-",
-      "-f", "ba/ba*/b/best",
+      "-f", "18/ba/b/best",
       "--no-playlist",
       urlOrQuery,
     ];
     const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
-    logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp stdout pipe stream");
+    logger.info({ urlOrQuery }, "Started Tier 4 yt-dlp default extractor pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err }, "Tier 1 yt-dlp pipe stream failed, trying Tier 2 (ios client)");
-  }
-
-  // Tier 2: Try alternate ios client (bypasses bot challenges and format blocks on datacenter IPs)
-  try {
-    const ytdlpArgs = [
-      "--js-runtimes", "node",
-      ...cookieArgs,
-      "--extractor-args", "youtube:player_client=ios",
-      "-q",
-      "--no-warnings",
-      "--no-progress",
-      "-o", "-",
-      "-f", "ba/ba*/b/best",
-      "--no-playlist",
-      urlOrQuery,
-    ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
-    logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp ios pipe stream");
-    return resource;
-  } catch (err) {
-    logger.warn({ err }, "Tier 2 ios pipe stream failed, trying Tier 3 (mweb client)");
-  }
-
-  // Tier 3: Try alternate mweb (mobile web) client
-  try {
-    const ytdlpArgs = [
-      "--js-runtimes", "node",
-      ...cookieArgs,
-      "--extractor-args", "youtube:player_client=mweb",
-      "-q",
-      "--no-warnings",
-      "--no-progress",
-      "-o", "-",
-      "-f", "ba/ba*/b/best",
-      "--no-playlist",
-      urlOrQuery,
-    ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
-    logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp mweb pipe stream");
-    return resource;
-  } catch (err) {
-    logger.warn({ err }, "Tier 3 mweb pipe stream failed, trying Tier 4 (tv client)");
-  }
-
-  // Tier 4: Try alternate tv client
-  try {
-    const ytdlpArgs = [
-      "--js-runtimes", "node",
-      ...cookieArgs,
-      "--extractor-args", "youtube:player_client=tv",
-      "-q",
-      "--no-warnings",
-      "--no-progress",
-      "-o", "-",
-      "-f", "ba/ba*/b/best",
-      "--no-playlist",
-      urlOrQuery,
-    ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
-    logger.info({ urlOrQuery }, "Started Tier 4 yt-dlp tv pipe stream");
-    return resource;
-  } catch (err) {
-    logger.warn({ err }, "Tier 4 tv pipe stream failed, trying Tier 5 direct HTTPS URL");
+    logger.warn({ err }, "Tier 4 pipe stream failed, trying Tier 5 direct HTTPS URL");
   }
 
   // Tier 5: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 8000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 5000);
     if (directUrl) {
       logger.info({ urlOrQuery }, "Attempting Tier 5 yt-dlp direct HTTPS audio URL");
-      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
+      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 8000);
       logger.info({ urlOrQuery }, "Streaming via Tier 5 yt-dlp direct HTTPS audio URL");
       return resource;
     }
   } catch (err) {
     logger.warn({ err }, "Tier 5 direct URL failed");
-  }
-
-  // If this was a direct YouTube link sent by the user, provide an accurate and actionable message
-  if (isDirectYouTubeLink) {
-    if (!hasYouTubeCookies()) {
-      throw new Error(
-        "⚠️ YouTube meminta konfirmasi bot (Sign in to confirm you're not a bot) di server hosting! " +
-        "Silakan pasang cookies YouTube kamu menggunakan perintah /cookies atau pasang variable YOUTUBE_COOKIE di Railway agar bot bisa memutar video YouTube tanpa hambatan."
-      );
-    }
-    throw new Error(
-      "Gagal memutar audio dari link video YouTube tersebut (video mungkin bersifat privat, dibatasi usia, atau cookies kamu sudah kedaluwarsa). Periksa dengan /cookies-status."
-    );
   }
 
   // Tier 4: SoundCloud fallback audio stream (ultra-reliable when YouTube IP is challenged, scored for accuracy)
