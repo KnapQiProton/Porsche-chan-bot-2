@@ -2476,6 +2476,12 @@ export const COMMANDS = [
         .setDescription("URL YouTube, YouTube Music, Spotify, SoundCloud, atau ketik judul lagu")
         .setRequired(true),
     )
+    .addBooleanOption((opt) =>
+      opt
+        .setName("playlist")
+        .setDescription("Putar seluruh playlist jika URL memiliki playlist? (Default: False untuk link video)")
+        .setRequired(false),
+    )
     .toJSON(),
   new SlashCommandBuilder()
     .setName("stop")
@@ -3244,11 +3250,20 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   const rawContent = message.content.trim();
 
-  // Prefix commands in guild: !play <url/query>, !stop, !pause, !resume, !forward, !rewind
+  // Prefix commands in guild: !play <url/query>, !playlist <url>, !play-all <url>, !stop, !pause, !resume, !forward, !rewind
   if (rawContent.startsWith("!play ") || rawContent.startsWith("!putar ")) {
     const q = rawContent.replace(/^!(?:play|putar)\s+/i, "").trim();
     if (q) {
-      await MusicService.playFromMessage(message, q);
+      await MusicService.playFromMessage(message, q, false);
+      return;
+    }
+  }
+
+  // Force playlist prefix commands: !playlist <url>, !putar-playlist <url>, !play-all <url>
+  if (rawContent.startsWith("!playlist ") || rawContent.startsWith("!putar-playlist ") || rawContent.startsWith("!play-all ")) {
+    const q = rawContent.replace(/^!(?:playlist|putar-playlist|play-all)\s+/i, "").trim();
+    if (q) {
+      await MusicService.playFromMessage(message, q, true);
       return;
     }
   }

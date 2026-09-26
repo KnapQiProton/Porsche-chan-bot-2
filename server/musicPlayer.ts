@@ -88,6 +88,7 @@ export interface TrackMetadata {
   requesterName: string;
   requesterId: string;
   rawTrackUrl?: string;
+  hasPlaylistParam?: boolean;
   // Audio stream resolver with optional seek offset in seconds
   createStream: (seekSeconds?: number) => Promise<any>;
 }
@@ -730,27 +731,39 @@ export async function getYouTubeMetadata(urlOrVideoId: string, ytdlpPath?: strin
 }
 
 // Extract YouTube Playlist items using yt-dlp flat-playlist mode
-export async function getYouTubePlaylist(url: string, ytdlpPath: string, timeoutMs: number = 10000): Promise<{
+export async function getYouTubePlaylist(url: string, ytdlpPath: string, timeoutMs: number = 15000): Promise<{
   title: string;
   thumbnail?: string;
-  tracks: Array<{ id: string; title: string; artist: string; durationSec?: number; url: string }>;
+  tracks: Array<{ id: string; title: string; artist: string; durationSec?: number; url: string; thumbnail?: string }>;
 } | null> {
-  const isPlaylist = /youtube\.com\/(?:playlist\?list=|watch\?.*list=)|music\.youtube\.com\/(?:playlist\?list=|watch\?.*list=)/i.test(url);
-  if (!isPlaylist) return null;
+  const listMatch = url.match(/[?&]list=([a-zA-Z0-9_-]+)/i);
+  const listId = listMatch ? listMatch[1] : null;
+  if (!listId) return null;
+
+  // Mixes (RD...) cannot be extracted cleanly with --flat-playlist
+  if (/^RD/i.test(listId)) {
+    logger.warn({ listId }, "Skipping flat-playlist for YouTube Mix (dynamic mix)");
+    return null;
+  }
+
+  // Canonical playlist URL to prevent yt-dlp from getting stuck on &index= or watch?v=
+  const cleanPlaylistUrl = `https://www.youtube.com/playlist?list=${listId}`;
 
   return new Promise((resolve) => {
     let resolved = false;
     const cookieArgs = getYtDlpCookieArgs();
+    const commonFlags = getCommonYtDlpFlags();
     const extractorArgs = getYtExtractorArgs(cookieArgs.length > 0);
 
     const proc = spawn(ytdlpPath, [
+      ...commonFlags,
       "--flat-playlist",
       "--dump-single-json",
       "--no-warnings",
       "--playlist-end", "100",
       ...cookieArgs,
       ...extractorArgs,
-      url,
+      cleanPlaylistUrl,
     ]);
 
     let stdout = "";
@@ -779,11 +792,12 @@ export async function getYouTubePlaylist(url: string, ytdlpPath: string, timeout
               .filter((e) => e && (e.id || e.url))
               .map((e) => {
                 const videoId = e.id || "";
-                const videoUrl = e.url && e.url.startsWith("http") ? e.url : (videoId ? `https://www.youtube.com/watch?v=${videoId}` : url);
+                const videoUrl = e.url && e.url.startsWith("http") ? e.url : (videoId ? `https://www.youtube.com/watch?v=${videoId}` : cleanPlaylistUrl);
                 const rawTitle = e.title || "YouTube Audio";
                 const rawUploader = e.uploader || e.channel || "Artis YouTube";
                 const parsed = parseTitleAndArtist(rawTitle, rawUploader);
                 const durationSec = typeof e.duration === "number" && e.duration > 0 ? Math.round(e.duration) : undefined;
+                const videoThumb = e.thumbnails?.[e.thumbnails.length - 1]?.url || (videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : undefined);
 
                 return {
                   id: videoId,
@@ -791,6 +805,7 @@ export async function getYouTubePlaylist(url: string, ytdlpPath: string, timeout
                   artist: parsed.artist && !isRecordLabelOrLyricChannel(parsed.artist) ? parsed.artist : rawUploader,
                   durationSec,
                   url: videoUrl,
+                  thumbnail: videoThumb,
                 };
               });
 
@@ -1631,6 +1646,16 @@ function tryPipedStream(
       }
     });
 
+    ffmpeg.on("close", (code: number) => {
+      if (!settled && code !== 0) {
+        settled = true;
+        clearTimeout(timer);
+        try { ytdlp.kill("SIGKILL"); } catch {}
+        const detail = ffmpegStderr.trim() ? `: ${ffmpegStderr.trim().slice(0, 300)}` : "";
+        reject(new Error(`FFmpeg exited with error code ${code}${detail}`));
+      }
+    });
+
     const onData = (chunk: Buffer) => {
       if (!settled) {
         settled = true;
@@ -1743,6 +1768,8 @@ export async function createAudioResourceFromYtDlp(
 ): Promise<any> {
   const cookieArgs = getYtDlpCookieArgs();
   const commonFlags = getCommonYtDlpFlags();
+  const videoId = extractYouTubeVideoId(urlOrQuery);
+  const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : urlOrQuery;
   const isDirectYouTubeLink = /https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com)\//i.test(urlOrQuery);
 
   // Format priority: audio-only first (ba = best audio), then muxed format 18 (360p MP4+AAC), then any
@@ -1760,10 +1787,10 @@ export async function createAudioResourceFromYtDlp(
       "-o", "-",
       "-f", fmtSelector,
       "--no-playlist",
-      urlOrQuery,
+      targetUrl,
     ];
     const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
-    logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp web_creator pipe stream");
+    logger.info({ targetUrl }, "Started Tier 1 yt-dlp web_creator pipe stream");
     return resource;
   } catch (err) {
     logger.warn({ err }, "Tier 1 web_creator pipe failed, trying Tier 2 (android client)");
@@ -1781,10 +1808,10 @@ export async function createAudioResourceFromYtDlp(
       "-o", "-",
       "-f", fmtSelector,
       "--no-playlist",
-      urlOrQuery,
+      targetUrl,
     ];
     const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
-    logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp android pipe stream");
+    logger.info({ targetUrl }, "Started Tier 2 yt-dlp android pipe stream");
     return resource;
   } catch (err) {
     logger.warn({ err }, "Tier 2 android pipe failed, trying Tier 3 (web_embedded client)");
@@ -1802,10 +1829,10 @@ export async function createAudioResourceFromYtDlp(
       "-o", "-",
       "-f", fmtSelector,
       "--no-playlist",
-      urlOrQuery,
+      targetUrl,
     ];
     const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
-    logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp web_embedded pipe stream");
+    logger.info({ targetUrl }, "Started Tier 3 yt-dlp web_embedded pipe stream");
     return resource;
   } catch (err) {
     logger.warn({ err }, "Tier 3 web_embedded pipe failed, trying Tier 4 (default extractor args)");
@@ -1824,10 +1851,10 @@ export async function createAudioResourceFromYtDlp(
       "-o", "-",
       "-f", fmtSelector,
       "--no-playlist",
-      urlOrQuery,
+      targetUrl,
     ];
     const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
-    logger.info({ urlOrQuery }, "Started Tier 4 yt-dlp default extractor pipe stream");
+    logger.info({ targetUrl }, "Started Tier 4 yt-dlp default extractor pipe stream");
     return resource;
   } catch (err) {
     logger.warn({ err }, "Tier 4 pipe stream failed, trying Tier 5 direct HTTPS URL");
@@ -1835,11 +1862,11 @@ export async function createAudioResourceFromYtDlp(
 
   // Tier 5: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 8000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000);
     if (directUrl) {
-      logger.info({ urlOrQuery }, "Attempting Tier 5 yt-dlp direct HTTPS audio URL");
+      logger.info({ targetUrl }, "Attempting Tier 5 yt-dlp direct HTTPS audio URL");
       const resource = await tryPipedUrlStream(directUrl, seekSeconds, 10000);
-      logger.info({ urlOrQuery }, "Streaming via Tier 5 yt-dlp direct HTTPS audio URL");
+      logger.info({ targetUrl }, "Streaming via Tier 5 yt-dlp direct HTTPS audio URL");
       return resource;
     }
   } catch (err) {
@@ -1917,7 +1944,8 @@ export async function createAudioResourceFromYtDlp(
 // Resolve single track or full playlist/album (YouTube, Spotify, SoundCloud, or text search)
 export async function resolveMusic(
   input: string,
-  requester: { name: string; id: string }
+  requester: { name: string; id: string },
+  options?: { forcePlaylist?: boolean }
 ): Promise<ResolvedMusicResult> {
   const cleanInput = input.trim();
   const ytdlpPath = await getOrDownloadYtDlp();
@@ -2065,97 +2093,93 @@ export async function resolveMusic(
     };
   }
 
-  // 4. YOUTUBE PLAYLIST (YouTube & YouTube Music)
-  const isYtPlaylist = /youtube\.com\/(?:playlist\?list=|watch\?.*list=)|music\.youtube\.com\/(?:playlist\?list=|watch\?.*list=)/i.test(cleanInput);
-  if (isYtPlaylist) {
-    const ytPlaylist = await getYouTubePlaylist(cleanInput, ytdlpPath);
-    if (ytPlaylist && ytPlaylist.tracks.length > 0) {
+  // 4. YOUTUBE & YOUTUBE MUSIC (Differentiating Single Video vs Playlist)
+  const isYouTube = /^(?:https?:\/\/)?(?:www\.|music\.)?(?:youtube\.com|youtu\.be)\//i.test(cleanInput);
+  if (isYouTube) {
+    const videoId = extractYouTubeVideoId(cleanInput);
+    const listMatch = cleanInput.match(/[?&]list=([a-zA-Z0-9_-]+)/i);
+    const listId = listMatch ? listMatch[1] : null;
+    const isMix = listId ? /^RD/i.test(listId) : false;
+    const isPurePlaylistUrl = cleanInput.includes("/playlist?") || (!videoId && Boolean(listId));
+
+    // Determine whether to play as a playlist:
+    // - Pure playlist URL (e.g. /playlist?list=PL...) is ALWAYS a playlist.
+    // - Video URL with playlist param (watch?v=...&list=PL...):
+    //   If it's a Mix (RD...), YouTube mixes CANNOT be loaded as flat-playlists; always play single track.
+    //   If it's a normal playlist (PL...), only load as playlist if forcePlaylist === true.
+    //   Otherwise, play that single track cleanly with zero delay and add tip to embed.
+    const shouldPlayAsPlaylist = isPurePlaylistUrl || (Boolean(listId) && !isMix && options?.forcePlaylist === true);
+
+    if (shouldPlayAsPlaylist && listId) {
+      const canonicalPlaylistUrl = `https://www.youtube.com/playlist?list=${listId}`;
+      logger.info({ listId, canonicalPlaylistUrl }, "Resolving YouTube playlist");
+      const ytPlaylist = await getYouTubePlaylist(canonicalPlaylistUrl, ytdlpPath);
+
+      if (ytPlaylist && ytPlaylist.tracks.length > 0) {
+        const isYtMusic = cleanInput.includes("music.youtube.com");
+        const tracks: TrackMetadata[] = ytPlaylist.tracks.map((t) => ({
+          title: t.title,
+          artist: t.artist,
+          duration: t.durationSec ? formatDuration(t.durationSec) : "Audio",
+          durationSec: t.durationSec,
+          url: t.url,
+          thumbnail: t.thumbnail || (t.id ? `https://i.ytimg.com/vi/${t.id}/hqdefault.jpg` : ytPlaylist.thumbnail),
+          source: (isYtMusic ? "youtube_music" : "youtube") as MusicSource,
+          sourceBadge: isYtMusic ? "🎵 YouTube Music Playlist" : "🔴 YouTube Playlist",
+          sourceColor: isYtMusic ? 0xff2a54 : 0xff4655,
+          requesterName: requester.name,
+          requesterId: requester.id,
+          rawTrackUrl: t.url,
+          createStream: async (seekSeconds: number = 0) => {
+            return createAudioResourceFromYtDlp(t.url, seekSeconds, ytdlpPath, `${t.title} ${t.artist}`);
+          },
+        }));
+
+        return {
+          isPlaylist: true,
+          playlistTitle: ytPlaylist.title,
+          playlistUrl: canonicalPlaylistUrl,
+          playlistThumbnail: ytPlaylist.thumbnail || tracks[0]?.thumbnail,
+          playlistCount: tracks.length,
+          tracks,
+        };
+      } else if (isPurePlaylistUrl) {
+        throw new Error("Playlist YouTube tidak dapat diakses (mungkin bersifat privat, kosong, atau dihapus).");
+      }
+      logger.warn({ listId }, "Playlist resolution failed or empty, falling back to single video");
+    }
+
+    // Single YouTube / YouTube Music Track
+    if (videoId) {
+      const canonicalUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      const ytMeta = await getYouTubeMetadata(canonicalUrl, ytdlpPath);
       const isYtMusic = cleanInput.includes("music.youtube.com");
-      const tracks: TrackMetadata[] = ytPlaylist.tracks.map((t) => ({
-        title: t.title,
-        artist: t.artist,
-        duration: t.durationSec ? formatDuration(t.durationSec) : "Audio",
-        durationSec: t.durationSec,
-        url: t.url,
-        thumbnail: ytPlaylist.thumbnail || (t.id ? `https://i.ytimg.com/vi/${t.id}/hqdefault.jpg` : undefined),
-        source: (isYtMusic ? "youtube_music" : "youtube") as MusicSource,
-        sourceBadge: isYtMusic ? "🎵 YouTube Music Playlist" : "🔴 YouTube Playlist",
-        sourceColor: isYtMusic ? 0xff2a54 : 0xff4655,
-        requesterName: requester.name,
-        requesterId: requester.id,
-        rawTrackUrl: t.url,
-        createStream: async (seekSeconds: number = 0) => {
-          return createAudioResourceFromYtDlp(t.url, seekSeconds, ytdlpPath, `${t.title} ${t.artist}`);
-        },
-      }));
+      const hasPlaylist = Boolean(listId && !isMix);
 
       return {
-        isPlaylist: true,
-        playlistTitle: ytPlaylist.title,
-        playlistUrl: cleanInput,
-        playlistThumbnail: ytPlaylist.thumbnail,
-        playlistCount: tracks.length,
-        tracks,
+        isPlaylist: false,
+        tracks: [
+          {
+            title: ytMeta.title,
+            artist: ytMeta.artist,
+            duration: ytMeta.duration,
+            durationSec: ytMeta.durationSec,
+            url: canonicalUrl,
+            thumbnail: ytMeta.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+            source: isYtMusic ? "youtube_music" : "youtube",
+            sourceBadge: isYtMusic ? "🎵 YouTube Music" : "🔴 YouTube",
+            sourceColor: isYtMusic ? 0xff2a54 : 0xff4655,
+            requesterName: requester.name,
+            requesterId: requester.id,
+            rawTrackUrl: canonicalUrl,
+            hasPlaylistParam: hasPlaylist,
+            createStream: async (seekSeconds: number = 0) => {
+              return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`);
+            },
+          },
+        ],
       };
     }
-  }
-
-  // 5. YOUTUBE MUSIC SINGLE TRACK
-  if (cleanInput.includes("music.youtube.com")) {
-    const ytMeta = await getYouTubeMetadata(cleanInput);
-    const canonicalUrl = ytMeta.url;
-
-    return {
-      isPlaylist: false,
-      tracks: [
-        {
-          title: ytMeta.title,
-          artist: ytMeta.artist,
-          duration: ytMeta.duration,
-          durationSec: ytMeta.durationSec,
-          url: cleanInput,
-          thumbnail: ytMeta.thumbnail,
-          source: "youtube_music",
-          sourceBadge: "🎵 YouTube Music",
-          sourceColor: 0xff2a54,
-          requesterName: requester.name,
-          requesterId: requester.id,
-          rawTrackUrl: canonicalUrl,
-          createStream: async (seekSeconds: number = 0) => {
-            return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`);
-          },
-        },
-      ],
-    };
-  }
-
-  // 6. YOUTUBE DIRECT SINGLE TRACK
-  if (cleanInput.includes("youtube.com") || cleanInput.includes("youtu.be")) {
-    const ytMeta = await getYouTubeMetadata(cleanInput);
-    const canonicalUrl = ytMeta.url;
-
-    return {
-      isPlaylist: false,
-      tracks: [
-        {
-          title: ytMeta.title,
-          artist: ytMeta.artist,
-          duration: ytMeta.duration,
-          durationSec: ytMeta.durationSec,
-          url: cleanInput,
-          thumbnail: ytMeta.thumbnail,
-          source: "youtube",
-          sourceBadge: "🔴 YouTube",
-          sourceColor: 0xff4655,
-          requesterName: requester.name,
-          requesterId: requester.id,
-          rawTrackUrl: canonicalUrl,
-          createStream: async (seekSeconds: number = 0) => {
-            return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`);
-          },
-        },
-      ],
-    };
   }
 
   // 7. TEXT SEARCH WITH YOUTUBE CANDIDATE SCORING
@@ -2237,8 +2261,12 @@ export function buildNowPlayingEmbed(
     embed.setThumbnail(track.thumbnail);
   }
 
+  const footerText = track.hasPlaylistParam
+    ? "💡 Link ini berisi playlist! Gunakan opsi playlist: True di /play untuk memutar semua."
+    : "Porsche-chan Music Engine • 48kHz Hi-Fi Stereo";
+
   embed
-    .setFooter({ text: "Porsche-chan Music Engine • 48kHz Hi-Fi Stereo" })
+    .setFooter({ text: footerText })
     .setTimestamp();
 
   return embed;
@@ -2621,13 +2649,14 @@ export class MusicService {
     }
 
     const queryOrUrl = interaction.options.getString("url", true);
+    const forcePlaylist = interaction.options.getBoolean("playlist") ?? false;
     await interaction.deferReply();
 
     try {
       const musicResult = await resolveMusic(queryOrUrl, {
         name: interaction.user.displayName || interaction.user.username,
         id: interaction.user.id,
-      });
+      }, { forcePlaylist });
 
       const textChannel = interaction.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
@@ -3013,7 +3042,7 @@ const followMsg = await interaction.followUp({
     });
   }
 
-  public static async playFromMessage(message: Message, queryOrUrl: string): Promise<void> {
+  public static async playFromMessage(message: Message, queryOrUrl: string, forcePlaylist: boolean = false): Promise<void> {
     const member = message.member;
     const voiceChannel = member?.voice?.channel;
     const guild = message.guild;
@@ -3035,7 +3064,7 @@ const followMsg = await interaction.followUp({
       const musicResult = await resolveMusic(queryOrUrl, {
         name: message.author.displayName || message.author.username,
         id: message.author.id,
-      });
+      }, { forcePlaylist });
 
       const textChannel = message.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
@@ -3285,12 +3314,11 @@ const followMsg = await interaction.followUp({
     MusicService.cleanupSessionProcesses(session);
     const skippedTitle = session.currentTrack?.title || "Lagu";
     if (session.queue.length > 0) {
-      const nextTrack = session.queue.shift()!;
+      const nextTitle = session.queue[0]?.title || "Lagu Berikutnya";
       session.isSeeking = false;
       session.seekOffsetSec = 0;
       session.player.stop(true);
-      await MusicService.playTrackInSession(session, nextTrack);
-      const replyContent = `⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTrack.title}** (๑˃ᴗ˂)ﻌ`;
+      const replyContent = `⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTitle}** (๑˃ᴗ˂)ﻌ`;
       if (interaction.isButton()) {
         await interaction.reply({ content: replyContent });
       } else {
@@ -3365,12 +3393,11 @@ const followMsg = await interaction.followUp({
     MusicService.cleanupSessionProcesses(session);
     const skippedTitle = session.currentTrack?.title || "Lagu";
     if (session.queue.length > 0) {
-      const nextTrack = session.queue.shift()!;
+      const nextTitle = session.queue[0]?.title || "Lagu Berikutnya";
       session.isSeeking = false;
       session.seekOffsetSec = 0;
       session.player.stop(true);
-      await MusicService.playTrackInSession(session, nextTrack);
-      await message.reply(`⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTrack.title}** (๑˃ᴗ˂)ﻌ`);
+      await message.reply(`⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTitle}** (๑˃ᴗ˂)ﻌ`);
     } else {
       session.player.stop(true);
       session.isPlaying = false;
