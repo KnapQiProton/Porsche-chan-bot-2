@@ -104,6 +104,44 @@ export interface GuildSession {
 
 const sessions = new Map<string, GuildSession>();
 
+// Rate-limiting / Cooldown maps & Guild action queue to prevent race conditions & spam
+const userCooldowns = new Map<string, number>();
+const guildCooldowns = new Map<string, number>();
+const guildActionQueues = new Map<string, Promise<any>>();
+
+export function checkUserCooldown(userId: string, action: string, cooldownMs: number = 2500): number | null {
+  const key = `${userId}:${action}`;
+  const now = Date.now();
+  const lastTime = userCooldowns.get(key) || 0;
+  const elapsed = now - lastTime;
+  if (elapsed < cooldownMs) {
+    return Math.ceil((cooldownMs - elapsed) / 1000);
+  }
+  userCooldowns.set(key, now);
+  return null;
+}
+
+export function checkGuildActionCooldown(guildId: string, action: string, cooldownMs: number = 1500): number | null {
+  const key = `${guildId}:${action}`;
+  const now = Date.now();
+  const lastTime = guildCooldowns.get(key) || 0;
+  const elapsed = now - lastTime;
+  if (elapsed < cooldownMs) {
+    return Math.ceil((cooldownMs - elapsed) / 1000);
+  }
+  guildCooldowns.set(key, now);
+  return null;
+}
+
+export function enqueueGuildAction<T>(guildId: string, action: () => Promise<T>): Promise<T> {
+  const previous = guildActionQueues.get(guildId) || Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(() => action());
+  guildActionQueues.set(guildId, next.catch(() => {}));
+  return next;
+}
+
 export function safeDestroyVoiceConnection(conn?: VoiceConnection | null): void {
   if (!conn) return;
   try {
@@ -2544,89 +2582,109 @@ export class MusicService {
       return;
     }
 
+    const cd = checkUserCooldown(interaction.user.id, "music_command", 3000);
+    if (cd !== null) {
+      await interaction.reply({
+        content: `⏳ Sabar ya! Tunggu **${cd} detik** lagi sebelum meminta lagu baru~ (๑•́ ₃ •̀๑)`,
+        ephemeral: true,
+      });
+      return;
+    }
+
     const queryOrUrl = interaction.options.getString("url", true);
     await interaction.deferReply();
 
-    try {
-      const musicResult = await resolveMusic(queryOrUrl, {
-        name: interaction.user.displayName || interaction.user.username,
-        id: interaction.user.id,
-      });
+    await enqueueGuildAction(guild.id, async () => {
+      try {
+        const musicResult = await resolveMusic(queryOrUrl, {
+          name: interaction.user.displayName || interaction.user.username,
+          id: interaction.user.id,
+        });
 
-      const textChannel = interaction.channel as TextBasedChannel;
-      const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
+        const textChannel = interaction.channel as TextBasedChannel;
+        const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
 
-      if (musicResult.isPlaylist) {
-        if (session.isPlaying && session.currentTrack) {
-          session.queue.push(...musicResult.tracks);
-          const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, true);
-          await interaction.editReply({ embeds: [embed] });
-        } else {
-          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-            try {
-              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-            } catch {}
+        if (musicResult.isPlaylist) {
+          if (session.isPlaying && session.currentTrack) {
+            session.queue.push(...musicResult.tracks);
+            const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, true);
+            await interaction.editReply({ embeds: [embed] });
+          } else {
+            if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+              try {
+                await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+              } catch {}
+            }
+            session.connection.subscribe(session.player);
+
+            const [firstTrack, ...queuedTracks] = musicResult.tracks;
+            session.queue.push(...queuedTracks);
+
+            const resource = await firstTrack.createStream(0);
+            session.currentTrack = firstTrack;
+            session.currentResource = resource;
+            session.isPlaying = true;
+            session.isPaused = false;
+            session.isSeeking = false;
+            session.seekOffsetSec = 0;
+            session.player.play(resource);
+
+            const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, false);
+            await interaction.editReply({
+              embeds: [embed],
+              components: [buildMusicControlRow(false)],
+            });
           }
-          session.connection.subscribe(session.player);
-
-          const [firstTrack, ...queuedTracks] = musicResult.tracks;
-          session.queue.push(...queuedTracks);
-
-          const resource = await firstTrack.createStream(0);
-          session.currentTrack = firstTrack;
-          session.currentResource = resource;
-          session.isPlaying = true;
-          session.isPaused = false;
-          session.isSeeking = false;
-          session.seekOffsetSec = 0;
-          session.player.play(resource);
-
-          const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, false);
-          await interaction.editReply({
-            embeds: [embed],
-            components: [buildMusicControlRow(false)],
-          });
-        }
-      } else {
-        const track = musicResult.tracks[0];
-        if (session.isPlaying && session.currentTrack) {
-          session.queue.push(track);
-          const embed = buildNowPlayingEmbed(track, true);
-          await interaction.editReply({ embeds: [embed] });
         } else {
-          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-            try {
-              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-            } catch {}
+          const track = musicResult.tracks[0];
+          if (session.isPlaying && session.currentTrack) {
+            session.queue.push(track);
+            const embed = buildNowPlayingEmbed(track, true);
+            await interaction.editReply({ embeds: [embed] });
+          } else {
+            if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+              try {
+                await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+              } catch {}
+            }
+            session.connection.subscribe(session.player);
+
+            const resource = await track.createStream(0);
+            session.currentTrack = track;
+            session.currentResource = resource;
+            session.isPlaying = true;
+            session.isPaused = false;
+            session.isSeeking = false;
+            session.seekOffsetSec = 0;
+            session.player.play(resource);
+
+            const embed = buildNowPlayingEmbed(track, false);
+            await interaction.editReply({
+              embeds: [embed],
+              components: [buildMusicControlRow(false)],
+            });
           }
-          session.connection.subscribe(session.player);
-
-          const resource = await track.createStream(0);
-          session.currentTrack = track;
-          session.currentResource = resource;
-          session.isPlaying = true;
-          session.isPaused = false;
-          session.isSeeking = false;
-          session.seekOffsetSec = 0;
-          session.player.play(resource);
-
-          const embed = buildNowPlayingEmbed(track, false);
-          await interaction.editReply({
-            embeds: [embed],
-            components: [buildMusicControlRow(false)],
-          });
         }
+      } catch (err) {
+        logger.error({ err, queryOrUrl }, "Error resolving and playing track");
+        await interaction.editReply(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
       }
-    } catch (err) {
-      logger.error({ err, queryOrUrl }, "Error resolving and playing track");
-      await interaction.editReply(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
-    }
+    });
   }
 
   public static async handleStop(interaction: ChatInputCommandInteraction): Promise<void> {
     const guild = interaction.guild;
     if (!guild) {
       await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+
+    const cd = checkGuildActionCooldown(guild.id, "music_stop", 2000);
+    if (cd !== null) {
+      await interaction.reply({
+        content: `⏳ Tunggu **${cd} detik** sebelum menghentikan musik lagi ya~ (๑•́ ₃ •̀๑)`,
+        ephemeral: true,
+      });
       return;
     }
 
@@ -2660,6 +2718,15 @@ export class MusicService {
       return;
     }
 
+    const cd = checkUserCooldown(interaction.user.id, "music_pause_resume", 2000);
+    if (cd !== null) {
+      await interaction.reply({
+        content: `⏳ Tunggu **${cd} detik** sebelum jeda/lanjut lagi ya~ (๑•́ ₃ •̀๑)`,
+        ephemeral: true,
+      });
+      return;
+    }
+
     const session = sessions.get(guild.id);
     if (!session || !session.isPlaying || !session.currentTrack) {
       await interaction.reply({ content: "❌ Tidak ada musik yang sedang diputar saat ini~ (๑•́ ₃ •̀๑)", ephemeral: true });
@@ -2674,12 +2741,23 @@ export class MusicService {
     session.player.pause();
     session.isPaused = true;
     await interaction.reply({ content: `⏸️ Musik dijeda oleh **${interaction.user.displayName || interaction.user.username}**! (◡ ω ◡)` });
+      const pauseMsg = await interaction.fetchReply();
+      setTimeout(() => pauseMsg.delete().catch(() => {}), 5_000);
   }
 
   public static async handleResume(interaction: ChatInputCommandInteraction): Promise<void> {
     const guild = interaction.guild;
     if (!guild) {
       await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+
+    const cd = checkUserCooldown(interaction.user.id, "music_pause_resume", 2000);
+    if (cd !== null) {
+      await interaction.reply({
+        content: `⏳ Tunggu **${cd} detik** sebelum jeda/lanjut lagi ya~ (๑•́ ₃ •̀๑)`,
+        ephemeral: true,
+      });
       return;
     }
 
@@ -2697,12 +2775,23 @@ export class MusicService {
     session.player.unpause();
     session.isPaused = false;
     await interaction.reply({ content: `▶️ Musik dilanjutkan oleh **${interaction.user.displayName || interaction.user.username}**! (o´∀\`o)` });
+      const resumeMsg = await interaction.fetchReply();
+      setTimeout(() => resumeMsg.delete().catch(() => {}), 5_000);
   }
 
   public static async handleSeekCommand(interaction: ChatInputCommandInteraction, deltaSec: number): Promise<void> {
     const guild = interaction.guild;
     if (!guild) {
       await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+
+    const cd = checkGuildActionCooldown(guild.id, "music_seek", 1000);
+    if (cd !== null) {
+      await interaction.reply({
+        content: `⏳ Tunggu **${cd} detik** sebelum mengatur posisi musik lagi ya~ (๑•́ ₃ •̀๑)`,
+        ephemeral: true,
+      });
       return;
     }
 
@@ -2753,22 +2842,34 @@ export class MusicService {
 
     const customId = interaction.customId;
 
+    // Button debounce / cooldown per guild & button to prevent spamming
+    const btnCd = checkGuildActionCooldown(guild.id, `btn_${customId}`, 1500);
+    if (btnCd !== null) {
+      await interaction.reply({
+        content: `⏳ Sabar ya! Tunggu **${btnCd} detik** sebelum menekan tombol ini lagi~ (๑•́ ₃ •̀๑)`,
+        ephemeral: true,
+      }).catch(() => {});
+      return;
+    }
+
     // 1. Pause / Resume Toggle
     if (customId === "music_pause_resume") {
       if (session.isPaused) {
         session.player.unpause();
         session.isPaused = false;
         await interaction.update({ components: [buildMusicControlRow(false)] }).catch(() => {});
-        await interaction.followUp({
+const followMsg = await interaction.followUp({
           content: `▶️ Musik dilanjutkan oleh **${interaction.user.displayName || interaction.user.username}**! (o´∀\`o)`,
-        }).catch(() => {});
+        });
+        setTimeout(() => followMsg.delete().catch(() => {}), 5_000);
       } else {
         session.player.pause();
         session.isPaused = true;
         await interaction.update({ components: [buildMusicControlRow(true)] }).catch(() => {});
-        await interaction.followUp({
+        const pauseMsg = await interaction.followUp({
           content: `⏸️ Musik dijeda oleh **${interaction.user.displayName || interaction.user.username}**! (◡ ω ◡)`,
-        }).catch(() => {});
+        });
+        setTimeout(() => pauseMsg.delete().catch(() => {}), 5_000);
       }
       return;
     }
@@ -2783,7 +2884,7 @@ export class MusicService {
       await MusicService.seekTrackInSession(session, targetPos);
       await interaction.followUp({
         content: `⏪ **-10s**: Posisi musik dimundurkan ke **${formatDuration(targetPos)}** oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
-      }).catch(() => {});
+      }).then(msg => { if (msg) setTimeout(() => msg.delete().catch(() => {}), 5_000); }).catch(() => {});
       return;
     }
 
@@ -2798,7 +2899,7 @@ export class MusicService {
       await MusicService.seekTrackInSession(session, targetPos);
       await interaction.followUp({
         content: `⏩ **+10s**: Posisi musik dimajukan ke **${formatDuration(targetPos)}** oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
-      }).catch(() => {});
+      }).then(msg => { if (msg) setTimeout(() => msg.delete().catch(() => {}), 5_000); }).catch(() => {});
       return;
     }
 
@@ -2867,89 +2968,105 @@ export class MusicService {
       return;
     }
 
-    const loadingMsg = await message.reply("🔎 Mencari & menyiapkan audio... Tunggu sebentar ya~ (๑˃ᴗ˂)ﻌ");
-    try {
-      const musicResult = await resolveMusic(queryOrUrl, {
-        name: message.author.displayName || message.author.username,
-        id: message.author.id,
-      });
-
-      const textChannel = message.channel as TextBasedChannel;
-      const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
-
-      if (musicResult.isPlaylist) {
-        if (session.isPlaying && session.currentTrack) {
-          session.queue.push(...musicResult.tracks);
-          const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, true);
-          await loadingMsg.edit({ content: null, embeds: [embed] });
-        } else {
-          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-            try {
-              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-            } catch {}
-          }
-          session.connection.subscribe(session.player);
-
-          const [firstTrack, ...queuedTracks] = musicResult.tracks;
-          session.queue.push(...queuedTracks);
-
-          const resource = await firstTrack.createStream(0);
-          session.currentTrack = firstTrack;
-          session.currentResource = resource;
-          session.isPlaying = true;
-          session.isPaused = false;
-          session.isSeeking = false;
-          session.seekOffsetSec = 0;
-          session.player.play(resource);
-
-          const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, false);
-          await loadingMsg.edit({
-            content: null,
-            embeds: [embed],
-            components: [buildMusicControlRow(false)],
-          });
-        }
-      } else {
-        const track = musicResult.tracks[0];
-        if (session.isPlaying && session.currentTrack) {
-          session.queue.push(track);
-          const embed = buildNowPlayingEmbed(track, true);
-          await loadingMsg.edit({ content: null, embeds: [embed] });
-        } else {
-          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-            try {
-              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-            } catch {}
-          }
-          session.connection.subscribe(session.player);
-
-          const resource = await track.createStream(0);
-          session.currentTrack = track;
-          session.currentResource = resource;
-          session.isPlaying = true;
-          session.isPaused = false;
-          session.isSeeking = false;
-          session.seekOffsetSec = 0;
-          session.player.play(resource);
-
-          const embed = buildNowPlayingEmbed(track, false);
-          await loadingMsg.edit({
-            content: null,
-            embeds: [embed],
-            components: [buildMusicControlRow(false)],
-          });
-        }
-      }
-    } catch (err) {
-      logger.error({ err, queryOrUrl }, "Error in playFromMessage");
-      await loadingMsg.edit(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
+    const cd = checkUserCooldown(message.author.id, "music_command", 3000);
+    if (cd !== null) {
+      const cdMsg = await message.reply(`⏳ Sabar ya **${message.author.displayName || message.author.username}**! Tunggu **${cd} detik** lagi sebelum meminta lagu baru~ (๑•́ ₃ •̀๑)`);
+      setTimeout(() => cdMsg.delete().catch(() => {}), 4_000);
+      return;
     }
+
+    const loadingMsg = await message.reply("🔎 Mencari & menyiapkan audio... Tunggu sebentar ya~ (๑˃ᴗ˂)ﻌ");
+    await enqueueGuildAction(guild.id, async () => {
+      try {
+        const musicResult = await resolveMusic(queryOrUrl, {
+          name: message.author.displayName || message.author.username,
+          id: message.author.id,
+        });
+
+        const textChannel = message.channel as TextBasedChannel;
+        const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
+
+        if (musicResult.isPlaylist) {
+          if (session.isPlaying && session.currentTrack) {
+            session.queue.push(...musicResult.tracks);
+            const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, true);
+            await loadingMsg.edit({ content: null, embeds: [embed] });
+          } else {
+            if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+              try {
+                await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+              } catch {}
+            }
+            session.connection.subscribe(session.player);
+
+            const [firstTrack, ...queuedTracks] = musicResult.tracks;
+            session.queue.push(...queuedTracks);
+
+            const resource = await firstTrack.createStream(0);
+            session.currentTrack = firstTrack;
+            session.currentResource = resource;
+            session.isPlaying = true;
+            session.isPaused = false;
+            session.isSeeking = false;
+            session.seekOffsetSec = 0;
+            session.player.play(resource);
+
+            const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, false);
+            await loadingMsg.edit({
+              content: null,
+              embeds: [embed],
+              components: [buildMusicControlRow(false)],
+            });
+          }
+        } else {
+          const track = musicResult.tracks[0];
+          if (session.isPlaying && session.currentTrack) {
+            session.queue.push(track);
+            const embed = buildNowPlayingEmbed(track, true);
+            await loadingMsg.edit({ content: null, embeds: [embed] });
+          } else {
+            if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+              try {
+                await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+              } catch {}
+            }
+            session.connection.subscribe(session.player);
+
+            const resource = await track.createStream(0);
+            session.currentTrack = track;
+            session.currentResource = resource;
+            session.isPlaying = true;
+            session.isPaused = false;
+            session.isSeeking = false;
+            session.seekOffsetSec = 0;
+            session.player.play(resource);
+
+            const embed = buildNowPlayingEmbed(track, false);
+            await loadingMsg.edit({
+              content: null,
+              embeds: [embed],
+              components: [buildMusicControlRow(false)],
+            });
+          }
+        }
+      } catch (err) {
+        logger.error({ err, queryOrUrl }, "Error in playFromMessage");
+        await loadingMsg.edit(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
+      }
+    });
   }
 
   public static async stopFromMessage(message: Message): Promise<void> {
     const guild = message.guild;
     if (!guild) {
       await message.reply("❌ Command ini hanya bisa dipakai di server.");
+      return;
+    }
+
+    const cd = checkGuildActionCooldown(guild.id, "music_stop", 2000);
+    if (cd !== null) {
+      const cdMsg = await message.reply(`⏳ Tunggu **${cd} detik** sebelum menghentikan musik lagi ya~ (๑•́ ₃ •̀๑)`);
+      setTimeout(() => cdMsg.delete().catch(() => {}), 4_000);
       return;
     }
     const session = sessions.get(guild.id);
@@ -2971,6 +3088,13 @@ export class MusicService {
   public static async pauseFromMessage(message: Message): Promise<void> {
     const guild = message.guild;
     if (!guild) return;
+
+    const cd = checkUserCooldown(message.author.id, "music_pause_resume", 2000);
+    if (cd !== null) {
+      const cdMsg = await message.reply(`⏳ Tunggu **${cd} detik** sebelum jeda/lanjut lagi ya~ (๑•́ ₃ •̀๑)`);
+      setTimeout(() => cdMsg.delete().catch(() => {}), 4_000);
+      return;
+    }
     const session = sessions.get(guild.id);
     if (!session || !session.isPlaying || !session.currentTrack) {
       await message.reply("❌ Tidak ada musik yang sedang diputar saat ini~ (๑•́ ₃ •̀๑)");
@@ -2982,12 +3106,21 @@ export class MusicService {
     }
     session.player.pause();
     session.isPaused = true;
-    await message.reply(`⏸️ Musik dijeda oleh **${message.author.displayName || message.author.username}**! (◡ ω ◡)`);
+    const pauseMsg = await message.reply(`⏸️ Musik dijeda oleh **${message.author.displayName || message.author.username}**! (◡ ω ◡)`);
+      setTimeout(() => pauseMsg.delete().catch(() => {}), 5_000);
   }
 
   public static async resumeFromMessage(message: Message): Promise<void> {
     const guild = message.guild;
     if (!guild) return;
+
+    const cd = checkUserCooldown(message.author.id, "music_pause_resume", 2000);
+    if (cd !== null) {
+      const cdMsg = await message.reply(`⏳ Tunggu **${cd} detik** sebelum jeda/lanjut lagi ya~ (๑•́ ₃ •̀๑)`);
+      setTimeout(() => cdMsg.delete().catch(() => {}), 4_000);
+      return;
+    }
+
     const session = sessions.get(guild.id);
     if (!session || !session.isPlaying || !session.currentTrack) {
       await message.reply("❌ Tidak ada musik yang sedang diputar saat ini~ (๑•́ ₃ •̀๑)");
@@ -2999,12 +3132,20 @@ export class MusicService {
     }
     session.player.unpause();
     session.isPaused = false;
-    await message.reply(`▶️ Musik dilanjutkan oleh **${message.author.displayName || message.author.username}**! (o´∀\`o)`);
+    const resumeMsg = await message.reply(`▶️ Musik dilanjutkan oleh **${message.author.displayName || message.author.username}**! (o´∀\`o)`);
+    setTimeout(() => resumeMsg.delete().catch(() => {}), 5_000);
   }
 
   public static async forwardFromMessage(message: Message, deltaSec: number = 10): Promise<void> {
     const guild = message.guild;
     if (!guild) return;
+
+    const cd = checkGuildActionCooldown(guild.id, "music_seek", 1000);
+    if (cd !== null) {
+      const cdMsg = await message.reply(`⏳ Tunggu **${cd} detik** sebelum mengatur posisi musik lagi ya~ (๑•́ ₃ •̀๑)`);
+      setTimeout(() => cdMsg.delete().catch(() => {}), 4_000);
+      return;
+    }
     const session = sessions.get(guild.id);
     if (!session || !session.isPlaying || !session.currentTrack) {
       await message.reply("❌ Tidak ada musik yang sedang diputar saat ini~ (๑•́ ₃ •̀๑)");
@@ -3021,6 +3162,13 @@ export class MusicService {
   public static async rewindFromMessage(message: Message, deltaSec: number = 10): Promise<void> {
     const guild = message.guild;
     if (!guild) return;
+
+    const cd = checkGuildActionCooldown(guild.id, "music_seek", 1000);
+    if (cd !== null) {
+      const cdMsg = await message.reply(`⏳ Tunggu **${cd} detik** sebelum mengatur posisi musik lagi ya~ (๑•́ ₃ •̀๑)`);
+      setTimeout(() => cdMsg.delete().catch(() => {}), 4_000);
+      return;
+    }
     const session = sessions.get(guild.id);
     if (!session || !session.isPlaying || !session.currentTrack) {
       await message.reply("❌ Tidak ada musik yang sedang diputar saat ini~ (๑•́ ₃ •̀๑)");
@@ -3037,6 +3185,15 @@ export class MusicService {
     const guild = interaction.guild;
     if (!guild) {
       await interaction.reply({ content: "❌ Command ini hanya bisa dipakai di server.", ephemeral: true });
+      return;
+    }
+
+    const cd = checkGuildActionCooldown(guild.id, "music_skip", 1500);
+    if (cd !== null) {
+      await interaction.reply({
+        content: `⏳ Tunggu **${cd} detik** sebelum skip lagu lagi ya~ (๑•́ ₃ •̀๑)`,
+        ephemeral: true,
+      }).catch(() => {});
       return;
     }
     const session = sessions.get(guild.id);
@@ -3112,6 +3269,13 @@ export class MusicService {
   public static async skipFromMessage(message: Message): Promise<void> {
     const guild = message.guild;
     if (!guild) return;
+
+    const cd = checkGuildActionCooldown(guild.id, "music_skip", 1500);
+    if (cd !== null) {
+      const cdMsg = await message.reply(`⏳ Tunggu **${cd} detik** sebelum skip lagu lagi ya~ (๑•́ ₃ •̀๑)`);
+      setTimeout(() => cdMsg.delete().catch(() => {}), 4_000);
+      return;
+    }
     const session = sessions.get(guild.id);
     if (!session || (!session.isPlaying && !session.currentTrack)) {
       await message.reply("❌ Tidak ada musik yang sedang diputar untuk di-skip~ (๑•́ ₃ •̀๑)");
