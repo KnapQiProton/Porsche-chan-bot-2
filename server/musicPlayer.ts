@@ -262,9 +262,13 @@ export async function autoUpdateYtDlp(): Promise<void> {
     logger.warn({ err }, "yt-dlp version check completed");
   }
 }
+// SoundCloud Integration Toggle (temporary disable per user request)
+export const ENABLE_SOUNDCLOUD = false;
+
 // Initialize SoundCloud free client id for play-dl
 let scInitialized = false;
 export async function initSoundCloud(): Promise<void> {
+  if (!ENABLE_SOUNDCLOUD) return;
   if (scInitialized) return;
   try {
     const scClientId = await playdl.getFreeClientID();
@@ -1515,40 +1519,42 @@ export async function searchYouTubeWithYtDlp(
       logger.error({ fallbackErr }, "play-dl search fallback also failed");
     }
 
-    // Tertiary fallback: search SoundCloud directly (with candidate scoring to prevent inaccurate songs)
-    try {
-      const scClientId = await playdl.getFreeClientID();
-      await playdl.setToken({ soundcloud: { client_id: scClientId } });
-      const scResults = await playdl.search(query, { source: { soundcloud: "tracks" }, limit: 5 });
-      if (scResults && scResults.length > 0) {
-        const scoredSc = scResults
-          .map((scTrack: any, idx: number) => ({
-            scTrack,
-            score: scoreTrackCandidate(query, "", targetDurationSec, {
-              name: scTrack.name || scTrack.title,
-              user: { name: scTrack.user?.name || scTrack.artist },
-              durationInSec: scTrack.durationInSec,
-            }, idx),
-          }))
-          .filter(s => s.score >= 120)
-          .sort((a, b) => b.score - a.score);
+    if (ENABLE_SOUNDCLOUD) {
+      // Tertiary fallback: search SoundCloud directly
+      try {
+        const scClientId = await playdl.getFreeClientID();
+        await playdl.setToken({ soundcloud: { client_id: scClientId } });
+        const scResults = await playdl.search(query, { source: { soundcloud: "tracks" }, limit: 5 });
+        if (scResults && scResults.length > 0) {
+          const scoredSc = scResults
+            .map((scTrack: any, idx: number) => ({
+              scTrack,
+              score: scoreTrackCandidate(query, "", targetDurationSec, {
+                name: scTrack.name || scTrack.title,
+                user: { name: scTrack.user?.name || scTrack.artist },
+                durationInSec: scTrack.durationInSec,
+              }, idx),
+            }))
+            .filter(s => s.score >= 120)
+            .sort((a, b) => b.score - a.score);
 
-        if (scoredSc.length > 0) {
-          const bestSc: any = scoredSc[0].scTrack;
-          logger.info({ title: bestSc.name || bestSc.title, score: scoredSc[0].score }, "Found verified track via SoundCloud search fallback");
-          return {
-            id: String(bestSc.id || ""),
-            url: bestSc.url,
-            title: bestSc.name || bestSc.title || query,
-            artist: bestSc.user?.name || bestSc.artist || "SoundCloud Artist",
-            duration: bestSc.durationRaw || formatDuration(bestSc.durationInSec) || "3:30",
-            durationSec: bestSc.durationInSec,
-            thumbnail: bestSc.thumbnail || bestSc.thumbnails?.[0]?.url,
-          };
+          if (scoredSc.length > 0) {
+            const bestSc: any = scoredSc[0].scTrack;
+            logger.info({ title: bestSc.name || bestSc.title, score: scoredSc[0].score }, "Found verified track via SoundCloud search fallback");
+            return {
+              id: String(bestSc.id || ""),
+              url: bestSc.url,
+              title: bestSc.name || bestSc.title || query,
+              artist: bestSc.user?.name || bestSc.artist || "SoundCloud Artist",
+              duration: bestSc.durationRaw || formatDuration(bestSc.durationInSec) || "3:30",
+              durationSec: bestSc.durationInSec,
+              thumbnail: bestSc.thumbnail || bestSc.thumbnails?.[0]?.url,
+            };
+          }
         }
+      } catch (scSearchErr) {
+        logger.warn({ scSearchErr }, "SoundCloud search fallback failed");
       }
-    } catch (scSearchErr) {
-      logger.warn({ scSearchErr }, "SoundCloud search fallback failed");
     }
 
     throw err;
@@ -1821,70 +1827,72 @@ export async function createAudioResourceFromYtDlp(
     logger.warn({ err: (err as Error).message }, "Tier 3 direct URL failed, trying Tier 4 SoundCloud fallback");
   }
 
-  // Tier 4: SoundCloud fallback audio stream (ultra-reliable on datacenter IPs)
-  const candidatesToSearch = [
-    fallbackSearchQuery,
-    urlOrQuery,
-  ].filter(Boolean) as string[];
+  if (ENABLE_SOUNDCLOUD) {
+    // Tier 4: SoundCloud fallback audio stream
+    const candidatesToSearch = [
+      fallbackSearchQuery,
+      urlOrQuery,
+    ].filter(Boolean) as string[];
 
-  const cleanCandidates: string[] = [];
-  for (const raw of candidatesToSearch) {
-    const stripped = raw
-      .replace(/https?:\/\/\S+/gi, "")
-      .replace(/\b(Artis YouTube|YouTube Audio|Official Video|Official Music Video|Official Audio|Lyric Video|Full Album|Audio|Video)\b/gi, "")
-      .replace(/[|•\-_[\]()#]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (stripped && stripped.length > 2) {
-      cleanCandidates.push(stripped);
-      const words = stripped.split(" ");
-      if (words.length > 3) {
-        cleanCandidates.push(words.slice(0, 3).join(" "));
-      }
-    }
-  }
-
-  if (cleanCandidates.length === 0 && (urlOrQuery.includes("youtube.com") || urlOrQuery.includes("youtu.be"))) {
-    try {
-      const oembed = await getYouTubeOEmbed(urlOrQuery);
-      if (oembed && oembed.title) {
-        const parsed = parseTitleAndArtist(oembed.title, oembed.author);
-        cleanCandidates.push(`${parsed.title} ${parsed.artist}`.trim());
-        cleanCandidates.push(parsed.title);
-      }
-    } catch {}
-  }
-
-  for (const q of cleanCandidates) {
-    try {
-      const scClientId = await playdl.getFreeClientID();
-      await playdl.setToken({ soundcloud: { client_id: scClientId } });
-      const res = await playdl.search(q, { source: { soundcloud: "tracks" }, limit: 5 });
-      if (res && res.length > 0) {
-        const scoredSc = res
-          .map((item: any, idx: number) => ({
-            item,
-            score: scoreTrackCandidate(q, "", undefined, {
-              name: item.name || item.title || "",
-              user: { name: item.user?.name || item.artist || "" },
-              durationInSec: item.durationInSec,
-            }, idx),
-          }))
-          .filter((s) => s.score >= 50)
-          .sort((a, b) => b.score - a.score);
-
-        const targetTrack = scoredSc.length > 0 ? scoredSc[0].item : res[0];
-        if (targetTrack && targetTrack.url) {
-          logger.info({ query: q, scUrl: targetTrack.url }, "Streaming via verified SoundCloud fallback");
-          return await createAudioResourceFromTrackUrl(targetTrack.url, seekSeconds);
+    const cleanCandidates: string[] = [];
+    for (const raw of candidatesToSearch) {
+      const stripped = raw
+        .replace(/https?:\/\/\S+/gi, "")
+        .replace(/\b(Artis YouTube|YouTube Audio|Official Video|Official Music Video|Official Audio|Lyric Video|Full Album|Audio|Video)\b/gi, "")
+        .replace(/[|•\-_[\]()#]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (stripped && stripped.length > 2) {
+        cleanCandidates.push(stripped);
+        const words = stripped.split(" ");
+        if (words.length > 3) {
+          cleanCandidates.push(words.slice(0, 3).join(" "));
         }
       }
-    } catch (scErr) {
-      logger.warn({ scErr }, "SoundCloud fallback candidate search failed");
+    }
+
+    if (cleanCandidates.length === 0 && (urlOrQuery.includes("youtube.com") || urlOrQuery.includes("youtu.be"))) {
+      try {
+        const oembed = await getYouTubeOEmbed(urlOrQuery);
+        if (oembed && oembed.title) {
+          const parsed = parseTitleAndArtist(oembed.title, oembed.author);
+          cleanCandidates.push(`${parsed.title} ${parsed.artist}`.trim());
+          cleanCandidates.push(parsed.title);
+        }
+      } catch {}
+    }
+
+    for (const q of cleanCandidates) {
+      try {
+        const scClientId = await playdl.getFreeClientID();
+        await playdl.setToken({ soundcloud: { client_id: scClientId } });
+        const res = await playdl.search(q, { source: { soundcloud: "tracks" }, limit: 5 });
+        if (res && res.length > 0) {
+          const scoredSc = res
+            .map((item: any, idx: number) => ({
+              item,
+              score: scoreTrackCandidate(q, "", undefined, {
+                name: item.name || item.title || "",
+                user: { name: item.user?.name || item.artist || "" },
+                durationInSec: item.durationInSec,
+              }, idx),
+            }))
+            .filter((s) => s.score >= 50)
+            .sort((a, b) => b.score - a.score);
+
+          const targetTrack = scoredSc.length > 0 ? scoredSc[0].item : res[0];
+          if (targetTrack && targetTrack.url) {
+            logger.info({ query: q, scUrl: targetTrack.url }, "Streaming via verified SoundCloud fallback");
+            return await createAudioResourceFromTrackUrl(targetTrack.url, seekSeconds);
+          }
+        }
+      } catch (scErr) {
+        logger.warn({ scErr }, "SoundCloud fallback candidate search failed");
+      }
     }
   }
 
-  throw new Error("Gagal memutar audio dari semua sumber streaming.");
+  throw new Error("Gagal memutar audio dari YouTube. Pastikan link atau judul lagu valid.");
 }
 
 // Main Track Resolver: handles YouTube, YouTube Music, Spotify, SoundCloud, and Text Query (Prioritizing User Links)
@@ -1899,6 +1907,9 @@ export async function resolveMusic(
 
   // 0. SOUNDCLOUD PLAYLIST / SET
   if (cleanInput.includes("soundcloud.com") && cleanInput.includes("/sets/")) {
+    if (!ENABLE_SOUNDCLOUD) {
+      throw new Error("❌ Dukungan SoundCloud sedang dinonaktifkan sementara. Silakan gunakan link YouTube, YouTube Music, atau Spotify ya~ (◡ ω ◡)");
+    }
     try {
       const scInfo: any = await playdl.soundcloud(cleanInput);
       if (scInfo && scInfo.tracks && Array.isArray(scInfo.tracks) && scInfo.tracks.length > 0) {
@@ -1936,6 +1947,9 @@ export async function resolveMusic(
 
   // 1. SOUNDCLOUD DIRECT TRACK
   if (cleanInput.includes("soundcloud.com")) {
+    if (!ENABLE_SOUNDCLOUD) {
+      throw new Error("❌ Dukungan SoundCloud sedang dinonaktifkan sementara. Silakan gunakan link YouTube, YouTube Music, atau Spotify ya~ (◡ ω ◡)");
+    }
     try {
       const scInfo: any = await playdl.soundcloud(cleanInput);
       if (scInfo && (scInfo.name || scInfo.title)) {

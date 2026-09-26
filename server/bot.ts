@@ -44,6 +44,7 @@ import {
   getCookieStatus,
   autoUpdateYtDlp,
   initSoundCloud,
+  ENABLE_SOUNDCLOUD,
 } from "./musicPlayer";
 import {
   parseSmartAnimeQuery,
@@ -2469,11 +2470,11 @@ export const COMMANDS = [
     .toJSON(),
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Putar lagu atau playlist dari YouTube, YouTube Music, Spotify, SoundCloud, atau judul lagu di VC")
+    .setDescription("Putar lagu atau playlist dari YouTube, YouTube Music, Spotify, atau judul lagu di VC")
     .addStringOption((opt) =>
       opt
         .setName("url")
-        .setDescription("URL YouTube, YouTube Music, Spotify, SoundCloud, atau ketik judul lagu")
+        .setDescription("URL YouTube, YouTube Music, Spotify, atau ketik judul lagu")
         .setRequired(true),
     )
     .addBooleanOption((opt) =>
@@ -2586,7 +2587,9 @@ client.once(Events.ClientReady, async (c) => {
 
   // Initialize music subsystems (non-blocking)
   autoUpdateYtDlp().catch((err) => logger.warn({ err }, "yt-dlp auto-update failed (non-fatal)"));
-  initSoundCloud().catch((err) => logger.warn({ err }, "SoundCloud init failed (non-fatal)"));
+  if (ENABLE_SOUNDCLOUD) {
+    initSoundCloud().catch((err) => logger.warn({ err }, "SoundCloud init failed (non-fatal)"));
+  }
 
   const token = process.env.DISCORD_BOT_TOKEN;
   if (token) {
@@ -2616,12 +2619,14 @@ client.once(Events.ClientReady, async (c) => {
     }
   }
 
-  try {
-    const scClientId = await playdl.getFreeClientID();
-    await playdl.setToken({ soundcloud: { client_id: scClientId } });
-    logger.info("SoundCloud initialized for play-dl");
-  } catch (err) {
-    logger.warn({ err }, "SoundCloud init non-critical notice");
+  if (ENABLE_SOUNDCLOUD) {
+    try {
+      const scClientId = await playdl.getFreeClientID();
+      await playdl.setToken({ soundcloud: { client_id: scClientId } });
+      logger.info("SoundCloud initialized for play-dl");
+    } catch (err) {
+      logger.warn({ err }, "SoundCloud init non-critical notice");
+    }
   }
 });
 
