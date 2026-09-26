@@ -43,8 +43,21 @@ if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
   }
 }
 
-// Optimal yt-dlp extractor args for YouTube on datacenter IPs (android + tv_embedded + android_creator avoids bot detection and format errors)
-const YT_EXTRACTOR_ARGS = ["--extractor-args", "youtube:player_client=android,tv_embedded,android_creator"];
+// Dynamic extractor arguments:
+// When cookies are present: web,mweb,ios (so YouTube honors web session cookies)
+// When cookies are absent: ios,web,mweb (ios client avoids datacenter bot checks)
+export function getYtExtractorArgs(hasCookies?: boolean): string[] {
+  if (process.env.YOUTUBE_PLAYER_CLIENT && process.env.YOUTUBE_PLAYER_CLIENT.trim()) {
+    return ["--extractor-args", `youtube:player_client=${process.env.YOUTUBE_PLAYER_CLIENT.trim()}`];
+  }
+  const cookiesPresent = hasCookies !== undefined ? hasCookies : hasYouTubeCookies();
+  if (cookiesPresent) {
+    return ["--extractor-args", "youtube:player_client=web,mweb,ios"];
+  }
+  return ["--extractor-args", "youtube:player_client=ios,web,mweb"];
+}
+
+const YT_EXTRACTOR_ARGS = getYtExtractorArgs();
 
 export type MusicSource = "youtube" | "youtube_music" | "spotify" | "soundcloud" | "search";
 
@@ -580,9 +593,42 @@ export async function getYouTubeMetadata(urlOrVideoId: string, ytdlpPath?: strin
   };
 }
 
+// Check if YouTube cookies or authentication is present
+export function hasYouTubeCookies(): boolean {
+  const localCookies = path.join(process.cwd(), "cookies.txt");
+  if (fs.existsSync(localCookies)) {
+    try {
+      if (fs.statSync(localCookies).size > 10) return true;
+    } catch {}
+  }
+  const appCookies = "/app/cookies.txt";
+  if (fs.existsSync(appCookies)) {
+    try {
+      if (fs.statSync(appCookies).size > 10) return true;
+    } catch {}
+  }
+  const fullCookies = path.join(process.cwd(), "cookies.full.txt");
+  if (fs.existsSync(fullCookies)) {
+    try {
+      if (fs.statSync(fullCookies).size > 10) return true;
+    } catch {}
+  }
+  const tmpCookies = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
+  if (fs.existsSync(tmpCookies)) {
+    try {
+      if (fs.statSync(tmpCookies).size > 10) return true;
+    } catch {}
+  }
+  const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
+  if (envCookie && envCookie.trim().length > 10) return true;
+  const bearer = process.env.YOUTUBE_OAUTH_TOKEN || process.env.YT_DLP_OAUTH_TOKEN;
+  if (bearer && bearer.trim().length > 10) return true;
+  return false;
+}
+
 // Helper to check for YouTube cookies (from file or environment variable)
-function getYtDlpCookieArgs(): string[] {
-  // 1. Check cookies.txt first (standard filename used by users and browser extensions)
+export function getYtDlpCookieArgs(): string[] {
+  // 1. Check cookies.txt in current working directory
   const localCookies = path.join(process.cwd(), "cookies.txt");
   if (fs.existsSync(localCookies)) {
     try {
@@ -593,7 +639,18 @@ function getYtDlpCookieArgs(): string[] {
     } catch {}
   }
 
-  // 2. Check cookies.full.txt as secondary fallback
+  // 2. Check /app/cookies.txt (Railway Docker container path)
+  const appCookies = "/app/cookies.txt";
+  if (fs.existsSync(appCookies)) {
+    try {
+      const stats = fs.statSync(appCookies);
+      if (stats.size > 10) {
+        return ["--cookies", appCookies];
+      }
+    } catch {}
+  }
+
+  // 3. Check cookies.full.txt as secondary fallback
   const fullCookies = path.join(process.cwd(), "cookies.full.txt");
   if (fs.existsSync(fullCookies)) {
     try {
@@ -604,8 +661,19 @@ function getYtDlpCookieArgs(): string[] {
     } catch {}
   }
 
-  // 3. Check environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
-  const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES;
+  // 4. Check temporary decoded cookies file if already written
+  const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
+  if (fs.existsSync(tmpCookiePath)) {
+    try {
+      const stats = fs.statSync(tmpCookiePath);
+      if (stats.size > 10) {
+        return ["--cookies", tmpCookiePath];
+      }
+    } catch {}
+  }
+
+  // 5. Check environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
+  const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
   if (envCookie && envCookie.trim()) {
     let cookieContent = envCookie.trim();
     // Strip quotes if user entered them in Railway variable value
@@ -626,7 +694,6 @@ function getYtDlpCookieArgs(): string[] {
       cookieContent = cookieContent.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
     }
 
-    const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
     try {
       fs.writeFileSync(tmpCookiePath, cookieContent, "utf-8");
       return ["--cookies", tmpCookiePath];
@@ -634,7 +701,95 @@ function getYtDlpCookieArgs(): string[] {
       logger.warn({ err }, "Could not write temporary youtube cookie file");
     }
   }
+
+  // 6. OAuth bearer token support
+  const bearer = process.env.YOUTUBE_OAUTH_TOKEN || process.env.YT_DLP_OAUTH_TOKEN;
+  if (bearer && bearer.trim()) {
+    return ["--add-header", `Authorization: Bearer ${bearer.trim()}`];
+  }
+
   return [];
+}
+
+// Save uploaded or pasted cookies and return Base64 for Railway environment variables
+export function saveUploadedCookies(cookieData: string | Buffer): {
+  success: boolean;
+  base64: string;
+  cookiePath: string;
+  count: number;
+} {
+  const content = Buffer.isBuffer(cookieData)
+    ? cookieData.toString("utf-8")
+    : cookieData;
+
+  const trimmed = content.trim();
+  if (!trimmed.includes("youtube.com") && !trimmed.includes(".youtube.com") && !trimmed.includes("# Netscape")) {
+    throw new Error("File cookies tidak valid. Pastikan file diekspor dari situs youtube.com dalam format Netscape HTTP Cookie File.");
+  }
+
+  const cookiePath = path.join(process.cwd(), "cookies.txt");
+  fs.writeFileSync(cookiePath, trimmed, "utf-8");
+
+  // Also write to tmpdir
+  const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
+  try {
+    fs.writeFileSync(tmpCookiePath, trimmed, "utf-8");
+  } catch {}
+
+  const base64 = Buffer.from(trimmed, "utf-8").toString("base64");
+  const count = (trimmed.match(/youtube\.com/g) || []).length;
+
+  return {
+    success: true,
+    base64,
+    cookiePath,
+    count,
+  };
+}
+
+// Get current cookies status
+export function getCookieStatus(): {
+  active: boolean;
+  source: string;
+  detail: string;
+} {
+  const localCookies = path.join(process.cwd(), "cookies.txt");
+  if (fs.existsSync(localCookies)) {
+    try {
+      const stats = fs.statSync(localCookies);
+      if (stats.size > 10) {
+        return {
+          active: true,
+          source: "cookies.txt (Lokal / Uploaded)",
+          detail: `File aktif (${stats.size} bytes).`,
+        };
+      }
+    } catch {}
+  }
+
+  const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
+  if (envCookie && envCookie.trim().length > 10) {
+    return {
+      active: true,
+      source: "Environment Variable (YOUTUBE_COOKIE)",
+      detail: `Variabel terpasang di hosting (${envCookie.trim().length} karakter).`,
+    };
+  }
+
+  const bearer = process.env.YOUTUBE_OAUTH_TOKEN || process.env.YT_DLP_OAUTH_TOKEN;
+  if (bearer && bearer.trim().length > 10) {
+    return {
+      active: true,
+      source: "OAuth Token (YOUTUBE_OAUTH_TOKEN)",
+      detail: "Bearer token aktif.",
+    };
+  }
+
+  return {
+    active: false,
+    source: "Belum Ada",
+    detail: "Belum ada cookies atau token yang aktif. Gunakan /cookies untuk memasang.",
+  };
 }
 
 // Create audio stream from direct URL using FFmpeg to 48kHz stereo raw PCM with seek support
@@ -1348,12 +1503,14 @@ export async function createAudioResourceFromYtDlp(
   const cookieArgs = getYtDlpCookieArgs();
   const isDirectYouTubeLink = /https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com)\//i.test(urlOrQuery);
 
+  const extractorArgs = getYtExtractorArgs(cookieArgs.length > 0);
+
   // Tier 1: Direct yt-dlp stdout pipe into FFmpeg raw PCM (Primary, fastest)
   try {
     const ytdlpArgs = [
       "--js-runtimes", "node",
       ...cookieArgs,
-      ...YT_EXTRACTOR_ARGS,
+      ...extractorArgs,
       "-q",
       "--no-warnings",
       "--no-progress",
@@ -1366,15 +1523,15 @@ export async function createAudioResourceFromYtDlp(
     logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp stdout pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err }, "Tier 1 yt-dlp pipe stream failed, trying Tier 2");
+    logger.warn({ err }, "Tier 1 yt-dlp pipe stream failed, trying Tier 2 (ios client)");
   }
 
-  // Tier 2: Try alternate tv_embedded client (bypasses bot challenges on datacenter IPs)
+  // Tier 2: Try alternate ios client (bypasses bot challenges and format blocks on datacenter IPs)
   try {
     const ytdlpArgs = [
       "--js-runtimes", "node",
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=tv_embedded",
+      "--extractor-args", "youtube:player_client=ios",
       "-q",
       "--no-warnings",
       "--no-progress",
@@ -1384,18 +1541,18 @@ export async function createAudioResourceFromYtDlp(
       urlOrQuery,
     ];
     const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
-    logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp tv_embedded pipe stream");
+    logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp ios pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err }, "Tier 2 tv_embedded pipe stream failed, trying Tier 3");
+    logger.warn({ err }, "Tier 2 ios pipe stream failed, trying Tier 3 (mweb client)");
   }
 
-  // Tier 3: Try alternate android client directly
+  // Tier 3: Try alternate mweb (mobile web) client
   try {
     const ytdlpArgs = [
       "--js-runtimes", "node",
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android",
+      "--extractor-args", "youtube:player_client=mweb",
       "-q",
       "--no-warnings",
       "--no-progress",
@@ -1405,28 +1562,57 @@ export async function createAudioResourceFromYtDlp(
       urlOrQuery,
     ];
     const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
-    logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp android pipe stream");
+    logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp mweb pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err }, "Tier 3 android pipe stream failed, trying Tier 4 direct HTTPS URL");
+    logger.warn({ err }, "Tier 3 mweb pipe stream failed, trying Tier 4 (tv client)");
   }
 
-  // Tier 4: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
+  // Tier 4: Try alternate tv client
+  try {
+    const ytdlpArgs = [
+      "--js-runtimes", "node",
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=tv",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", "ba/ba*/b/best",
+      "--no-playlist",
+      urlOrQuery,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    logger.info({ urlOrQuery }, "Started Tier 4 yt-dlp tv pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err }, "Tier 4 tv pipe stream failed, trying Tier 5 direct HTTPS URL");
+  }
+
+  // Tier 5: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
   try {
     const directUrl = await getDirectAudioUrlWithYtDlp(urlOrQuery, ytdlpPath, 8000);
     if (directUrl) {
-      logger.info({ urlOrQuery }, "Attempting Tier 4 yt-dlp direct HTTPS audio URL");
+      logger.info({ urlOrQuery }, "Attempting Tier 5 yt-dlp direct HTTPS audio URL");
       const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
-      logger.info({ urlOrQuery }, "Streaming via Tier 4 yt-dlp direct HTTPS audio URL");
+      logger.info({ urlOrQuery }, "Streaming via Tier 5 yt-dlp direct HTTPS audio URL");
       return resource;
     }
   } catch (err) {
-    logger.warn({ err }, "Tier 4 direct URL failed");
+    logger.warn({ err }, "Tier 5 direct URL failed");
   }
 
-  // If this was a direct YouTube link sent by the user, DO NOT substitute with SoundCloud!
+  // If this was a direct YouTube link sent by the user, provide an accurate and actionable message
   if (isDirectYouTubeLink) {
-    throw new Error("Gagal memutar audio dari link video YouTube tersebut (video mungkin bersifat privat, dibatasi usia, atau tidak tersedia).");
+    if (!hasYouTubeCookies()) {
+      throw new Error(
+        "⚠️ YouTube meminta konfirmasi bot (Sign in to confirm you're not a bot) di server hosting! " +
+        "Silakan pasang cookies YouTube kamu menggunakan perintah /cookies atau pasang variable YOUTUBE_COOKIE di Railway agar bot bisa memutar video YouTube tanpa hambatan."
+      );
+    }
+    throw new Error(
+      "Gagal memutar audio dari link video YouTube tersebut (video mungkin bersifat privat, dibatasi usia, atau cookies kamu sudah kedaluwarsa). Periksa dengan /cookies-status."
+    );
   }
 
   // Tier 4: SoundCloud fallback audio stream (ultra-reliable when YouTube IP is challenged, scored for accuracy)

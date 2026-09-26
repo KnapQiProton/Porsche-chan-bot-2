@@ -37,7 +37,12 @@ import * as cheerio from "cheerio";
 import fs from "node:fs";
 import path from "node:path";
 import { logger } from "./logger";
-import { MusicService, safeDestroyVoiceConnection } from "./musicPlayer";
+import {
+  MusicService,
+  safeDestroyVoiceConnection,
+  saveUploadedCookies,
+  getCookieStatus,
+} from "./musicPlayer";
 import {
   parseSmartAnimeQuery,
   fetchBooruArtWithCascadingFallback,
@@ -2512,6 +2517,26 @@ export const COMMANDS = [
     .setName("sync")
     .setDescription("Sinkronkan slash commands & bersihkan command lokal server yang berpotensi menimpa opsi /illust")
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("cookies")
+    .setDescription("Upload atau set cookies YouTube agar bot bisa memutar video YouTube di Railway")
+    .addAttachmentOption((opt) =>
+      opt
+        .setName("file")
+        .setDescription("File cookies.txt dari browser (format Netscape)")
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("base64")
+        .setDescription("Atau masukkan string Base64 dari cookies.txt")
+        .setRequired(false)
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("cookies-status")
+    .setDescription("Cek status cookies / autentikasi YouTube untuk pemutaran musik")
+    .toJSON(),
 ];
 
 // Discord Client
@@ -3067,6 +3092,100 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
   if (interaction.commandName === "nowplaying") {
     await MusicService.handleNowPlaying(interaction);
   }
+
+  if (interaction.commandName === "cookies") {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const fileAttachment = interaction.options.getAttachment("file");
+      const base64Input = interaction.options.getString("base64");
+
+      if (!fileAttachment && !base64Input) {
+        const status = getCookieStatus();
+        const embed = new EmbedBuilder()
+          .setColor(status.active ? 0x22c55e : 0xf59e0b)
+          .setTitle("🍪 Panduan Autentikasi Cookies YouTube")
+          .setDescription(
+            `Status saat ini: **${status.active ? "🟢 Aktif (Siap)" : "🔴 Belum Ada"}**\nSumber: \`${status.source}\`\n\n` +
+            `**Cara mudah memasang Cookies YouTube:**\n` +
+            `1. Pasang ekstensi browser **Get cookies.txt LOCALLY** (tersedia di Chrome Web Store, Edge, & Firefox).\n` +
+            `2. Buka [YouTube](https://www.youtube.com) di browser dan pastikan akun Google/YouTube kamu sudah login.\n` +
+            `3. Klik icon ekstensi tersebut -> klik tombol **Export** (file \`cookies.txt\` akan otomatis terdownload).\n` +
+            `4. Jalankan perintah ini lagi: \`/cookies\` lalu lampirkan file \`cookies.txt\` tersebut!\n\n` +
+            `🔒 *Cookies bersifat privat & ephemeral — tidak akan dibagikan ke publik.*`
+          );
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      let cookieContent = "";
+      if (fileAttachment) {
+        const response = await fetch(fileAttachment.url);
+        if (!response.ok) {
+          throw new Error(`Gagal mengunduh file lampiran: HTTP ${response.status}`);
+        }
+        cookieContent = await response.text();
+      } else if (base64Input) {
+        const raw = base64Input.trim();
+        try {
+          cookieContent = Buffer.from(raw, "base64").toString("utf-8");
+          if (!cookieContent.includes("youtube.com")) {
+            cookieContent = raw;
+          }
+        } catch {
+          cookieContent = raw;
+        }
+      }
+
+      const result = saveUploadedCookies(cookieContent);
+
+      const embed = new EmbedBuilder()
+        .setColor(0x22c55e)
+        .setTitle("✅ Cookies YouTube Berhasil Diaktifkan!")
+        .setDescription(
+          `Cookies YouTube telah tersimpan dan langsung aktif untuk streaming saat ini.\n` +
+          `• Ditemukan **${result.count}** entri domain YouTube.\n\n` +
+          `💡 **PENTING UNTUK RAILWAY (Agar Permanen):**\n` +
+          `Server Railway me-reset disk saat redeploy/restart. Agar cookies kamu **permanen selamanya**, pasang variable di Railway:\n\n` +
+          `1. Buka dashboard service kamu di **[Railway](https://railway.app)**\n` +
+          `2. Buka tab **Variables** -> klik **New Variable**\n` +
+          `   • **Name:** \`YOUTUBE_COOKIE\`\n` +
+          `   • **Value:** *(Download file lampiran di bawah dan copy isinya)*\n` +
+          `3. Klik Deploy / Save. Selesai! Bot kamu akan selalu login selamanya!`
+        );
+
+      const base64File = new AttachmentBuilder(Buffer.from(result.base64, "utf-8"), {
+        name: "railway_youtube_cookie_base64.txt",
+        description: "Kode Base64 untuk Railway YOUTUBE_COOKIE",
+      });
+
+      await interaction.editReply({
+        embeds: [embed],
+        files: [base64File],
+      });
+      logger.info({ count: result.count }, "YouTube cookies successfully uploaded and activated via slash command");
+    } catch (err: any) {
+      logger.error({ err }, "Failed to save YouTube cookies via slash command");
+      await interaction.editReply({
+        content: `❌ Gagal menyimpan cookies: ${err?.message || "Format cookies tidak valid"}`,
+      });
+    }
+    return;
+  }
+
+  if (interaction.commandName === "cookies-status") {
+    const status = getCookieStatus();
+    const embed = new EmbedBuilder()
+      .setColor(status.active ? 0x22c55e : 0xf59e0b)
+      .setTitle("🍪 Status Cookies / Autentikasi YouTube")
+      .addFields(
+        { name: "Status", value: status.active ? "🟢 Aktif (Siap streaming)" : "🔴 Belum Terpasang", inline: true },
+        { name: "Sumber", value: `\`${status.source}\``, inline: true },
+        { name: "Detail", value: status.detail, inline: false },
+      )
+      .setFooter({ text: "Gunakan /cookies untuk mengupload cookies.txt atau melihat panduan lengkap" });
+    await interaction.reply({ embeds: [embed], ephemeral: true });
+    return;
+  }
 }
 
 // Flag reactions for translation (AI-Powered)
@@ -3178,6 +3297,37 @@ client.on(Events.MessageCreate, async (message: Message) => {
   if (rawContent === "!skip" || rawContent === "!lewati") {
     await MusicService.skipFromMessage(message);
     return;
+  }
+
+  if (rawContent === "!cookies-status" || rawContent === "!cookie-status") {
+    const status = getCookieStatus();
+    const embed = new EmbedBuilder()
+      .setColor(status.active ? 0x22c55e : 0xf59e0b)
+      .setTitle("🍪 Status Cookies / Autentikasi YouTube")
+      .addFields(
+        { name: "Status", value: status.active ? "🟢 Aktif (Siap streaming)" : "🔴 Belum Terpasang", inline: true },
+        { name: "Sumber", value: `\`${status.source}\``, inline: true },
+        { name: "Detail", value: status.detail, inline: false },
+      )
+      .setFooter({ text: "Gunakan /cookies untuk mengupload cookies.txt" });
+    await message.reply({ embeds: [embed] });
+    return;
+  }
+
+  if (rawContent.startsWith("!cookies") || rawContent.startsWith("!cookie")) {
+    const attachment = message.attachments.first();
+    if (attachment) {
+      try {
+        const response = await fetch(attachment.url);
+        const text = await response.text();
+        const res = saveUploadedCookies(text);
+        await message.reply(`✅ Cookies YouTube berhasil disimpan (${res.count} entri)! Gunakan slash command \`/cookies\` untuk melihat kode Base64 untuk Railway.`);
+        await message.delete().catch(() => {});
+      } catch (err: any) {
+        await message.reply(`❌ Gagal menyimpan cookies: ${err?.message || "Format tidak valid"}`);
+      }
+      return;
+    }
   }
   if (rawContent === "!queue" || rawContent === "!antrean" || rawContent === "!antrian" || rawContent === "!q") {
     await MusicService.queueFromMessage(message);
