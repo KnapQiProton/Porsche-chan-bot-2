@@ -8,6 +8,8 @@ coverage/
 !.env.example
 cookies.txt
 cookies.full.txt
+*cookie*.txt
+*cookies*.txt
 bin/
 tmp
 out-tsc

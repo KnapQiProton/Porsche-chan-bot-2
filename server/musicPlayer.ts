@@ -928,7 +928,8 @@ export function getYtDlpCookieArgs(): string[] {
     }
 
     try {
-      fs.writeFileSync(tmpCookiePath, cookieContent, "utf-8");
+      cookieContent = sanitizeNetscapeCookies(cookieContent);
+    fs.writeFileSync(tmpCookiePath, cookieContent, "utf-8");
       return ["--cookies", tmpCookiePath];
     } catch (err) {
       logger.warn({ err }, "Could not write temporary youtube cookie file");
@@ -945,6 +946,24 @@ export function getYtDlpCookieArgs(): string[] {
 }
 
 // Save uploaded or pasted cookies and return Base64 for Railway environment variables
+// Sanitize Netscape cookies by removing ephemeral tracking ST-* cookies that bloat size from 3KB to 50KB+
+export function sanitizeNetscapeCookies(rawCookies: string): string {
+  const lines = rawCookies.split(/\r?\n/);
+  const filtered = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith('#')) return true;
+    const parts = trimmed.split('\t');
+    if (parts.length >= 7) {
+      const cookieName = parts[5];
+      // Strip noisy search/stream click-tracking cookies (ST-*) that bloat size & cause Railway env var errors
+      if (cookieName && cookieName.startsWith('ST-')) return false;
+    }
+    return true;
+  });
+  return filtered.join('\n');
+}
+
 export function saveUploadedCookies(cookieData: string | Buffer): {
   success: boolean;
   base64: string;
@@ -970,6 +989,9 @@ export function saveUploadedCookies(cookieData: string | Buffer): {
   if (!trimmed.includes("youtube.com") && !trimmed.includes(".youtube.com") && !trimmed.includes("# Netscape")) {
     throw new Error("File cookies tidak valid. Pastikan file berformat Netscape cookies.txt atau file .txt berisi kode base64 cookies yang valid.");
   }
+
+  // Strip noisy ST-* tracking cookies to keep file lightweight and fast
+  trimmed = sanitizeNetscapeCookies(trimmed);
 
   const cookiePath = path.join(process.cwd(), "cookies.txt");
   fs.writeFileSync(cookiePath, trimmed, "utf-8");
