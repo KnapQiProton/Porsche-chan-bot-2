@@ -183,8 +183,8 @@ function getGeminiClient(): GoogleGenAI | null {
   return geminiAi;
 }
 
-export const GEMINI_PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-export const GEMINI_FALLBACK_MODEL = "gemini-2.5-flash";
+export const GEMINI_PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+export const GEMINI_FALLBACK_MODEL = "gemini-2.0-flash";
 
 async function callGeminiWithFallback(
   ai: GoogleGenAI,
@@ -192,28 +192,32 @@ async function callGeminiWithFallback(
     contents: any;
     config?: any;
   }
-) {
+): Promise<any> {
   try {
-    return await withRetry(() =>
+    const res = await withRetry(() =>
       ai.models.generateContent({
         model: GEMINI_PRIMARY_MODEL,
         contents: params.contents,
         config: params.config,
       })
     );
+    (res as any).modelUsed = GEMINI_PRIMARY_MODEL;
+    return res;
   } catch (primaryErr) {
     if (GEMINI_PRIMARY_MODEL !== GEMINI_FALLBACK_MODEL) {
       logger.warn(
         { primaryErr, model: GEMINI_PRIMARY_MODEL },
         `Gemini ${GEMINI_PRIMARY_MODEL} error, falling back to ${GEMINI_FALLBACK_MODEL}...`
       );
-      return await withRetry(() =>
+      const fallbackRes = await withRetry(() =>
         ai.models.generateContent({
           model: GEMINI_FALLBACK_MODEL,
           contents: params.contents,
           config: params.config,
         })
       );
+      (fallbackRes as any).modelUsed = GEMINI_FALLBACK_MODEL;
+      return fallbackRes;
     }
     throw primaryErr;
   }
@@ -257,6 +261,7 @@ async function callOpenAICompat(
   apiKey: string,
   model: string,
   messages: OAIMessage[],
+  maxTokens: number = 2048,
 ): Promise<string> {
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -267,7 +272,8 @@ async function callOpenAICompat(
     body: JSON.stringify({
       model,
       messages,
-      max_tokens: 8192,
+      max_tokens: maxTokens,
+      temperature: 0.7,
     }),
   });
   if (!res.ok) {
@@ -292,97 +298,177 @@ async function callPollinationsText(messages: OAIMessage[]): Promise<string> {
   return await res.text();
 }
 
+export interface GenerateTextResult {
+  text: string;
+  provider: Provider;
+  model: string;
+}
+
 export async function generateText(
   messages: { role: "user" | "model"; text: string }[],
   systemPrompt?: string,
-): Promise<{ text: string; provider: Provider }> {
+): Promise<GenerateTextResult> {
   const oai = toOAIMessages(messages);
   const oaiWithSystem: OAIMessage[] = systemPrompt ? [{ role: "system", content: systemPrompt }, ...oai] : oai;
 
-  // 1. Gemini (primary: gemini-3.8-flash with fallback)
-  const ai = getGeminiClient();
-  if (ai) {
-    try {
-      const response = await callGeminiWithFallback(ai, {
-        contents: messages.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
-        config: {
-          maxOutputTokens: 8192,
-          ...(systemPrompt ? { systemInstruction: systemPrompt } : {}),
-        },
-      });
-      return { text: response.text ?? "", provider: "gemini" };
-    } catch (err) {
-      logger.warn({ err }, "Gemini failed, trying Groq...");
-    }
-  }
+  // 1. DeepSeek — Fast conversational model (DeepSeek-V3 via deepseek-chat)
+  const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY?.trim();
+  const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat";
+  const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL?.trim() || "https://api.deepseek.com/v1";
 
-  // 2. Groq — Llama 3.3 70B
-  const GROQ_API_KEY = process.env.GROQ_API_KEY;
-  if (GROQ_API_KEY) {
+  const tryDeepSeek = async (): Promise<GenerateTextResult | null> => {
+    if (!DEEPSEEK_API_KEY) return null;
+    try {
+      const text = await callOpenAICompat(
+        DEEPSEEK_BASE_URL,
+        DEEPSEEK_API_KEY,
+        DEEPSEEK_MODEL,
+        oaiWithSystem,
+        2048
+      );
+      if (text && text.trim()) {
+        const displayModel = DEEPSEEK_MODEL === "deepseek-chat" ? "DeepSeek-V3" : DEEPSEEK_MODEL;
+        return { text: text.trim(), provider: "deepseek", model: displayModel };
+      }
+    } catch (err) {
+      logger.warn({ err }, "DeepSeek chat API failed, trying next provider...");
+    }
+    return null;
+  };
+
+  // 2. Groq — Ultra-fast inference (Llama 3.3 70B / 3.1 8B)
+  const GROQ_API_KEY = process.env.GROQ_API_KEY?.trim();
+  const GROQ_MODEL = process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile";
+
+  const tryGroq = async (): Promise<GenerateTextResult | null> => {
+    if (!GROQ_API_KEY) return null;
     try {
       const text = await callOpenAICompat(
         "https://api.groq.com/openai/v1",
         GROQ_API_KEY,
-        "llama-3.3-70b-versatile",
+        GROQ_MODEL,
         oaiWithSystem,
+        2048
       );
-      return { text, provider: "groq" };
+      if (text && text.trim()) {
+        const displayModel = GROQ_MODEL.includes("llama-3.3-70b") ? "Groq (Llama 3.3 70B)" : `Groq (${GROQ_MODEL})`;
+        return { text: text.trim(), provider: "groq", model: displayModel };
+      }
     } catch (err) {
-      logger.warn({ err }, "Groq failed, trying Mistral...");
+      logger.warn({ err }, "Groq chat API failed, trying next provider...");
     }
-  }
+    return null;
+  };
 
-  // 3. Mistral
-  const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
-  if (MISTRAL_API_KEY) {
+  // 3. Gemini — Fast Flash (gemini-2.5-flash with zero thinking delay)
+  const tryGemini = async (): Promise<GenerateTextResult | null> => {
+    const ai = getGeminiClient();
+    if (!ai) return null;
+    try {
+      const response = await callGeminiWithFallback(ai, {
+        contents: messages.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
+        config: {
+          maxOutputTokens: 2048,
+          thinkingConfig: { thinkingBudget: 0 },
+          ...(systemPrompt ? { systemInstruction: systemPrompt } : {}),
+        },
+      });
+      const text = response?.text?.trim() || "";
+      if (text) {
+        const modelUsed = (response as any).modelUsed || GEMINI_PRIMARY_MODEL;
+        return { text, provider: "gemini", model: `Gemini (${modelUsed})` };
+      }
+    } catch (err) {
+      logger.warn({ err }, "Gemini chat API failed, trying next provider...");
+    }
+    return null;
+  };
+
+  // 4. Mistral
+  const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY?.trim();
+  const MISTRAL_MODEL = process.env.MISTRAL_MODEL?.trim() || "mistral-small-latest";
+
+  const tryMistral = async (): Promise<GenerateTextResult | null> => {
+    if (!MISTRAL_API_KEY) return null;
     try {
       const text = await callOpenAICompat(
         "https://api.mistral.ai/v1",
         MISTRAL_API_KEY,
-        "mistral-small-latest",
+        MISTRAL_MODEL,
         oaiWithSystem,
+        2048
       );
-      return { text, provider: "mistral" };
+      if (text && text.trim()) {
+        return { text: text.trim(), provider: "mistral", model: `Mistral (${MISTRAL_MODEL})` };
+      }
     } catch (err) {
-      logger.warn({ err }, "Mistral failed, trying DeepSeek...");
+      logger.warn({ err }, "Mistral chat API failed, trying next provider...");
     }
-  }
-
-  // 4. DeepSeek R1
-  const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
-  if (DEEPSEEK_API_KEY) {
-    try {
-      const text = await callOpenAICompat(
-        "https://api.deepseek.com/v1",
-        DEEPSEEK_API_KEY,
-        "deepseek-reasoner",
-        oaiWithSystem,
-      );
-      return { text, provider: "deepseek" };
-    } catch (err) {
-      logger.warn({ err }, "DeepSeek failed, trying OpenRouter...");
-    }
-  }
+    return null;
+  };
 
   // 5. OpenRouter
-  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-  if (OPENROUTER_API_KEY) {
+  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY?.trim();
+  const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL?.trim() || "deepseek/deepseek-chat";
+
+  const tryOpenRouter = async (): Promise<GenerateTextResult | null> => {
+    if (!OPENROUTER_API_KEY) return null;
     try {
       const text = await callOpenAICompat(
         "https://openrouter.ai/api/v1",
         OPENROUTER_API_KEY,
-        "meta-llama/llama-3.3-70b-instruct:free",
+        OPENROUTER_MODEL,
         oaiWithSystem,
+        2048
       );
-      return { text, provider: "openrouter" };
+      if (text && text.trim()) {
+        const shortModel = OPENROUTER_MODEL.includes("/") ? OPENROUTER_MODEL.split("/")[1] : OPENROUTER_MODEL;
+        return { text: text.trim(), provider: "openrouter", model: `OpenRouter (${shortModel})` };
+      }
     } catch (err) {
-      logger.warn({ err }, "OpenRouter failed, trying Pollinations...");
+      logger.warn({ err }, "OpenRouter chat API failed, trying next provider...");
+    }
+    return null;
+  };
+
+  // Provider preference & priority
+  const preferred = process.env.CHAT_PROVIDER?.toLowerCase().trim();
+  const providerMap: Record<string, () => Promise<GenerateTextResult | null>> = {
+    deepseek: tryDeepSeek,
+    groq: tryGroq,
+    gemini: tryGemini,
+    mistral: tryMistral,
+    openrouter: tryOpenRouter,
+  };
+
+  const sequence: Array<() => Promise<GenerateTextResult | null>> = [];
+  if (preferred && providerMap[preferred]) {
+    sequence.push(providerMap[preferred]);
+  }
+
+  // Fast response default priority: DeepSeek -> Groq -> Gemini -> Mistral -> OpenRouter
+  const defaultOrder = [tryDeepSeek, tryGroq, tryGemini, tryMistral, tryOpenRouter];
+  for (const fn of defaultOrder) {
+    if (!sequence.includes(fn)) {
+      sequence.push(fn);
     }
   }
 
-  // 6. Pollinations AI (free, no API key required)
-  const text = await callPollinationsText(oaiWithSystem);
-  return { text, provider: "pollinations" };
+  for (const fn of sequence) {
+    const res = await fn();
+    if (res && res.text) {
+      return res;
+    }
+  }
+
+  // 6. Free Neural Fallback (Pollinations AI)
+  try {
+    const text = await callPollinationsText(oaiWithSystem);
+    return { text: text.trim(), provider: "pollinations", model: "Pollinations AI (OpenAI)" };
+  } catch (err) {
+    logger.error({ err }, "All text providers failed");
+    throw err;
+  }
 }
 
 const IMAGE_KEYWORDS = [
@@ -3692,6 +3778,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
   } else {
     try {
       const channelId = message.channelId;
+      if ("sendTyping" in message.channel) {
+        message.channel.sendTyping().catch(() => {});
+      }
       const history = conversationHistory.get(channelId) || [];
 
       let conversationalInput = userText;
@@ -3711,7 +3800,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
 
       const systemPrompt = buildPersona(isCreator);
-      const { text: reply } = await generateText(updatedHistory, systemPrompt);
+      const { text: reply, model: modelName } = await generateText(updatedHistory, systemPrompt);
 
       const finalHistory = [...updatedHistory, { role: "model" as const, text: reply }];
       if (finalHistory.length > MAX_HISTORY) {
@@ -3719,7 +3808,17 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
       conversationHistory.set(channelId, finalHistory);
 
+      // Append model indicator footer for regular chat
+      const footer = modelName ? `\n\n-# ⚡ Model: ${modelName}` : "";
       const chunks = splitMessage(reply);
+      if (chunks.length > 0 && footer) {
+        const lastIdx = chunks.length - 1;
+        if (chunks[lastIdx].length + footer.length <= DISCORD_LIMIT) {
+          chunks[lastIdx] += footer;
+        } else {
+          chunks.push(footer.trim());
+        }
+      }
       for (let i = 0; i < chunks.length; i++) {
         if (i === 0) {
           try {
