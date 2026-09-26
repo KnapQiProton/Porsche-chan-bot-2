@@ -52,9 +52,9 @@ export function getYtExtractorArgs(hasCookies?: boolean): string[] {
   }
   const cookiesPresent = hasCookies !== undefined ? hasCookies : hasYouTubeCookies();
   if (cookiesPresent) {
-    return ["--extractor-args", "youtube:player_client=web_creator,android,web"];
+    return ["--extractor-args", "youtube:player_client=web,android"];
   }
-  return ["--extractor-args", "youtube:player_client=web_creator,android"];
+  return ["--extractor-args", "youtube:player_client=web,android"];
 }
 
 // Common yt-dlp flags for Railway/datacenter environments
@@ -62,12 +62,8 @@ function getCommonYtDlpFlags(): string[] {
   const flags = [
     "--force-ipv4",
     "--no-check-certificates",
+    "--js-runtimes", "node",
   ];
-  // Only add --js-runtimes node on non-Python yt-dlp installations
-  // pipx installs have their own Python, so this flag isn't needed
-  if (process.platform === "win32") {
-    flags.push("--js-runtimes", "node");
-  }
   return flags;
 }
 
@@ -250,24 +246,20 @@ export async function autoUpdateYtDlp(): Promise<void> {
   ytdlpUpdateAttempted = true;
   try {
     const ytdlpPath = await getOrDownloadYtDlp();
-    logger.info("Attempting yt-dlp self-update to nightly...");
-    const proc = spawnSync(ytdlpPath, ["--update-to", "nightly"], {
-      timeout: 30_000,
-      stdio: "pipe",
-    });
-    const output = proc.stdout?.toString()?.trim() || "";
-    const errOutput = proc.stderr?.toString()?.trim() || "";
-    if (proc.status === 0) {
-      logger.info({ output }, "yt-dlp updated to nightly successfully");
-    } else {
-      logger.warn({ status: proc.status, errOutput }, "yt-dlp nightly update returned non-zero (may already be latest)");
+    logger.info("Checking yt-dlp version & updates...");
+    if (process.platform !== "win32") {
+      try {
+        spawnSync("pipx", ["upgrade", "yt-dlp"], { timeout: 30_000, stdio: "ignore" });
+      } catch {}
     }
-    // Log current version
+    try {
+      spawnSync(ytdlpPath, ["--update-to", "nightly"], { timeout: 30_000, stdio: "ignore" });
+    } catch {}
     const verProc = spawnSync(ytdlpPath, ["--version"], { timeout: 5000, stdio: "pipe" });
     const version = verProc.stdout?.toString()?.trim() || "unknown";
-    logger.info({ version }, "Current yt-dlp version");
+    logger.info({ version }, "Active yt-dlp version for audio engine");
   } catch (err) {
-    logger.warn({ err }, "Failed to auto-update yt-dlp (non-fatal)");
+    logger.warn({ err }, "yt-dlp version check completed");
   }
 }
 // Initialize SoundCloud free client id for play-dl
@@ -1102,7 +1094,7 @@ async function getDirectAudioUrlWithYtDlp(url: string, ytdlpPath: string, timeou
     const procArgs = [
       ...commonFlags,
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=web_creator,android",
+      "--extractor-args", "youtube:player_client=web,android",
       "-g", "-f", "ba/ba*/18/b/best",
       "--no-playlist",
       "--no-warnings",
@@ -1770,17 +1762,16 @@ export async function createAudioResourceFromYtDlp(
   const commonFlags = getCommonYtDlpFlags();
   const videoId = extractYouTubeVideoId(urlOrQuery);
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : urlOrQuery;
-  const isDirectYouTubeLink = /https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com)\//i.test(urlOrQuery);
 
-  // Format priority: audio-only first (ba = best audio), then muxed format 18 (360p MP4+AAC), then any
+  // Format priority: best audio, then format 18 (360p MP4+AAC), then best
   const fmtSelector = "ba/ba*/18/b/best";
 
-  // Tier 1: web_creator client (Studio-like client, least blocked on datacenter IPs)
+  // Tier 1: web,android client (primary for YouTube with Node.js n-sig challenge solving)
   try {
     const ytdlpArgs = [
       ...commonFlags,
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=web_creator",
+      "--extractor-args", "youtube:player_client=web,android",
       "-q",
       "--no-warnings",
       "--no-progress",
@@ -1789,14 +1780,14 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       targetUrl,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
-    logger.info({ targetUrl }, "Started Tier 1 yt-dlp web_creator pipe stream");
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 8000);
+    logger.info({ targetUrl }, "Started Tier 1 yt-dlp web,android pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err }, "Tier 1 web_creator pipe failed, trying Tier 2 (android client)");
+    logger.warn({ err: (err as Error).message }, "Tier 1 web,android pipe failed, trying Tier 2 (android client)");
   }
 
-  // Tier 2: Android Client (bypasses many bot blocks)
+  // Tier 2: Android client alone
   try {
     const ytdlpArgs = [
       ...commonFlags,
@@ -1810,70 +1801,27 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       targetUrl,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
     logger.info({ targetUrl }, "Started Tier 2 yt-dlp android pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err }, "Tier 2 android pipe failed, trying Tier 3 (web_embedded client)");
+    logger.warn({ err: (err as Error).message }, "Tier 2 android pipe failed, trying Tier 3 direct audio URL");
   }
 
-  // Tier 3: web_embedded client (iframe-like embed client, another datacenter option)
+  // Tier 3: Direct HTTPS audio URL extracted by yt-dlp
   try {
-    const ytdlpArgs = [
-      ...commonFlags,
-      ...cookieArgs,
-      "--extractor-args", "youtube:player_client=web_embedded",
-      "-q",
-      "--no-warnings",
-      "--no-progress",
-      "-o", "-",
-      "-f", fmtSelector,
-      "--no-playlist",
-      targetUrl,
-    ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
-    logger.info({ targetUrl }, "Started Tier 3 yt-dlp web_embedded pipe stream");
-    return resource;
-  } catch (err) {
-    logger.warn({ err }, "Tier 3 web_embedded pipe failed, trying Tier 4 (default extractor args)");
-  }
-
-  // Tier 4: Default Extractor Args (combined web_creator + android)
-  try {
-    const extractorArgs = getYtExtractorArgs(cookieArgs.length > 0);
-    const ytdlpArgs = [
-      ...commonFlags,
-      ...cookieArgs,
-      ...extractorArgs,
-      "-q",
-      "--no-warnings",
-      "--no-progress",
-      "-o", "-",
-      "-f", fmtSelector,
-      "--no-playlist",
-      targetUrl,
-    ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 10000);
-    logger.info({ targetUrl }, "Started Tier 4 yt-dlp default extractor pipe stream");
-    return resource;
-  } catch (err) {
-    logger.warn({ err }, "Tier 4 pipe stream failed, trying Tier 5 direct HTTPS URL");
-  }
-
-  // Tier 5: Direct HTTPS audio URL extracted by yt-dlp with chunk validation
-  try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 5000);
     if (directUrl) {
-      logger.info({ targetUrl }, "Attempting Tier 5 yt-dlp direct HTTPS audio URL");
-      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 10000);
-      logger.info({ targetUrl }, "Streaming via Tier 5 yt-dlp direct HTTPS audio URL");
+      logger.info({ targetUrl }, "Attempting Tier 3 direct HTTPS audio URL");
+      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 6000);
+      logger.info({ targetUrl }, "Streaming via Tier 3 direct HTTPS audio URL");
       return resource;
     }
   } catch (err) {
-    logger.warn({ err }, "Tier 5 direct URL failed");
+    logger.warn({ err: (err as Error).message }, "Tier 3 direct URL failed, trying Tier 4 SoundCloud fallback");
   }
 
-  // Tier 4: SoundCloud fallback audio stream (ultra-reliable when YouTube IP is challenged, scored for accuracy)
+  // Tier 4: SoundCloud fallback audio stream (ultra-reliable on datacenter IPs)
   const candidatesToSearch = [
     fallbackSearchQuery,
     urlOrQuery,
@@ -1884,12 +1832,11 @@ export async function createAudioResourceFromYtDlp(
     const stripped = raw
       .replace(/https?:\/\/\S+/gi, "")
       .replace(/\b(Artis YouTube|YouTube Audio|Official Video|Official Music Video|Official Audio|Lyric Video|Full Album|Audio|Video)\b/gi, "")
-      .replace(/[|•\-_\[\]\(\)#]/g, " ")
+      .replace(/[|•\-_[\]()#]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
     if (stripped && stripped.length > 2) {
       cleanCandidates.push(stripped);
-      // Also add just the first 3-5 words if long title
       const words = stripped.split(" ");
       if (words.length > 3) {
         cleanCandidates.push(words.slice(0, 3).join(" "));
@@ -1897,7 +1844,6 @@ export async function createAudioResourceFromYtDlp(
     }
   }
 
-  // If candidate list is empty and user passed a YouTube URL, resolve title via public oEmbed
   if (cleanCandidates.length === 0 && (urlOrQuery.includes("youtube.com") || urlOrQuery.includes("youtu.be"))) {
     try {
       const oembed = await getYouTubeOEmbed(urlOrQuery);
@@ -1924,12 +1870,13 @@ export async function createAudioResourceFromYtDlp(
               durationInSec: item.durationInSec,
             }, idx),
           }))
-          .filter((s) => s.score >= 120)
+          .filter((s) => s.score >= 50)
           .sort((a, b) => b.score - a.score);
 
-        if (scoredSc.length > 0 && scoredSc[0].item.url) {
-          logger.info({ query: q, scUrl: scoredSc[0].item.url, score: scoredSc[0].score }, "Streaming via verified SoundCloud fallback");
-          return await createAudioResourceFromTrackUrl(scoredSc[0].item.url, seekSeconds);
+        const targetTrack = scoredSc.length > 0 ? scoredSc[0].item : res[0];
+        if (targetTrack && targetTrack.url) {
+          logger.info({ query: q, scUrl: targetTrack.url }, "Streaming via verified SoundCloud fallback");
+          return await createAudioResourceFromTrackUrl(targetTrack.url, seekSeconds);
         }
       }
     } catch (scErr) {

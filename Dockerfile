@@ -37,7 +37,7 @@ RUN npm run build
 
 # Update yt-dlp to nightly at the END so Docker doesn't cache stale version
 # (This layer runs after source copy, so it always rebuilds on code changes)
-RUN yt-dlp --update-to nightly 2>/dev/null || yt-dlp --update 2>/dev/null || true && \
+RUN pipx upgrade yt-dlp 2>/dev/null || pipx install --force "https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz" 2>/dev/null || true && \
     echo "yt-dlp version:" && yt-dlp --version
 
 # Runtime environment
