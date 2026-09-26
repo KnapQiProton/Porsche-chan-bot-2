@@ -104,10 +104,9 @@ export interface GuildSession {
 
 const sessions = new Map<string, GuildSession>();
 
-// Rate-limiting / Cooldown maps & Guild action queue to prevent race conditions & spam
+// Rate-limiting / Cooldown maps to prevent command spamming
 const userCooldowns = new Map<string, number>();
 const guildCooldowns = new Map<string, number>();
-const guildActionQueues = new Map<string, Promise<any>>();
 
 export function checkUserCooldown(userId: string, action: string, cooldownMs: number = 2500): number | null {
   const key = `${userId}:${action}`;
@@ -131,15 +130,6 @@ export function checkGuildActionCooldown(guildId: string, action: string, cooldo
   }
   guildCooldowns.set(key, now);
   return null;
-}
-
-export function enqueueGuildAction<T>(guildId: string, action: () => Promise<T>): Promise<T> {
-  const previous = guildActionQueues.get(guildId) || Promise.resolve();
-  const next = previous
-    .catch(() => {})
-    .then(() => action());
-  guildActionQueues.set(guildId, next.catch(() => {}));
-  return next;
 }
 
 export function safeDestroyVoiceConnection(conn?: VoiceConnection | null): void {
@@ -1721,7 +1711,7 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
     logger.info({ urlOrQuery }, "Started Tier 1 yt-dlp stdout pipe stream");
     return resource;
   } catch (err) {
@@ -1742,7 +1732,7 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
     logger.info({ urlOrQuery }, "Started Tier 2 yt-dlp ios pipe stream");
     return resource;
   } catch (err) {
@@ -1763,7 +1753,7 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
     logger.info({ urlOrQuery }, "Started Tier 3 yt-dlp mweb pipe stream");
     return resource;
   } catch (err) {
@@ -1784,7 +1774,7 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       urlOrQuery,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 6000);
     logger.info({ urlOrQuery }, "Started Tier 4 yt-dlp tv pipe stream");
     return resource;
   } catch (err) {
@@ -2594,82 +2584,101 @@ export class MusicService {
     const queryOrUrl = interaction.options.getString("url", true);
     await interaction.deferReply();
 
-    await enqueueGuildAction(guild.id, async () => {
-      try {
-        const musicResult = await resolveMusic(queryOrUrl, {
-          name: interaction.user.displayName || interaction.user.username,
-          id: interaction.user.id,
-        });
+    try {
+      const musicResult = await resolveMusic(queryOrUrl, {
+        name: interaction.user.displayName || interaction.user.username,
+        id: interaction.user.id,
+      });
 
-        const textChannel = interaction.channel as TextBasedChannel;
-        const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
+      const textChannel = interaction.channel as TextBasedChannel;
+      const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
 
-        if (musicResult.isPlaylist) {
-          if (session.isPlaying && session.currentTrack) {
-            session.queue.push(...musicResult.tracks);
-            const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, true);
-            await interaction.editReply({ embeds: [embed] });
-          } else {
-            if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-              try {
-                await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-              } catch {}
-            }
-            session.connection.subscribe(session.player);
-
-            const [firstTrack, ...queuedTracks] = musicResult.tracks;
-            session.queue.push(...queuedTracks);
-
-            const resource = await firstTrack.createStream(0);
-            session.currentTrack = firstTrack;
-            session.currentResource = resource;
-            session.isPlaying = true;
-            session.isPaused = false;
-            session.isSeeking = false;
-            session.seekOffsetSec = 0;
-            session.player.play(resource);
-
-            const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, false);
-            await interaction.editReply({
-              embeds: [embed],
-              components: [buildMusicControlRow(false)],
-            });
-          }
+      if (musicResult.isPlaylist) {
+        if (session.isPlaying && session.currentTrack) {
+          session.queue.push(...musicResult.tracks);
+          const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, true);
+          await interaction.editReply({ embeds: [embed] });
         } else {
-          const track = musicResult.tracks[0];
-          if (session.isPlaying && session.currentTrack) {
-            session.queue.push(track);
-            const embed = buildNowPlayingEmbed(track, true);
-            await interaction.editReply({ embeds: [embed] });
-          } else {
-            if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-              try {
-                await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-              } catch {}
-            }
-            session.connection.subscribe(session.player);
+          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+            } catch {}
+          }
+          session.connection.subscribe(session.player);
 
-            const resource = await track.createStream(0);
-            session.currentTrack = track;
+          const [firstTrack, ...queuedTracks] = musicResult.tracks;
+          session.queue.push(...queuedTracks);
+
+          session.currentTrack = firstTrack;
+          session.isPlaying = true;
+          session.isPaused = false;
+          session.isSeeking = false;
+          session.seekOffsetSec = 0;
+
+          const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, false);
+          await interaction.editReply({
+            embeds: [embed],
+            components: [buildMusicControlRow(false)],
+          });
+
+          try {
+            const resource = await firstTrack.createStream(0);
             session.currentResource = resource;
-            session.isPlaying = true;
-            session.isPaused = false;
-            session.isSeeking = false;
-            session.seekOffsetSec = 0;
             session.player.play(resource);
-
-            const embed = buildNowPlayingEmbed(track, false);
-            await interaction.editReply({
-              embeds: [embed],
-              components: [buildMusicControlRow(false)],
-            });
+          } catch (streamErr) {
+            logger.error({ streamErr, track: firstTrack.title }, "Failed to start initial playlist stream");
+            if (session.queue.length > 0) {
+              const next = session.queue.shift()!;
+              await MusicService.playTrackInSession(session, next);
+            }
           }
         }
-      } catch (err) {
-        logger.error({ err, queryOrUrl }, "Error resolving and playing track");
-        await interaction.editReply(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
+      } else {
+        const track = musicResult.tracks[0];
+        if (session.isPlaying && session.currentTrack) {
+          session.queue.push(track);
+          const embed = buildNowPlayingEmbed(track, true);
+          await interaction.editReply({ embeds: [embed] });
+        } else {
+          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+            } catch {}
+          }
+          session.connection.subscribe(session.player);
+
+          session.currentTrack = track;
+          session.isPlaying = true;
+          session.isPaused = false;
+          session.isSeeking = false;
+          session.seekOffsetSec = 0;
+
+          const embed = buildNowPlayingEmbed(track, false);
+          await interaction.editReply({
+            embeds: [embed],
+            components: [buildMusicControlRow(false)],
+          });
+
+          try {
+            const resource = await track.createStream(0);
+            session.currentResource = resource;
+            session.player.play(resource);
+          } catch (streamErr) {
+            logger.error({ streamErr, track: track.title }, "Failed to start track stream");
+            if (textChannel && "send" in textChannel) {
+              await (textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(streamErr as Error).message || "Stream error"}`).catch(() => {});
+            }
+            if (session.queue.length > 0) {
+              const next = session.queue.shift()!;
+              await MusicService.playTrackInSession(session, next);
+            }
+          }
+        }
       }
-    });
+    } catch (err) {
+      logger.error({ err, queryOrUrl }, "Error resolving and playing track");
+      await interaction.editReply(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
+    }
   }
 
   public static async handleStop(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -2976,84 +2985,103 @@ const followMsg = await interaction.followUp({
     }
 
     const loadingMsg = await message.reply("🔎 Mencari & menyiapkan audio... Tunggu sebentar ya~ (๑˃ᴗ˂)ﻌ");
-    await enqueueGuildAction(guild.id, async () => {
-      try {
-        const musicResult = await resolveMusic(queryOrUrl, {
-          name: message.author.displayName || message.author.username,
-          id: message.author.id,
-        });
+    try {
+      const musicResult = await resolveMusic(queryOrUrl, {
+        name: message.author.displayName || message.author.username,
+        id: message.author.id,
+      });
 
-        const textChannel = message.channel as TextBasedChannel;
-        const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
+      const textChannel = message.channel as TextBasedChannel;
+      const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
 
-        if (musicResult.isPlaylist) {
-          if (session.isPlaying && session.currentTrack) {
-            session.queue.push(...musicResult.tracks);
-            const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, true);
-            await loadingMsg.edit({ content: null, embeds: [embed] });
-          } else {
-            if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-              try {
-                await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-              } catch {}
-            }
-            session.connection.subscribe(session.player);
-
-            const [firstTrack, ...queuedTracks] = musicResult.tracks;
-            session.queue.push(...queuedTracks);
-
-            const resource = await firstTrack.createStream(0);
-            session.currentTrack = firstTrack;
-            session.currentResource = resource;
-            session.isPlaying = true;
-            session.isPaused = false;
-            session.isSeeking = false;
-            session.seekOffsetSec = 0;
-            session.player.play(resource);
-
-            const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, false);
-            await loadingMsg.edit({
-              content: null,
-              embeds: [embed],
-              components: [buildMusicControlRow(false)],
-            });
-          }
+      if (musicResult.isPlaylist) {
+        if (session.isPlaying && session.currentTrack) {
+          session.queue.push(...musicResult.tracks);
+          const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, true);
+          await loadingMsg.edit({ content: null, embeds: [embed] });
         } else {
-          const track = musicResult.tracks[0];
-          if (session.isPlaying && session.currentTrack) {
-            session.queue.push(track);
-            const embed = buildNowPlayingEmbed(track, true);
-            await loadingMsg.edit({ content: null, embeds: [embed] });
-          } else {
-            if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-              try {
-                await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
-              } catch {}
-            }
-            session.connection.subscribe(session.player);
+          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+            } catch {}
+          }
+          session.connection.subscribe(session.player);
 
-            const resource = await track.createStream(0);
-            session.currentTrack = track;
+          const [firstTrack, ...queuedTracks] = musicResult.tracks;
+          session.queue.push(...queuedTracks);
+
+          session.currentTrack = firstTrack;
+          session.isPlaying = true;
+          session.isPaused = false;
+          session.isSeeking = false;
+          session.seekOffsetSec = 0;
+
+          const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, false);
+          await loadingMsg.edit({
+            content: null,
+            embeds: [embed],
+            components: [buildMusicControlRow(false)],
+          });
+
+          try {
+            const resource = await firstTrack.createStream(0);
             session.currentResource = resource;
-            session.isPlaying = true;
-            session.isPaused = false;
-            session.isSeeking = false;
-            session.seekOffsetSec = 0;
             session.player.play(resource);
-
-            const embed = buildNowPlayingEmbed(track, false);
-            await loadingMsg.edit({
-              content: null,
-              embeds: [embed],
-              components: [buildMusicControlRow(false)],
-            });
+          } catch (streamErr) {
+            logger.error({ streamErr, track: firstTrack.title }, "Failed to start initial playlist stream");
+            if (session.queue.length > 0) {
+              const next = session.queue.shift()!;
+              await MusicService.playTrackInSession(session, next);
+            }
           }
         }
-      } catch (err) {
-        logger.error({ err, queryOrUrl }, "Error in playFromMessage");
-        await loadingMsg.edit(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
+      } else {
+        const track = musicResult.tracks[0];
+        if (session.isPlaying && session.currentTrack) {
+          session.queue.push(track);
+          const embed = buildNowPlayingEmbed(track, true);
+          await loadingMsg.edit({ content: null, embeds: [embed] });
+        } else {
+          if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              await entersState(session.connection, VoiceConnectionStatus.Ready, 5_000);
+            } catch {}
+          }
+          session.connection.subscribe(session.player);
+
+          session.currentTrack = track;
+          session.isPlaying = true;
+          session.isPaused = false;
+          session.isSeeking = false;
+          session.seekOffsetSec = 0;
+
+          const embed = buildNowPlayingEmbed(track, false);
+          await loadingMsg.edit({
+            content: null,
+            embeds: [embed],
+            components: [buildMusicControlRow(false)],
+          });
+
+          try {
+            const resource = await track.createStream(0);
+            session.currentResource = resource;
+            session.player.play(resource);
+          } catch (streamErr) {
+            logger.error({ streamErr, track: track.title }, "Failed to start track stream");
+            if (textChannel && "send" in textChannel) {
+              await (textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(streamErr as Error).message || "Stream error"}`).catch(() => {});
+            }
+            if (session.queue.length > 0) {
+              const next = session.queue.shift()!;
+              await MusicService.playTrackInSession(session, next);
+            }
+          }
+        }
       }
-    });
+    } catch (err) {
+      logger.error({ err, queryOrUrl }, "Error in playFromMessage");
+      await loadingMsg.edit(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
+    }
   }
 
   public static async stopFromMessage(message: Message): Promise<void> {
