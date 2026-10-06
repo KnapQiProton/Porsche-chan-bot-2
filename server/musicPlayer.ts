@@ -23,6 +23,9 @@ import {
   Message,
   TextBasedChannel,
   VoiceBasedChannel,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  StringSelectMenuInteraction
 } from "discord.js";
 import { spawn, spawnSync } from "child_process";
 import fs from "fs";
@@ -2480,6 +2483,45 @@ export function buildMusicControlRow(isPaused: boolean = false, disabled: boolea
   return new ActionRowBuilder<ButtonBuilder>().addComponents(rewindBtn, pauseResumeBtn, forwardBtn, skipBtn, stopBtn);
 }
 
+
+export function buildMusicComponents(session: GuildSession): ActionRowBuilder<any>[] {
+  const controlRow = buildMusicControlRow(session.isPaused, false);
+  const rows: ActionRowBuilder<any>[] = [controlRow];
+
+  if (session.queue.length > 0) {
+    const shuffleBtn = new ButtonBuilder()
+      .setCustomId("music_shuffle")
+      .setLabel("Acak Antrean")
+      .setEmoji("🔀")
+      .setStyle(ButtonStyle.Primary);
+      
+    const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(shuffleBtn);
+    rows.push(actionRow);
+
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId("music_jump")
+      .setPlaceholder("Pilih lagu untuk diputar selanjutnya...");
+
+    const maxOptions = Math.min(25, session.queue.length);
+    for (let i = 0; i < maxOptions; i++) {
+      const track = session.queue[i];
+      const title = track.title.length > 50 ? track.title.substring(0, 47) + "..." : track.title;
+      const artist = track.artist ? (track.artist.length > 50 ? track.artist.substring(0, 47) + "..." : track.artist) : "Unknown";
+      selectMenu.addOptions(
+        new StringSelectMenuOptionBuilder()
+          .setLabel(`${i + 1}. ${title}`)
+          .setDescription(artist)
+          .setValue(`jump_${i}`)
+      );
+    }
+    
+    const menuRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
+    rows.push(menuRow);
+  }
+
+  return rows;
+}
+
 // Build Aesthetic Music Queue Embed
 export function buildQueueEmbed(session: GuildSession): EmbedBuilder {
   const current = session.currentTrack;
@@ -2745,7 +2787,7 @@ export class MusicService {
       const embed = buildNowPlayingEmbed(track, false);
       await MusicService.sendOrReplacePreview(session, {
         embeds: [embed],
-        components: [buildMusicControlRow(false)],
+        components: buildMusicComponents(session),
       });
     } catch (err) {
       logger.error({ err, track: track.title }, "Failed to stream audio resource");
@@ -2822,7 +2864,7 @@ export class MusicService {
           await MusicService.deletePreviewMessage(session);
           await interaction.editReply({
             embeds: [embed],
-            components: [buildMusicControlRow(false)],
+            components: buildMusicComponents(session),
           });
           session.previewMessage = await interaction.fetchReply().catch(() => null);
 
@@ -2867,7 +2909,7 @@ export class MusicService {
           await MusicService.deletePreviewMessage(session);
           await interaction.editReply({
             embeds: [embed],
-            components: [buildMusicControlRow(false)],
+            components: buildMusicComponents(session),
           });
           session.previewMessage = await interaction.fetchReply().catch(() => null);
 
@@ -3042,6 +3084,60 @@ export class MusicService {
     });
   }
 
+  
+  public static async handleSelectMenuInteraction(interaction: StringSelectMenuInteraction): Promise<void> {
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.reply({ content: "❌ Menu ini hanya dapat digunakan di dalam server.", ephemeral: true });
+      return;
+    }
+
+    const member = interaction.member as GuildMember | null;
+    const voiceChannel = member?.voice?.channel;
+    if (!voiceChannel) {
+      await interaction.reply({
+        content: "❌ Kamu harus berada di voice channel untuk mengontrol musik! (๑•́ ₃ •̀๑)",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const session = sessions.get(guild.id);
+    if (!session || (!session.isPlaying && !session.currentTrack)) {
+      await interaction.reply({
+        content: "❌ Tidak ada musik yang sedang aktif diputar saat ini~ (๑•́ ₃ •̀๑)",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const customId = interaction.customId;
+
+    if (customId === "music_jump") {
+      const value = interaction.values[0]; // e.g. "jump_3"
+      if (!value.startsWith("jump_")) return;
+      const index = parseInt(value.replace("jump_", ""), 10);
+      if (isNaN(index) || index < 0 || index >= session.queue.length) {
+        await interaction.reply({ content: "❌ Lagu yang dipilih tidak valid atau antrean sudah berubah~ (๑•́ ₃ •̀๑)", ephemeral: true });
+        return;
+      }
+
+      // Remove songs before the selected index, so the selected song is next
+      const targetTrack = session.queue[index];
+      session.queue = session.queue.slice(index);
+      
+      MusicService.cleanupSessionProcesses(session);
+      session.player.stop(true); // Stop current track, will trigger Idle event and play the next (targetTrack)
+
+      await interaction.update({ components: buildMusicComponents(session) }).catch(() => {});
+      await interaction.followUp({
+        content: `⏭️ Melompat ke lagu **${targetTrack.title}** oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
+        ephemeral: true,
+      });
+      return;
+    }
+  }
+
   public static async handleButtonInteraction(interaction: ButtonInteraction): Promise<void> {
     const guild = interaction.guild;
     if (!guild) {
@@ -3081,11 +3177,32 @@ export class MusicService {
     }
 
     // 1. Pause / Resume Toggle
+    
+    if (customId === "music_shuffle") {
+      if (session.queue.length > 1) {
+        for (let i = session.queue.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [session.queue[i], session.queue[j]] = [session.queue[j], session.queue[i]];
+        }
+        await interaction.update({ components: buildMusicComponents(session) }).catch(() => {});
+        const shuffleMsg = await interaction.followUp({
+          content: `🔀 Antrean musik telah diacak oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
+          ephemeral: true,
+        });
+      } else {
+        await interaction.reply({
+          content: "❌ Antrean terlalu pendek untuk diacak~ (๑•́ ₃ •̀๑)",
+          ephemeral: true,
+        });
+      }
+      return;
+    }
+
     if (customId === "music_pause_resume") {
       if (session.isPaused) {
         session.player.unpause();
         session.isPaused = false;
-        await interaction.update({ components: [buildMusicControlRow(false)] }).catch(() => {});
+        await interaction.update({ components: buildMusicComponents(session) }).catch(() => {});
 const followMsg = await interaction.followUp({
           content: `▶️ Musik dilanjutkan oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
         });
@@ -3093,7 +3210,7 @@ const followMsg = await interaction.followUp({
       } else {
         session.player.pause();
         session.isPaused = true;
-        await interaction.update({ components: [buildMusicControlRow(true)] }).catch(() => {});
+        await interaction.update({ components: buildMusicComponents(session) }).catch(() => {});
         const pauseMsg = await interaction.followUp({
           content: `⏸️ Musik dijeda oleh **${interaction.user.displayName || interaction.user.username}**! (◡ ω ◡)`,
         });
@@ -3247,7 +3364,7 @@ const followMsg = await interaction.followUp({
           await loadingMsg.edit({
             content: null,
             embeds: [embed],
-            components: [buildMusicControlRow(false)],
+            components: buildMusicComponents(session),
           });
           session.previewMessage = loadingMsg;
           setTimeout(() => message.delete().catch(() => {}), 3_000);
@@ -3294,7 +3411,7 @@ const followMsg = await interaction.followUp({
           await loadingMsg.edit({
             content: null,
             embeds: [embed],
-            components: [buildMusicControlRow(false)],
+            components: buildMusicComponents(session),
           });
           session.previewMessage = loadingMsg;
           setTimeout(() => message.delete().catch(() => {}), 3_000);
@@ -3533,7 +3650,7 @@ const followMsg = await interaction.followUp({
 
     const embed = buildNowPlayingEmbed(track, false, currentPos);
     await MusicService.deletePreviewMessage(session);
-    await interaction.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
+    await interaction.reply({ embeds: [embed], components: buildMusicComponents(session) });
     session.previewMessage = await interaction.fetchReply().catch(() => null);
   }
 
@@ -3603,7 +3720,7 @@ const followMsg = await interaction.followUp({
 
     const embed = buildNowPlayingEmbed(track, false, currentPos);
     await MusicService.deletePreviewMessage(session);
-    const npMsg = await message.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
+    const npMsg = await message.reply({ embeds: [embed], components: buildMusicComponents(session) });
     session.previewMessage = npMsg;
     setTimeout(() => message.delete().catch(() => {}), 3_000);
   }

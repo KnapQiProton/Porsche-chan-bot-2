@@ -2865,6 +2865,14 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     }
   }
 
+  
+  if (interaction.isStringSelectMenu()) {
+    if (interaction.customId === "music_jump") {
+      await MusicService.handleSelectMenuInteraction(interaction);
+      return;
+    }
+  }
+
   if (!interaction.isChatInputCommand()) return;
   try {
     await handleSlashCommand(interaction);
