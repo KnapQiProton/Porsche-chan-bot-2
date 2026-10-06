@@ -55,7 +55,7 @@ export function getYtExtractorArgs(hasCookies?: boolean): string[] {
   }
   const cookiesPresent = hasCookies !== undefined ? hasCookies : hasYouTubeCookies();
   if (cookiesPresent) {
-    return ["--extractor-args", "youtube:player_client=web,android"];
+    return ["--extractor-args", "youtube:player_client=web_creator,android,mweb,web"];
   }
   return ["--extractor-args", "youtube:player_client=web,android"];
 }
@@ -602,7 +602,7 @@ async function getYtDlpMetadata(
     const proc = spawn(ytdlpPath, [
       ...getCommonYtDlpFlags(),
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android,mweb,web",
+      "--extractor-args", "youtube:player_client=web_creator,android,mweb,web",
       "--dump-single-json",
       "--no-playlist",
       "--no-warnings",
@@ -1805,6 +1805,28 @@ export async function createAudioResourceFromYtDlp(
   // Format priority: best audio, then format 18 (360p MP4+AAC), then best
   const fmtSelector = "ba/ba*/18/b/best";
 
+  
+  // Tier 0: web_creator client (bypasses most datacenter blocks)
+  try {
+    const ytdlpArgs = [
+      ...commonFlags,
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=web_creator,mweb,android,web",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", fmtSelector,
+      "--no-playlist",
+      targetUrl,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    logger.info({ targetUrl }, "Started Tier 0 yt-dlp web_creator pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "Tier 0 web_creator pipe failed, trying Tier 1 (android client)");
+  }
+
   // Tier 1: Android client (fastest live pipe ~2-3s, direct stream to FFmpeg)
   try {
     const ytdlpArgs = [
@@ -2505,8 +2527,10 @@ export function buildMusicComponents(session: GuildSession): ActionRowBuilder<an
     const maxOptions = Math.min(25, session.queue.length);
     for (let i = 0; i < maxOptions; i++) {
       const track = session.queue[i];
-      const title = track.title.length > 50 ? track.title.substring(0, 47) + "..." : track.title;
-      const artist = track.artist ? (track.artist.length > 50 ? track.artist.substring(0, 47) + "..." : track.artist) : "Unknown";
+      const titleStr = track.title || "Lagu";
+      const title = titleStr.length > 50 ? titleStr.substring(0, 47) + "..." : titleStr;
+      const artistStr = track.artist || "Unknown";
+      const artist = artistStr.length > 50 ? artistStr.substring(0, 47) + "..." : artistStr;
       selectMenu.addOptions(
         new StringSelectMenuOptionBuilder()
           .setLabel(`${i + 1}. ${title}`)
@@ -2792,7 +2816,8 @@ export class MusicService {
     } catch (err) {
       logger.error({ err, track: track.title }, "Failed to stream audio resource");
       if (session.textChannel && "send" in session.textChannel) {
-        await (session.textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(err as Error).message}`).catch(() => {});
+        const errMsg = await (session.textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(err as Error).message}`).catch(() => null);
+        if (errMsg) setTimeout(() => errMsg.delete().catch(() => {}), 5000);
       }
       if (session.queue.length > 0) {
         const next = session.queue.shift()!;
@@ -2924,7 +2949,8 @@ export class MusicService {
             session.currentTrack = null;
             session.currentResource = null;
             if (textChannel && "send" in textChannel) {
-              await (textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(streamErr as Error).message || "Stream error"}`).catch(() => {});
+              const errMsg = await (textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(streamErr as Error).message || "Stream error"}`).catch(() => null);
+              if (errMsg) setTimeout(() => errMsg.delete().catch(() => {}), 5000);
             }
             if (session.queue.length > 0) {
               const next = session.queue.shift()!;
