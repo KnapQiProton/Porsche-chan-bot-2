@@ -3235,6 +3235,20 @@ export class MusicService {
 
     // 1. Pause / Resume Toggle
     
+    
+    if (customId === "music_queue_prev" || customId === "music_queue_next") {
+      if (customId === "music_queue_prev" && (session.queuePage || 0) > 0) {
+        session.queuePage = (session.queuePage || 0) - 1;
+      } else if (customId === "music_queue_next") {
+        const totalPages = Math.ceil(session.queue.length / 25);
+        if ((session.queuePage || 0) < totalPages - 1) {
+          session.queuePage = (session.queuePage || 0) + 1;
+        }
+      }
+      await interaction.update({ components: buildMusicComponents(session) }).catch(() => {});
+      return;
+    }
+
     if (customId === "music_shuffle") {
       if (session.queue.length > 1) {
         for (let i = session.queue.length - 1; i > 0; i--) {
