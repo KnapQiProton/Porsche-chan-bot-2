@@ -115,6 +115,7 @@ export interface GuildSession {
   isSeeking: boolean;
   seekOffsetSec: number;
   previewMessage?: Message | null;
+  queuePage?: number;
 }
 
 const sessions = new Map<string, GuildSession>();
@@ -2511,21 +2512,50 @@ export function buildMusicComponents(session: GuildSession): ActionRowBuilder<an
   const rows: ActionRowBuilder<any>[] = [controlRow];
 
   if (session.queue.length > 0) {
+    const page = session.queuePage || 0;
+    const maxItems = 25;
+    const totalPages = Math.ceil(session.queue.length / maxItems);
+    // ensure page is valid
+    const currentPage = Math.min(Math.max(0, page), Math.max(0, totalPages - 1));
+    if (session.queuePage !== currentPage) session.queuePage = currentPage;
+
+    const actionRow = new ActionRowBuilder<ButtonBuilder>();
+
     const shuffleBtn = new ButtonBuilder()
       .setCustomId("music_shuffle")
       .setLabel("Acak Antrean")
       .setEmoji("🔀")
       .setStyle(ButtonStyle.Primary);
+    actionRow.addComponents(shuffleBtn);
+
+    if (totalPages > 1) {
+      const prevBtn = new ButtonBuilder()
+        .setCustomId("music_queue_prev")
+        .setLabel("Prev")
+        .setEmoji("⬅️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(currentPage === 0);
       
-    const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(shuffleBtn);
+      const nextBtn = new ButtonBuilder()
+        .setCustomId("music_queue_next")
+        .setLabel("Next")
+        .setEmoji("➡️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(currentPage >= totalPages - 1);
+
+      actionRow.addComponents(prevBtn, nextBtn);
+    }
+      
     rows.push(actionRow);
 
     const selectMenu = new StringSelectMenuBuilder()
       .setCustomId("music_jump")
-      .setPlaceholder("Pilih lagu untuk diputar selanjutnya...");
+      .setPlaceholder(totalPages > 1 ? `Pilih lagu... (Hal. ${currentPage + 1}/${totalPages})` : "Pilih lagu untuk diputar selanjutnya...");
 
-    const maxOptions = Math.min(25, session.queue.length);
-    for (let i = 0; i < maxOptions; i++) {
+    const startIndex = currentPage * maxItems;
+    const endIndex = Math.min(startIndex + maxItems, session.queue.length);
+    
+    for (let i = startIndex; i < endIndex; i++) {
       const track = session.queue[i];
       const titleStr = track.title || "Lagu";
       const title = titleStr.length > 50 ? titleStr.substring(0, 47) + "..." : titleStr;
@@ -2719,6 +2749,7 @@ export class MusicService {
         isSeeking: false,
         seekOffsetSec: 0,
         previewMessage: null,
+        queuePage: 0,
       };
 
       player.on(AudioPlayerStatus.Idle, async () => {
