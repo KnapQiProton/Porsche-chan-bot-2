@@ -579,7 +579,12 @@ async function getYouTubeOEmbed(urlOrVideoId: string): Promise<{ title: string; 
 }
 
 // Extract full YouTube metadata via yt-dlp (preserves exact duration, title, uploader)
-async function getYtDlpMetadata(url: string, ytdlpPath: string, timeoutMs: number = 6000): Promise<{
+async function getYtDlpMetadata(
+  url: string,
+  ytdlpPath: string,
+  timeoutMs: number = 15000,
+  overrideCookieArgs?: string[]
+): Promise<{
   id: string;
   url: string;
   title: string;
@@ -588,13 +593,13 @@ async function getYtDlpMetadata(url: string, ytdlpPath: string, timeoutMs: numbe
   durationSec?: number;
   thumbnail?: string;
 } | null> {
+  const cookieArgs = overrideCookieArgs !== undefined ? overrideCookieArgs : getYtDlpCookieArgs();
   return new Promise((resolve) => {
     let resolved = false;
-    const cookieArgs = getYtDlpCookieArgs();
     const proc = spawn(ytdlpPath, [
       ...getCommonYtDlpFlags(),
       ...cookieArgs,
-      ...YT_EXTRACTOR_ARGS,
+      "--extractor-args", "youtube:player_client=android,mweb,web",
       "--dump-single-json",
       "--no-playlist",
       "--no-warnings",
@@ -670,9 +675,14 @@ export async function getYouTubeMetadata(urlOrVideoId: string, ytdlpPath?: strin
 
   // 1. Try yt-dlp first (most accurate for exact duration, title, uploader & thumbnail)
   try {
-    const ytdlpMeta = await getYtDlpMetadata(targetUrl, binPath);
+    const ytdlpMeta = await getYtDlpMetadata(targetUrl, binPath, 15000);
     if (ytdlpMeta) {
       return ytdlpMeta;
+    }
+    // Fallback: retry without cookies in case cookies are expired/blocking
+    const noCookieMeta = await getYtDlpMetadata(targetUrl, binPath, 12000, []);
+    if (noCookieMeta) {
+      return noCookieMeta;
     }
   } catch {}
 
@@ -895,16 +905,8 @@ export function getYtDlpCookieArgs(): string[] {
     } catch {}
   }
 
-  // 4. Check temporary decoded cookies file if already written
+  // 4. Check temporary decoded cookies file ONLY if env var is present
   const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
-  if (fs.existsSync(tmpCookiePath)) {
-    try {
-      const stats = fs.statSync(tmpCookiePath);
-      if (stats.size > 10) {
-        return ["--cookies", tmpCookiePath];
-      }
-    } catch {}
-  }
 
   // 5. Check environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
   const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
@@ -1111,17 +1113,22 @@ export async function createAudioResourceFromTrackUrl(trackUrl: string, seekSeco
 }
 
 // Fast extraction of direct audio URL using yt-dlp with timeout protection and optional cookies
-async function getDirectAudioUrlWithYtDlp(url: string, ytdlpPath: string, timeoutMs: number = 6000): Promise<string | null> {
+async function getDirectAudioUrlWithYtDlp(
+  url: string,
+  ytdlpPath: string,
+  timeoutMs: number = 15000,
+  overrideCookieArgs?: string[]
+): Promise<string | null> {
   return new Promise<string | null>((resolve) => {
     let resolved = false;
     let directUrl = "";
 
-    const cookieArgs = getYtDlpCookieArgs();
+    const cookieArgs = overrideCookieArgs !== undefined ? overrideCookieArgs : getYtDlpCookieArgs();
     const commonFlags = getCommonYtDlpFlags();
     const procArgs = [
       ...commonFlags,
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=web,android",
+      "--extractor-args", "youtube:player_client=android,mweb,web",
       "-g", "-f", "ba/ba*/18/b/best",
       "--no-playlist",
       "--no-warnings",
@@ -1780,7 +1787,7 @@ function tryPipedUrlStream(
   });
 }
 
-// Create AudioResource from YouTube with multi-tier streaming architecture (Piped yt-dlp -> FFmpeg -> Direct URL -> SoundCloud fallback)
+// Create AudioResource from YouTube with robust multi-tier live piped streaming architecture
 export async function createAudioResourceFromYtDlp(
   urlOrQuery: string,
   seekSeconds: number = 0,
@@ -1795,7 +1802,7 @@ export async function createAudioResourceFromYtDlp(
   // Format priority: best audio, then format 18 (360p MP4+AAC), then best
   const fmtSelector = "ba/ba*/18/b/best";
 
-  // Tier 1: Android client (fastest extraction ~3s, no n-sig JS challenge needed)
+  // Tier 1: Android client (fastest live pipe ~2-3s, direct stream to FFmpeg)
   try {
     const ytdlpArgs = [
       ...commonFlags,
@@ -1813,10 +1820,31 @@ export async function createAudioResourceFromYtDlp(
     logger.info({ targetUrl }, "Started Tier 1 yt-dlp android pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 1 android pipe failed, trying Tier 2 (web,android client)");
+    logger.warn({ err: (err as Error).message }, "Tier 1 android pipe failed, trying Tier 2 (mweb client)");
   }
 
-  // Tier 2: web,android client (Node.js n-sig challenge solving, more formats but slower ~8-9s)
+  // Tier 2: Mobile Web (mweb) client (resilient against bot blocks on datacenter IPs)
+  try {
+    const ytdlpArgs = [
+      ...commonFlags,
+      ...cookieArgs,
+      "--extractor-args", "youtube:player_client=mweb",
+      "-q",
+      "--no-warnings",
+      "--no-progress",
+      "-o", "-",
+      "-f", fmtSelector,
+      "--no-playlist",
+      targetUrl,
+    ];
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+    logger.info({ targetUrl }, "Started Tier 2 yt-dlp mweb pipe stream");
+    return resource;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "Tier 2 mweb pipe failed, trying Tier 3 (web,android client)");
+  }
+
+  // Tier 3: web,android client (with Node.js n-sig challenge solver)
   try {
     const ytdlpArgs = [
       ...commonFlags,
@@ -1830,24 +1858,104 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       targetUrl,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 20000);
-    logger.info({ targetUrl }, "Started Tier 2 yt-dlp web,android pipe stream");
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 22000);
+    logger.info({ targetUrl }, "Started Tier 3 yt-dlp web,android pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 2 web,android pipe failed, trying Tier 3 direct audio URL");
+    logger.warn({ err: (err as Error).message }, "Tier 3 web,android pipe failed");
   }
 
-  // Tier 3: Direct HTTPS audio URL extracted by yt-dlp
+  // If cookies were provided and failed, RETRY WITHOUT COOKIES! (expired/rotated cookies often cause 403 on YouTube)
+  if (cookieArgs.length > 0) {
+    logger.warn({ targetUrl }, "Cookie-based streaming failed; attempting fallback WITHOUT cookies");
+
+    // Tier 4: Android client WITHOUT cookies
+    try {
+      const ytdlpArgs = [
+        ...commonFlags,
+        "--extractor-args", "youtube:player_client=android",
+        "-q",
+        "--no-warnings",
+        "--no-progress",
+        "-o", "-",
+        "-f", fmtSelector,
+        "--no-playlist",
+        targetUrl,
+      ];
+      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+      logger.info({ targetUrl }, "Started Tier 4 (no-cookie android) stream");
+      return resource;
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, "Tier 4 (no-cookie android) pipe failed");
+    }
+
+    // Tier 5: mweb client WITHOUT cookies
+    try {
+      const ytdlpArgs = [
+        ...commonFlags,
+        "--extractor-args", "youtube:player_client=mweb",
+        "-q",
+        "--no-warnings",
+        "--no-progress",
+        "-o", "-",
+        "-f", fmtSelector,
+        "--no-playlist",
+        targetUrl,
+      ];
+      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
+      logger.info({ targetUrl }, "Started Tier 5 (no-cookie mweb) stream");
+      return resource;
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, "Tier 5 (no-cookie mweb) pipe failed");
+    }
+
+    // Tier 6: web,android client WITHOUT cookies
+    try {
+      const ytdlpArgs = [
+        ...commonFlags,
+        "--extractor-args", "youtube:player_client=web,android",
+        "-q",
+        "--no-warnings",
+        "--no-progress",
+        "-o", "-",
+        "-f", fmtSelector,
+        "--no-playlist",
+        targetUrl,
+      ];
+      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 22000);
+      logger.info({ targetUrl }, "Started Tier 6 (no-cookie web,android) stream");
+      return resource;
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, "Tier 6 (no-cookie web,android) pipe failed");
+    }
+  }
+
+  // Tier 7: Direct HTTPS audio URL extracted by yt-dlp (with cookies)
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 15000);
+    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 15000, cookieArgs);
     if (directUrl) {
-      logger.info({ targetUrl }, "Attempting Tier 3 direct HTTPS audio URL");
+      logger.info({ targetUrl }, "Attempting Tier 7 direct HTTPS audio URL");
       const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
-      logger.info({ targetUrl }, "Streaming via Tier 3 direct HTTPS audio URL");
+      logger.info({ targetUrl }, "Streaming via Tier 7 direct HTTPS audio URL");
       return resource;
     }
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 3 direct URL failed, trying Tier 4 SoundCloud fallback");
+    logger.warn({ err: (err as Error).message }, "Tier 7 direct URL failed");
+  }
+
+  // Tier 8: Direct HTTPS audio URL extracted by yt-dlp WITHOUT cookies
+  if (cookieArgs.length > 0) {
+    try {
+      const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 15000, []);
+      if (directUrl) {
+        logger.info({ targetUrl }, "Attempting Tier 8 direct HTTPS audio URL (no cookies)");
+        const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
+        logger.info({ targetUrl }, "Streaming via Tier 8 direct HTTPS audio URL (no cookies)");
+        return resource;
+      }
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, "Tier 8 direct URL (no cookies) failed");
+    }
   }
 
   if (ENABLE_SOUNDCLOUD) {
