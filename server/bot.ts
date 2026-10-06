@@ -3113,11 +3113,10 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       stayChannels.set(interaction.guild.id, voiceChannel.id);
-      const joinMsg = await interaction.reply({
+      await interaction.reply({
         content: `✅ Porsche-chan sekarang ada di **${voiceChannel.name}** dan akan STAY di sana! (๑˃ᴗ˂)ﻌ`,
-        fetchReply: true,
+        ephemeral: true,
       });
-      setTimeout(() => joinMsg.delete().catch(() => {}), 5_000);
     } catch (error) {
       safeDestroyVoiceConnection(connection);
       await interaction.reply({ content: "❌ Gagal masuk ke voice channel.", ephemeral: true });
@@ -3144,11 +3143,10 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       stayChannels.set(guild.id, targetChannel.id);
-      const stayMsg = await interaction.reply({
+      await interaction.reply({
         content: `✅ Porsche-chan sekarang stay di voice channel **${targetChannel.name}**! (๑˃ᴗ˂)ﻌ`,
-        fetchReply: true,
+        ephemeral: true,
       });
-      setTimeout(() => stayMsg.delete().catch(() => {}), 5_000);
     } catch (error) {
       safeDestroyVoiceConnection(connection);
       await interaction.reply({ content: "❌ Gagal masuk ke voice channel tersebut.", ephemeral: true });
@@ -3352,6 +3350,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
     if (!voiceChannel || !message.guild) {
       const err = await message.reply("❌ Masuk ke voice channel dulu ya! (๑•́ ₃ •̀๑)");
       setTimeout(() => err.delete().catch(() => {}), 4_000);
+      setTimeout(() => message.delete().catch(() => {}), 4_000);
       return;
     }
     const connection = joinVoiceChannel({
@@ -3363,12 +3362,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       stayChannels.set(message.guild.id, voiceChannel.id);
       const joinMsg = await message.reply(`✅ Porsche-chan sekarang ada di **${voiceChannel.name}** dan akan STAY di sana! (๑˃ᴗ˂)ﻌ`);
-      setTimeout(() => joinMsg.delete().catch(() => {}), 5_000);
-      setTimeout(() => message.delete().catch(() => {}), 5_000);
+      setTimeout(() => joinMsg.delete().catch(() => {}), 4_000);
+      setTimeout(() => message.delete().catch(() => {}), 4_000);
     } catch {
       safeDestroyVoiceConnection(connection);
       const err = await message.reply("❌ Gagal masuk ke voice channel.");
       setTimeout(() => err.delete().catch(() => {}), 4_000);
+      setTimeout(() => message.delete().catch(() => {}), 4_000);
     }
     return;
   }

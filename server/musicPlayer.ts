@@ -112,6 +112,8 @@ export interface GuildSession {
   isSeeking: boolean;
   seekOffsetSec: number;
   previewMessage?: Message | null;
+  previewMessageId?: string | null;
+  previewChannelId?: string | null;
 }
 
 const sessions = new Map<string, GuildSession>();
@@ -579,12 +581,7 @@ async function getYouTubeOEmbed(urlOrVideoId: string): Promise<{ title: string; 
 }
 
 // Extract full YouTube metadata via yt-dlp (preserves exact duration, title, uploader)
-async function getYtDlpMetadata(
-  url: string,
-  ytdlpPath: string,
-  timeoutMs: number = 15000,
-  overrideCookieArgs?: string[]
-): Promise<{
+async function getYtDlpMetadata(url: string, ytdlpPath: string, timeoutMs: number = 6000): Promise<{
   id: string;
   url: string;
   title: string;
@@ -593,13 +590,13 @@ async function getYtDlpMetadata(
   durationSec?: number;
   thumbnail?: string;
 } | null> {
-  const cookieArgs = overrideCookieArgs !== undefined ? overrideCookieArgs : getYtDlpCookieArgs();
   return new Promise((resolve) => {
     let resolved = false;
+    const cookieArgs = getYtDlpCookieArgs();
     const proc = spawn(ytdlpPath, [
       ...getCommonYtDlpFlags(),
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android,mweb,web",
+      ...YT_EXTRACTOR_ARGS,
       "--dump-single-json",
       "--no-playlist",
       "--no-warnings",
@@ -675,14 +672,9 @@ export async function getYouTubeMetadata(urlOrVideoId: string, ytdlpPath?: strin
 
   // 1. Try yt-dlp first (most accurate for exact duration, title, uploader & thumbnail)
   try {
-    const ytdlpMeta = await getYtDlpMetadata(targetUrl, binPath, 15000);
+    const ytdlpMeta = await getYtDlpMetadata(targetUrl, binPath);
     if (ytdlpMeta) {
       return ytdlpMeta;
-    }
-    // Fallback: retry without cookies in case cookies are expired/blocking
-    const noCookieMeta = await getYtDlpMetadata(targetUrl, binPath, 12000, []);
-    if (noCookieMeta) {
-      return noCookieMeta;
     }
   } catch {}
 
@@ -905,8 +897,16 @@ export function getYtDlpCookieArgs(): string[] {
     } catch {}
   }
 
-  // 4. Check temporary decoded cookies file ONLY if env var is present
+  // 4. Check temporary decoded cookies file if already written
   const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
+  if (fs.existsSync(tmpCookiePath)) {
+    try {
+      const stats = fs.statSync(tmpCookiePath);
+      if (stats.size > 10) {
+        return ["--cookies", tmpCookiePath];
+      }
+    } catch {}
+  }
 
   // 5. Check environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
   const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
@@ -1113,22 +1113,17 @@ export async function createAudioResourceFromTrackUrl(trackUrl: string, seekSeco
 }
 
 // Fast extraction of direct audio URL using yt-dlp with timeout protection and optional cookies
-async function getDirectAudioUrlWithYtDlp(
-  url: string,
-  ytdlpPath: string,
-  timeoutMs: number = 15000,
-  overrideCookieArgs?: string[]
-): Promise<string | null> {
+async function getDirectAudioUrlWithYtDlp(url: string, ytdlpPath: string, timeoutMs: number = 6000): Promise<string | null> {
   return new Promise<string | null>((resolve) => {
     let resolved = false;
     let directUrl = "";
 
-    const cookieArgs = overrideCookieArgs !== undefined ? overrideCookieArgs : getYtDlpCookieArgs();
+    const cookieArgs = getYtDlpCookieArgs();
     const commonFlags = getCommonYtDlpFlags();
     const procArgs = [
       ...commonFlags,
       ...cookieArgs,
-      "--extractor-args", "youtube:player_client=android,mweb,web",
+      "--extractor-args", "youtube:player_client=web,android",
       "-g", "-f", "ba/ba*/18/b/best",
       "--no-playlist",
       "--no-warnings",
@@ -1787,7 +1782,7 @@ function tryPipedUrlStream(
   });
 }
 
-// Create AudioResource from YouTube with robust multi-tier live piped streaming architecture
+// Create AudioResource from YouTube with multi-tier streaming architecture (Piped yt-dlp -> FFmpeg -> Direct URL -> SoundCloud fallback)
 export async function createAudioResourceFromYtDlp(
   urlOrQuery: string,
   seekSeconds: number = 0,
@@ -1802,7 +1797,7 @@ export async function createAudioResourceFromYtDlp(
   // Format priority: best audio, then format 18 (360p MP4+AAC), then best
   const fmtSelector = "ba/ba*/18/b/best";
 
-  // Tier 1: Android client (fastest live pipe ~2-3s, direct stream to FFmpeg)
+  // Tier 1: Android client (fastest extraction ~3s, no n-sig JS challenge needed)
   try {
     const ytdlpArgs = [
       ...commonFlags,
@@ -1820,31 +1815,10 @@ export async function createAudioResourceFromYtDlp(
     logger.info({ targetUrl }, "Started Tier 1 yt-dlp android pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 1 android pipe failed, trying Tier 2 (mweb client)");
+    logger.warn({ err: (err as Error).message }, "Tier 1 android pipe failed, trying Tier 2 (web,android client)");
   }
 
-  // Tier 2: Mobile Web (mweb) client (resilient against bot blocks on datacenter IPs)
-  try {
-    const ytdlpArgs = [
-      ...commonFlags,
-      ...cookieArgs,
-      "--extractor-args", "youtube:player_client=mweb",
-      "-q",
-      "--no-warnings",
-      "--no-progress",
-      "-o", "-",
-      "-f", fmtSelector,
-      "--no-playlist",
-      targetUrl,
-    ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
-    logger.info({ targetUrl }, "Started Tier 2 yt-dlp mweb pipe stream");
-    return resource;
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 2 mweb pipe failed, trying Tier 3 (web,android client)");
-  }
-
-  // Tier 3: web,android client (with Node.js n-sig challenge solver)
+  // Tier 2: web,android client (Node.js n-sig challenge solving, more formats but slower ~8-9s)
   try {
     const ytdlpArgs = [
       ...commonFlags,
@@ -1858,104 +1832,24 @@ export async function createAudioResourceFromYtDlp(
       "--no-playlist",
       targetUrl,
     ];
-    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 22000);
-    logger.info({ targetUrl }, "Started Tier 3 yt-dlp web,android pipe stream");
+    const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 20000);
+    logger.info({ targetUrl }, "Started Tier 2 yt-dlp web,android pipe stream");
     return resource;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 3 web,android pipe failed");
+    logger.warn({ err: (err as Error).message }, "Tier 2 web,android pipe failed, trying Tier 3 direct audio URL");
   }
 
-  // If cookies were provided and failed, RETRY WITHOUT COOKIES! (expired/rotated cookies often cause 403 on YouTube)
-  if (cookieArgs.length > 0) {
-    logger.warn({ targetUrl }, "Cookie-based streaming failed; attempting fallback WITHOUT cookies");
-
-    // Tier 4: Android client WITHOUT cookies
-    try {
-      const ytdlpArgs = [
-        ...commonFlags,
-        "--extractor-args", "youtube:player_client=android",
-        "-q",
-        "--no-warnings",
-        "--no-progress",
-        "-o", "-",
-        "-f", fmtSelector,
-        "--no-playlist",
-        targetUrl,
-      ];
-      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
-      logger.info({ targetUrl }, "Started Tier 4 (no-cookie android) stream");
-      return resource;
-    } catch (err) {
-      logger.warn({ err: (err as Error).message }, "Tier 4 (no-cookie android) pipe failed");
-    }
-
-    // Tier 5: mweb client WITHOUT cookies
-    try {
-      const ytdlpArgs = [
-        ...commonFlags,
-        "--extractor-args", "youtube:player_client=mweb",
-        "-q",
-        "--no-warnings",
-        "--no-progress",
-        "-o", "-",
-        "-f", fmtSelector,
-        "--no-playlist",
-        targetUrl,
-      ];
-      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 15000);
-      logger.info({ targetUrl }, "Started Tier 5 (no-cookie mweb) stream");
-      return resource;
-    } catch (err) {
-      logger.warn({ err: (err as Error).message }, "Tier 5 (no-cookie mweb) pipe failed");
-    }
-
-    // Tier 6: web,android client WITHOUT cookies
-    try {
-      const ytdlpArgs = [
-        ...commonFlags,
-        "--extractor-args", "youtube:player_client=web,android",
-        "-q",
-        "--no-warnings",
-        "--no-progress",
-        "-o", "-",
-        "-f", fmtSelector,
-        "--no-playlist",
-        targetUrl,
-      ];
-      const resource = await tryPipedStream(ytdlpPath, ytdlpArgs, seekSeconds, 22000);
-      logger.info({ targetUrl }, "Started Tier 6 (no-cookie web,android) stream");
-      return resource;
-    } catch (err) {
-      logger.warn({ err: (err as Error).message }, "Tier 6 (no-cookie web,android) pipe failed");
-    }
-  }
-
-  // Tier 7: Direct HTTPS audio URL extracted by yt-dlp (with cookies)
+  // Tier 3: Direct HTTPS audio URL extracted by yt-dlp
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 15000, cookieArgs);
+    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 15000);
     if (directUrl) {
-      logger.info({ targetUrl }, "Attempting Tier 7 direct HTTPS audio URL");
+      logger.info({ targetUrl }, "Attempting Tier 3 direct HTTPS audio URL");
       const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
-      logger.info({ targetUrl }, "Streaming via Tier 7 direct HTTPS audio URL");
+      logger.info({ targetUrl }, "Streaming via Tier 3 direct HTTPS audio URL");
       return resource;
     }
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 7 direct URL failed");
-  }
-
-  // Tier 8: Direct HTTPS audio URL extracted by yt-dlp WITHOUT cookies
-  if (cookieArgs.length > 0) {
-    try {
-      const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 15000, []);
-      if (directUrl) {
-        logger.info({ targetUrl }, "Attempting Tier 8 direct HTTPS audio URL (no cookies)");
-        const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
-        logger.info({ targetUrl }, "Streaming via Tier 8 direct HTTPS audio URL (no cookies)");
-        return resource;
-      }
-    } catch (err) {
-      logger.warn({ err: (err as Error).message }, "Tier 8 direct URL (no cookies) failed");
-    }
+    logger.warn({ err: (err as Error).message }, "Tier 3 direct URL failed, trying Tier 4 SoundCloud fallback");
   }
 
   if (ENABLE_SOUNDCLOUD) {
@@ -2537,11 +2431,20 @@ export class MusicService {
   }
 
   public static async deletePreviewMessage(session?: GuildSession | null): Promise<void> {
-    if (!session || !session.previewMessage) return;
-    try {
-      await session.previewMessage.delete().catch(() => {});
-    } catch {}
-    session.previewMessage = null;
+    if (!session) return;
+    if (session.previewMessage) {
+      try {
+        await session.previewMessage.delete().catch(() => {});
+      } catch {}
+      session.previewMessage = null;
+    }
+    if (session.previewMessageId && session.textChannel && "messages" in session.textChannel) {
+      try {
+        const msg = await (session.textChannel as any).messages.fetch(session.previewMessageId).catch(() => null);
+        if (msg) await msg.delete().catch(() => {});
+      } catch {}
+      session.previewMessageId = null;
+    }
   }
 
   public static async setPreviewMessage(session: GuildSession, newMessage: Message | null): Promise<void> {
@@ -2549,17 +2452,38 @@ export class MusicService {
       await MusicService.deletePreviewMessage(session);
     }
     session.previewMessage = newMessage;
+    if (newMessage) {
+      session.previewMessageId = newMessage.id;
+      session.previewChannelId = newMessage.channelId;
+    }
   }
 
   public static async sendOrReplacePreview(
     session: GuildSession,
     payload: { embeds: EmbedBuilder[]; components?: ActionRowBuilder<ButtonBuilder>[] }
   ): Promise<Message | null> {
+    // 1. If an existing preview message exists in the channel and is editable, edit it in place!
+    if (session.previewMessage && session.textChannel && session.previewMessage.channelId === session.textChannel.id) {
+      try {
+        await session.previewMessage.edit(payload);
+        return session.previewMessage;
+      } catch {
+        // Edit failed (e.g. message deleted or interaction expired), fallback to delete & recreate
+      }
+    }
+
+    // 2. Otherwise cleanly delete any previous preview message
     await MusicService.deletePreviewMessage(session);
+
+    // 3. Send a new preview card and track it
     if (session.textChannel && "send" in session.textChannel) {
       try {
         const msg = await (session.textChannel as any).send(payload).catch(() => null);
         session.previewMessage = msg;
+        if (msg) {
+          session.previewMessageId = msg.id;
+          session.previewChannelId = msg.channelId;
+        }
         return msg;
       } catch (err) {
         logger.warn({ err }, "Failed to send music preview message");
@@ -2670,7 +2594,7 @@ export class MusicService {
         }
       });
 
-      player.on("error", (error) => {
+      player.on("error", async (error) => {
         MusicService.cleanupSessionProcesses(session);
         logger.error({ guildId: guild.id, error }, "Audio player error encountered");
         if (session!.isSeeking) {
@@ -2686,7 +2610,7 @@ export class MusicService {
           const nextTrack = session!.queue.shift()!;
           MusicService.playTrackInSession(session!, nextTrack).catch(() => {});
         } else {
-          MusicService.deletePreviewMessage(session).catch(() => {});
+          await MusicService.deletePreviewMessage(session);
         }
       });
 
@@ -2813,12 +2737,14 @@ export class MusicService {
           session.seekOffsetSec = 0;
 
           const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, false);
-          await MusicService.deletePreviewMessage(session);
-          await interaction.editReply({
+          await interaction.editReply({ content: `🎶 Memulai playlist **${musicResult.playlistTitle || "Playlist"}** (${musicResult.tracks.length} lagu)... (๑˃ᴗ˂)ﻌ` });
+          const noticeMsg = await interaction.fetchReply().catch(() => null);
+          if (noticeMsg) setTimeout(() => noticeMsg.delete().catch(() => {}), 4_000);
+
+          await MusicService.sendOrReplacePreview(session, {
             embeds: [embed],
             components: [buildMusicControlRow(false)],
           });
-          session.previewMessage = await interaction.fetchReply().catch(() => null);
 
           try {
             const resource = await firstTrack.createStream(0);
@@ -2858,12 +2784,14 @@ export class MusicService {
           session.seekOffsetSec = 0;
 
           const embed = buildNowPlayingEmbed(track, false);
-          await MusicService.deletePreviewMessage(session);
-          await interaction.editReply({
+          await interaction.editReply({ content: `🎶 Memutar **${track.title}** (๑˃ᴗ˂)ﻌ` });
+          const noticeMsg = await interaction.fetchReply().catch(() => null);
+          if (noticeMsg) setTimeout(() => noticeMsg.delete().catch(() => {}), 4_000);
+
+          await MusicService.sendOrReplacePreview(session, {
             embeds: [embed],
             components: [buildMusicControlRow(false)],
           });
-          session.previewMessage = await interaction.fetchReply().catch(() => null);
 
           try {
             const resource = await track.createStream(0);
@@ -2926,11 +2854,10 @@ export class MusicService {
     session.player.stop(true);
 
     await MusicService.deletePreviewMessage(session);
-    const stopMsg = await interaction.reply({
+    await interaction.reply({
       content: "⏹️ Musik telah dihentikan dan antrean dibersihkan! (◡ ω ◡)",
-      fetchReply: true,
+      ephemeral: true,
     });
-    setTimeout(() => stopMsg.delete().catch(() => {}), 4_000);
   }
 
   public static async handlePause(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -2962,9 +2889,10 @@ export class MusicService {
 
     session.player.pause();
     session.isPaused = true;
-    await interaction.reply({ content: `⏸️ Musik dijeda oleh **${interaction.user.displayName || interaction.user.username}**! (◡ ω ◡)` });
-      const pauseMsg = await interaction.fetchReply();
-      setTimeout(() => pauseMsg.delete().catch(() => {}), 5_000);
+    await interaction.reply({
+      content: `⏸️ Musik dijeda oleh **${interaction.user.displayName || interaction.user.username}**! (◡ ω ◡)`,
+      ephemeral: true,
+    });
   }
 
   public static async handleResume(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -2996,9 +2924,10 @@ export class MusicService {
 
     session.player.unpause();
     session.isPaused = false;
-    await interaction.reply({ content: `▶️ Musik dilanjutkan oleh **${interaction.user.displayName || interaction.user.username}**! (o´∀\`o)` });
-      const resumeMsg = await interaction.fetchReply();
-      setTimeout(() => resumeMsg.delete().catch(() => {}), 5_000);
+    await interaction.reply({
+      content: `▶️ Musik dilanjutkan oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
+      ephemeral: true,
+    });
   }
 
   public static async handleSeekCommand(interaction: ChatInputCommandInteraction, deltaSec: number): Promise<void> {
@@ -3028,7 +2957,7 @@ export class MusicService {
     const totalSec = session.currentTrack.durationSec || 300;
     const targetPos = Math.max(0, Math.min(totalSec - 2, currentPos + deltaSec));
 
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
     await MusicService.seekTrackInSession(session, targetPos);
     const label = deltaSec >= 0 ? `⏩ +${deltaSec}s` : `⏪ ${deltaSec}s`;
     await interaction.editReply({
@@ -3080,18 +3009,18 @@ export class MusicService {
         session.player.unpause();
         session.isPaused = false;
         await interaction.update({ components: [buildMusicControlRow(false)] }).catch(() => {});
-const followMsg = await interaction.followUp({
-          content: `▶️ Musik dilanjutkan oleh **${interaction.user.displayName || interaction.user.username}**! (o´∀\`o)`,
-        });
-        setTimeout(() => followMsg.delete().catch(() => {}), 5_000);
+        await interaction.followUp({
+          content: `▶️ Musik dilanjutkan oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
+          ephemeral: true,
+        }).catch(() => {});
       } else {
         session.player.pause();
         session.isPaused = true;
         await interaction.update({ components: [buildMusicControlRow(true)] }).catch(() => {});
-        const pauseMsg = await interaction.followUp({
+        await interaction.followUp({
           content: `⏸️ Musik dijeda oleh **${interaction.user.displayName || interaction.user.username}**! (◡ ω ◡)`,
-        });
-        setTimeout(() => pauseMsg.delete().catch(() => {}), 5_000);
+          ephemeral: true,
+        }).catch(() => {});
       }
       return;
     }
@@ -3105,8 +3034,9 @@ const followMsg = await interaction.followUp({
       await interaction.deferUpdate();
       await MusicService.seekTrackInSession(session, targetPos);
       await interaction.followUp({
-        content: `⏪ **-10s**: Posisi musik dimundurkan ke **${formatDuration(targetPos)}** oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
-      }).then(msg => { if (msg) setTimeout(() => msg.delete().catch(() => {}), 5_000); }).catch(() => {});
+        content: `⏪ **-10s**: Posisi musik dimundurkan ke **${formatDuration(targetPos)}**! (๑˃ᴗ˂)ﻌ`,
+        ephemeral: true,
+      }).catch(() => {});
       return;
     }
 
@@ -3120,8 +3050,9 @@ const followMsg = await interaction.followUp({
       await interaction.deferUpdate();
       await MusicService.seekTrackInSession(session, targetPos);
       await interaction.followUp({
-        content: `⏩ **+10s**: Posisi musik dimajukan ke **${formatDuration(targetPos)}** oleh **${interaction.user.displayName || interaction.user.username}**! (๑˃ᴗ˂)ﻌ`,
-      }).then(msg => { if (msg) setTimeout(() => msg.delete().catch(() => {}), 5_000); }).catch(() => {});
+        content: `⏩ **+10s**: Posisi musik dimajukan ke **${formatDuration(targetPos)}**! (๑˃ᴗ˂)ﻌ`,
+        ephemeral: true,
+      }).catch(() => {});
       return;
     }
 
@@ -3138,10 +3069,10 @@ const followMsg = await interaction.followUp({
 
       await MusicService.deletePreviewMessage(session);
       await interaction.deferUpdate().catch(() => {});
-      const stopMsg = await interaction.followUp({
+      await interaction.followUp({
         content: `⏹️ Musik telah dihentikan dan antrean dibersihkan oleh **${interaction.user.displayName || interaction.user.username}**! (◡ ω ◡)`,
-      }).catch(() => null);
-      if (stopMsg) setTimeout(() => stopMsg.delete().catch(() => {}), 4_000);
+        ephemeral: true,
+      }).catch(() => {});
       return;
     }
 
@@ -3237,14 +3168,13 @@ const followMsg = await interaction.followUp({
           session.seekOffsetSec = 0;
 
           const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, false);
-          await MusicService.deletePreviewMessage(session);
-          await loadingMsg.edit({
-            content: null,
+          await loadingMsg.delete().catch(() => {});
+          setTimeout(() => message.delete().catch(() => {}), 3_000);
+
+          await MusicService.sendOrReplacePreview(session, {
             embeds: [embed],
             components: [buildMusicControlRow(false)],
           });
-          session.previewMessage = loadingMsg;
-          setTimeout(() => message.delete().catch(() => {}), 3_000);
 
           try {
             const resource = await firstTrack.createStream(0);
@@ -3284,14 +3214,13 @@ const followMsg = await interaction.followUp({
           session.seekOffsetSec = 0;
 
           const embed = buildNowPlayingEmbed(track, false);
-          await MusicService.deletePreviewMessage(session);
-          await loadingMsg.edit({
-            content: null,
+          await loadingMsg.delete().catch(() => {});
+          setTimeout(() => message.delete().catch(() => {}), 3_000);
+
+          await MusicService.sendOrReplacePreview(session, {
             embeds: [embed],
             components: [buildMusicControlRow(false)],
           });
-          session.previewMessage = loadingMsg;
-          setTimeout(() => message.delete().catch(() => {}), 3_000);
 
           try {
             const resource = await track.createStream(0);
@@ -3397,7 +3326,7 @@ const followMsg = await interaction.followUp({
     }
     session.player.unpause();
     session.isPaused = false;
-    const resumeMsg = await message.reply(`▶️ Musik dilanjutkan oleh **${message.author.displayName || message.author.username}**! (o´∀\`o)`);
+    const resumeMsg = await message.reply(`▶️ Musik dilanjutkan oleh **${message.author.displayName || message.author.username}**! (๑˃ᴗ˂)ﻌ`);
     setTimeout(() => resumeMsg.delete().catch(() => {}), 5_000);
   }
 
@@ -3485,11 +3414,9 @@ const followMsg = await interaction.followUp({
 
     if (interaction.isButton()) {
       await interaction.deferUpdate().catch(() => {});
-      const follow = await interaction.followUp({ content: replyContent }).catch(() => null);
-      if (follow) setTimeout(() => follow.delete().catch(() => {}), 4_000);
+      await interaction.followUp({ content: replyContent, ephemeral: true }).catch(() => {});
     } else {
-      const rep = await interaction.reply({ content: replyContent, fetchReply: true });
-      setTimeout(() => rep.delete().catch(() => {}), 4_000);
+      await interaction.reply({ content: replyContent, ephemeral: true }).catch(() => {});
     }
   }
 
@@ -3506,7 +3433,7 @@ const followMsg = await interaction.followUp({
     }
 
     const embed = buildQueueEmbed(session);
-    await interaction.reply({ embeds: [embed] });
+    await interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
   public static async handleNowPlaying(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -3526,9 +3453,7 @@ const followMsg = await interaction.followUp({
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
 
     const embed = buildNowPlayingEmbed(track, false, currentPos);
-    await MusicService.deletePreviewMessage(session);
-    await interaction.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
-    session.previewMessage = await interaction.fetchReply().catch(() => null);
+    await interaction.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)], ephemeral: true });
   }
 
   public static async skipFromMessage(message: Message): Promise<void> {
@@ -3596,9 +3521,10 @@ const followMsg = await interaction.followUp({
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
 
     const embed = buildNowPlayingEmbed(track, false, currentPos);
-    await MusicService.deletePreviewMessage(session);
-    const npMsg = await message.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
-    session.previewMessage = npMsg;
+    await MusicService.sendOrReplacePreview(session, {
+      embeds: [embed],
+      components: [buildMusicControlRow(session.isPaused)],
+    });
     setTimeout(() => message.delete().catch(() => {}), 3_000);
   }
 }
