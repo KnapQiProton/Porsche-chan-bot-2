@@ -111,6 +111,7 @@ export interface GuildSession {
   isPaused: boolean;
   isSeeking: boolean;
   seekOffsetSec: number;
+  previewMessage?: Message | null;
 }
 
 const sessions = new Map<string, GuildSession>();
@@ -2427,6 +2428,38 @@ export class MusicService {
     return sessions.get(guildId);
   }
 
+  public static async deletePreviewMessage(session?: GuildSession | null): Promise<void> {
+    if (!session || !session.previewMessage) return;
+    try {
+      await session.previewMessage.delete().catch(() => {});
+    } catch {}
+    session.previewMessage = null;
+  }
+
+  public static async setPreviewMessage(session: GuildSession, newMessage: Message | null): Promise<void> {
+    if (session.previewMessage && session.previewMessage.id !== newMessage?.id) {
+      await MusicService.deletePreviewMessage(session);
+    }
+    session.previewMessage = newMessage;
+  }
+
+  public static async sendOrReplacePreview(
+    session: GuildSession,
+    payload: { embeds: EmbedBuilder[]; components?: ActionRowBuilder<ButtonBuilder>[] }
+  ): Promise<Message | null> {
+    await MusicService.deletePreviewMessage(session);
+    if (session.textChannel && "send" in session.textChannel) {
+      try {
+        const msg = await (session.textChannel as any).send(payload).catch(() => null);
+        session.previewMessage = msg;
+        return msg;
+      } catch (err) {
+        logger.warn({ err }, "Failed to send music preview message");
+      }
+    }
+    return null;
+  }
+
   public static cleanupSessionProcesses(session?: GuildSession | null): void {
     if (!session) return;
     if (session.currentResource && typeof (session.currentResource as any)._cleanupProcesses === "function") {
@@ -2505,6 +2538,7 @@ export class MusicService {
         isPaused: false,
         isSeeking: false,
         seekOffsetSec: 0,
+        previewMessage: null,
       };
 
       player.on(AudioPlayerStatus.Idle, async () => {
@@ -2523,6 +2557,8 @@ export class MusicService {
         if (session!.queue.length > 0) {
           const nextTrack = session!.queue.shift()!;
           await MusicService.playTrackInSession(session!, nextTrack);
+        } else {
+          await MusicService.deletePreviewMessage(session);
         }
       });
 
@@ -2541,6 +2577,8 @@ export class MusicService {
         if (session!.queue.length > 0) {
           const nextTrack = session!.queue.shift()!;
           MusicService.playTrackInSession(session!, nextTrack).catch(() => {});
+        } else {
+          MusicService.deletePreviewMessage(session).catch(() => {});
         }
       });
 
@@ -2590,13 +2628,11 @@ export class MusicService {
       session.seekOffsetSec = 0;
       session.player.play(resource);
 
-      if (session.textChannel && "send" in session.textChannel) {
-        const embed = buildNowPlayingEmbed(track, false);
-        await (session.textChannel as any).send({
-          embeds: [embed],
-          components: [buildMusicControlRow(false)],
-        }).catch(() => {});
-      }
+      const embed = buildNowPlayingEmbed(track, false);
+      await MusicService.sendOrReplacePreview(session, {
+        embeds: [embed],
+        components: [buildMusicControlRow(false)],
+      });
     } catch (err) {
       logger.error({ err, track: track.title }, "Failed to stream audio resource");
       if (session.textChannel && "send" in session.textChannel) {
@@ -2649,6 +2685,8 @@ export class MusicService {
           session.queue.push(...musicResult.tracks);
           const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, true);
           await interaction.editReply({ embeds: [embed] });
+          const noticeMsg = await interaction.fetchReply().catch(() => null);
+          if (noticeMsg) setTimeout(() => noticeMsg.delete().catch(() => {}), 7_000);
         } else {
           if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
             try {
@@ -2667,10 +2705,12 @@ export class MusicService {
           session.seekOffsetSec = 0;
 
           const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, false);
+          await MusicService.deletePreviewMessage(session);
           await interaction.editReply({
             embeds: [embed],
             components: [buildMusicControlRow(false)],
           });
+          session.previewMessage = await interaction.fetchReply().catch(() => null);
 
           try {
             const resource = await firstTrack.createStream(0);
@@ -2693,6 +2733,8 @@ export class MusicService {
           session.queue.push(track);
           const embed = buildNowPlayingEmbed(track, true);
           await interaction.editReply({ embeds: [embed] });
+          const noticeMsg = await interaction.fetchReply().catch(() => null);
+          if (noticeMsg) setTimeout(() => noticeMsg.delete().catch(() => {}), 7_000);
         } else {
           if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
             try {
@@ -2708,10 +2750,12 @@ export class MusicService {
           session.seekOffsetSec = 0;
 
           const embed = buildNowPlayingEmbed(track, false);
+          await MusicService.deletePreviewMessage(session);
           await interaction.editReply({
             embeds: [embed],
             components: [buildMusicControlRow(false)],
           });
+          session.previewMessage = await interaction.fetchReply().catch(() => null);
 
           try {
             const resource = await track.createStream(0);
@@ -2773,9 +2817,12 @@ export class MusicService {
     session.seekOffsetSec = 0;
     session.player.stop(true);
 
-    await interaction.reply({
-      content: "⏹️ Musik telah dihentikan dan antrean dibersihkan! Porsche-chan tetap stay di VC ya~ (◡ ω ◡)",
+    await MusicService.deletePreviewMessage(session);
+    const stopMsg = await interaction.reply({
+      content: "⏹️ Musik telah dihentikan dan antrean dibersihkan! (◡ ω ◡)",
+      fetchReply: true,
     });
+    setTimeout(() => stopMsg.delete().catch(() => {}), 4_000);
   }
 
   public static async handlePause(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -2981,10 +3028,12 @@ const followMsg = await interaction.followUp({
       session.seekOffsetSec = 0;
       session.player.stop(true);
 
-      await interaction.update({ components: [buildMusicControlRow(false, true)] }).catch(() => {});
-      await interaction.followUp({
+      await MusicService.deletePreviewMessage(session);
+      await interaction.deferUpdate().catch(() => {});
+      const stopMsg = await interaction.followUp({
         content: `⏹️ Musik telah dihentikan dan antrean dibersihkan oleh **${interaction.user.displayName || interaction.user.username}**! (◡ ω ◡)`,
-      }).catch(() => {});
+      }).catch(() => null);
+      if (stopMsg) setTimeout(() => stopMsg.delete().catch(() => {}), 4_000);
       return;
     }
 
@@ -3020,9 +3069,12 @@ const followMsg = await interaction.followUp({
       safeDestroyVoiceConnection(conn);
     }
 
-    await interaction.reply({
+    await MusicService.deletePreviewMessage(session);
+    const leaveMsg = await interaction.reply({
       content: "👋 Porsche-chan keluar dari voice channel. Sampai jumpa lagi~! (◡ ω ◡)",
+      fetchReply: true,
     });
+    setTimeout(() => leaveMsg.delete().catch(() => {}), 5_000);
   }
 
   public static async playFromMessage(message: Message, queryOrUrl: string, forcePlaylist: boolean = false): Promise<void> {
@@ -3057,6 +3109,8 @@ const followMsg = await interaction.followUp({
           session.queue.push(...musicResult.tracks);
           const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, true);
           await loadingMsg.edit({ content: null, embeds: [embed] });
+          setTimeout(() => loadingMsg.delete().catch(() => {}), 7_000);
+          setTimeout(() => message.delete().catch(() => {}), 7_000);
         } else {
           if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
             try {
@@ -3075,11 +3129,14 @@ const followMsg = await interaction.followUp({
           session.seekOffsetSec = 0;
 
           const embed = buildPlaylistEmbed(musicResult, message.author.displayName || message.author.username, false);
+          await MusicService.deletePreviewMessage(session);
           await loadingMsg.edit({
             content: null,
             embeds: [embed],
             components: [buildMusicControlRow(false)],
           });
+          session.previewMessage = loadingMsg;
+          setTimeout(() => message.delete().catch(() => {}), 3_000);
 
           try {
             const resource = await firstTrack.createStream(0);
@@ -3102,6 +3159,8 @@ const followMsg = await interaction.followUp({
           session.queue.push(track);
           const embed = buildNowPlayingEmbed(track, true);
           await loadingMsg.edit({ content: null, embeds: [embed] });
+          setTimeout(() => loadingMsg.delete().catch(() => {}), 7_000);
+          setTimeout(() => message.delete().catch(() => {}), 7_000);
         } else {
           if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
             try {
@@ -3117,11 +3176,14 @@ const followMsg = await interaction.followUp({
           session.seekOffsetSec = 0;
 
           const embed = buildNowPlayingEmbed(track, false);
+          await MusicService.deletePreviewMessage(session);
           await loadingMsg.edit({
             content: null,
             embeds: [embed],
             components: [buildMusicControlRow(false)],
           });
+          session.previewMessage = loadingMsg;
+          setTimeout(() => message.delete().catch(() => {}), 3_000);
 
           try {
             const resource = await track.createStream(0);
@@ -3174,7 +3236,10 @@ const followMsg = await interaction.followUp({
     session.isPaused = false;
     session.seekOffsetSec = 0;
     session.player.stop(true);
-    await message.reply("⏹️ Musik telah dihentikan dan antrean dibersihkan! Porsche-chan tetap stay di VC ya~ (◡ ω ◡)");
+    await MusicService.deletePreviewMessage(session);
+    const stopMsg = await message.reply("⏹️ Musik telah dihentikan dan antrean dibersihkan! (◡ ω ◡)");
+    setTimeout(() => stopMsg.delete().catch(() => {}), 4_000);
+    setTimeout(() => message.delete().catch(() => {}), 4_000);
   }
 
   public static async pauseFromMessage(message: Message): Promise<void> {
@@ -3248,7 +3313,9 @@ const followMsg = await interaction.followUp({
     const totalSec = session.currentTrack.durationSec || 300;
     const targetPos = Math.min(Math.max(0, totalSec - 2), currentPos + deltaSec);
     await MusicService.seekTrackInSession(session, targetPos);
-    await message.reply(`⏩ **+${deltaSec}s**: Posisi musik sekarang di **${formatDuration(targetPos)}** (๑˃ᴗ˂)ﻌ`);
+    const fwdMsg = await message.reply(`⏩ **+${deltaSec}s**: Posisi musik sekarang di **${formatDuration(targetPos)}** (๑˃ᴗ˂)ﻌ`);
+    setTimeout(() => fwdMsg.delete().catch(() => {}), 4_000);
+    setTimeout(() => message.delete().catch(() => {}), 4_000);
   }
 
   public static async rewindFromMessage(message: Message, deltaSec: number = 10): Promise<void> {
@@ -3270,7 +3337,9 @@ const followMsg = await interaction.followUp({
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
     const targetPos = Math.max(0, currentPos - deltaSec);
     await MusicService.seekTrackInSession(session, targetPos);
-    await message.reply(`⏪ **-${deltaSec}s**: Posisi musik sekarang di **${formatDuration(targetPos)}** (๑˃ᴗ˂)ﻌ`);
+    const rwdMsg = await message.reply(`⏪ **-${deltaSec}s**: Posisi musik sekarang di **${formatDuration(targetPos)}** (๑˃ᴗ˂)ﻌ`);
+    setTimeout(() => rwdMsg.delete().catch(() => {}), 4_000);
+    setTimeout(() => message.delete().catch(() => {}), 4_000);
   }
 
   public static async handleSkip(interaction: ChatInputCommandInteraction | ButtonInteraction): Promise<void> {
@@ -3296,28 +3365,23 @@ const followMsg = await interaction.followUp({
 
     MusicService.cleanupSessionProcesses(session);
     const skippedTitle = session.currentTrack?.title || "Lagu";
-    if (session.queue.length > 0) {
-      const nextTitle = session.queue[0]?.title || "Lagu Berikutnya";
-      session.isSeeking = false;
-      session.seekOffsetSec = 0;
-      session.player.stop(true);
-      const replyContent = `⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTitle}** (๑˃ᴗ˂)ﻌ`;
-      if (interaction.isButton()) {
-        await interaction.reply({ content: replyContent });
-      } else {
-        await interaction.reply({ content: replyContent });
-      }
+    const hasNext = session.queue.length > 0;
+    const nextTitle = hasNext ? session.queue[0]?.title || "Lagu Berikutnya" : "";
+    session.isSeeking = false;
+    session.seekOffsetSec = 0;
+    session.player.stop(true);
+
+    const replyContent = hasNext
+      ? `⏭️ **${skippedTitle}** di-skip oleh **${interaction.user.displayName || interaction.user.username}**! Memutar: **${nextTitle}** (๑˃ᴗ˂)ﻌ`
+      : `⏭️ **${skippedTitle}** di-skip oleh **${interaction.user.displayName || interaction.user.username}**. Antrean sudah kosong! (◡ ω ◡)`;
+
+    if (interaction.isButton()) {
+      await interaction.deferUpdate().catch(() => {});
+      const follow = await interaction.followUp({ content: replyContent }).catch(() => null);
+      if (follow) setTimeout(() => follow.delete().catch(() => {}), 4_000);
     } else {
-      session.player.stop(true);
-      session.isPlaying = false;
-      session.currentTrack = null;
-      session.currentResource = null;
-      const replyContent = `⏭️ Berhasil skip **${skippedTitle}**. Antrean sudah kosong! (◡ ω ◡)`;
-      if (interaction.isButton()) {
-        await interaction.reply({ content: replyContent });
-      } else {
-        await interaction.reply({ content: replyContent });
-      }
+      const rep = await interaction.reply({ content: replyContent, fetchReply: true });
+      setTimeout(() => rep.delete().catch(() => {}), 4_000);
     }
   }
 
@@ -3354,7 +3418,9 @@ const followMsg = await interaction.followUp({
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
 
     const embed = buildNowPlayingEmbed(track, false, currentPos);
+    await MusicService.deletePreviewMessage(session);
     await interaction.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
+    session.previewMessage = await interaction.fetchReply().catch(() => null);
   }
 
   public static async skipFromMessage(message: Message): Promise<void> {
@@ -3380,13 +3446,18 @@ const followMsg = await interaction.followUp({
       session.isSeeking = false;
       session.seekOffsetSec = 0;
       session.player.stop(true);
-      await message.reply(`⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTitle}** (๑˃ᴗ˂)ﻌ`);
+      const skipMsg = await message.reply(`⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTitle}** (๑˃ᴗ˂)ﻌ`);
+      setTimeout(() => skipMsg.delete().catch(() => {}), 4_000);
+      setTimeout(() => message.delete().catch(() => {}), 4_000);
     } else {
       session.player.stop(true);
       session.isPlaying = false;
       session.currentTrack = null;
       session.currentResource = null;
-      await message.reply(`⏭️ Berhasil skip **${skippedTitle}**. Antrean sudah kosong! (◡ ω ◡)`);
+      await MusicService.deletePreviewMessage(session);
+      const skipMsg = await message.reply(`⏭️ Berhasil skip **${skippedTitle}**. Antrean sudah kosong! (◡ ω ◡)`);
+      setTimeout(() => skipMsg.delete().catch(() => {}), 4_000);
+      setTimeout(() => message.delete().catch(() => {}), 4_000);
     }
   }
 
@@ -3417,6 +3488,9 @@ const followMsg = await interaction.followUp({
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
 
     const embed = buildNowPlayingEmbed(track, false, currentPos);
-    await message.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
+    await MusicService.deletePreviewMessage(session);
+    const npMsg = await message.reply({ embeds: [embed], components: [buildMusicControlRow(session.isPaused)] });
+    session.previewMessage = npMsg;
+    setTimeout(() => message.delete().catch(() => {}), 3_000);
   }
 }
