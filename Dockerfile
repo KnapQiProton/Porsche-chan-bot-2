@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 ENV PATH="/root/.local/bin:$PATH"
 
 # Install yt-dlp via pipx (Python-based, supports plugins and --update-to nightly)
-RUN pipx install "yt-dlp[default]"
+RUN pipx install --pip-args="--pre" "yt-dlp[default]"
 
 WORKDIR /app
 
@@ -37,7 +37,7 @@ RUN npm run build
 
 # Update yt-dlp to nightly at the END so Docker doesn't cache stale version
 # (This layer runs after source copy, so it always rebuilds on code changes)
-RUN pipx upgrade yt-dlp 2>/dev/null || pipx install --force "https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz" 2>/dev/null || true && \
+RUN pipx upgrade --pip-args="--pre" yt-dlp 2>/dev/null || true && \
     echo "yt-dlp version:" && yt-dlp --version
 
 # Runtime environment
