@@ -1817,102 +1817,57 @@ export async function createAudioResourceFromYtDlp(
     "-o", "-",
     "-f", fmtSelector,
     "--no-playlist",
-    "--no-hls-use-mpegts",
     targetUrl,
   ];
 
-  // Tier 1: Let yt-dlp nightly choose the best client automatically (fastest, most adaptive)
+  // Tier 1: Web Embedded client WITHOUT cookies (Bypasses datacenter bot-detection & SABR on Railway, pure YouTube)
   try {
-    const resource = await tryPipedStream(ytdlpPath, buildPipeArgs([]), seekSeconds, 12000);
-    logger.info({ targetUrl }, "Tier 1 (smart native) stream started");
+    const resource = await tryPipedStream(ytdlpPath, buildPipeArgs(["--extractor-args", "youtube:player_client=web_embedded"], false), seekSeconds, 10000);
+    logger.info({ targetUrl }, "Tier 1 (web_embedded no-cookies) stream started");
     return resource;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 1 (smart native) failed");
+    logger.warn({ err: (err as Error).message }, "Tier 1 (web_embedded no-cookies) failed");
   }
 
-  // Tier 2: Force web_embedded client (bypasses SABR & datacenter bot-detection via HLS)
-  try {
-    const resource = await tryPipedStream(ytdlpPath, buildPipeArgs(["--extractor-args", "youtube:player_client=web_embedded"]), seekSeconds, 15000);
-    logger.info({ targetUrl }, "Tier 2 (web_embedded) stream started");
-    return resource;
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 2 (web_embedded) failed");
-  }
-
-  // Tier 3: No-cookie retry (expired cookies often cause 403)
+  // Tier 2: Web Embedded client with cookies (if cookies provided)
   if (cookieArgs.length > 0) {
     try {
-      const resource = await tryPipedStream(ytdlpPath, buildPipeArgs([], false), seekSeconds, 12000);
-      logger.info({ targetUrl }, "Tier 3 (no-cookie native) stream started");
+      const resource = await tryPipedStream(ytdlpPath, buildPipeArgs(["--extractor-args", "youtube:player_client=web_embedded"], true), seekSeconds, 10000);
+      logger.info({ targetUrl }, "Tier 2 (web_embedded with cookies) stream started");
       return resource;
     } catch (err) {
-      logger.warn({ err: (err as Error).message }, "Tier 3 (no-cookie native) failed");
+      logger.warn({ err: (err as Error).message }, "Tier 2 (web_embedded with cookies) failed");
     }
   }
 
-  // Tier 4: Direct URL extraction -> ffmpeg (last resort)
+  // Tier 3: Android client WITHOUT cookies (Clean Android player fallback)
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000, cookieArgs);
+    const resource = await tryPipedStream(ytdlpPath, buildPipeArgs(["--extractor-args", "youtube:player_client=android"], false), seekSeconds, 10000);
+    logger.info({ targetUrl }, "Tier 3 (android no-cookies) stream started");
+    return resource;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "Tier 3 (android no-cookies) failed");
+  }
+
+  // Tier 4: Smart Native yt-dlp (Lets yt-dlp dynamically choose the best client)
+  try {
+    const resource = await tryPipedStream(ytdlpPath, buildPipeArgs([], false), seekSeconds, 10000);
+    logger.info({ targetUrl }, "Tier 4 (smart native no-cookies) stream started");
+    return resource;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "Tier 4 (smart native no-cookies) failed");
+  }
+
+  // Tier 5: Direct URL extraction -> ffmpeg (pure YouTube direct link)
+  try {
+    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000, []);
     if (directUrl) {
       const resource = await tryPipedUrlStream(directUrl, seekSeconds, 8000);
-      logger.info({ targetUrl }, "Tier 4 (direct URL) stream started");
+      logger.info({ targetUrl }, "Tier 5 (direct URL) stream started");
       return resource;
     }
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 4 (direct URL) failed");
-  }
-
-  // Tier 5: Resilient audio fallback via yt-dlp search (Bypasses YouTube datacenter bot-blocks with zero dependencies)
-  const candidatesToSearch = [
-    fallbackSearchQuery,
-    urlOrQuery,
-  ].filter(Boolean) as string[];
-
-  const cleanCandidates: string[] = [];
-  for (const raw of candidatesToSearch) {
-    const stripped = raw
-      .replace(/https?:\/\/\S+/gi, "")
-      .replace(/\b(Artis YouTube|YouTube Audio|Official Video|Official Music Video|Official Audio|Lyric Video|Full Album|Audio|Video)\b/gi, "")
-      .replace(/[|•\-_[\]()#]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (stripped && stripped.length > 2) {
-      cleanCandidates.push(stripped);
-      const words = stripped.split(" ");
-      if (words.length > 3) {
-        cleanCandidates.push(words.slice(0, 3).join(" "));
-      }
-    }
-  }
-
-  if (cleanCandidates.length === 0 && (urlOrQuery.includes("youtube.com") || urlOrQuery.includes("youtu.be"))) {
-    try {
-      const oembed = await getYouTubeOEmbed(urlOrQuery);
-      if (oembed && oembed.title) {
-        const parsed = parseTitleAndArtist(oembed.title, oembed.author);
-        cleanCandidates.push(`${parsed.title} ${parsed.artist}`.trim());
-        cleanCandidates.push(parsed.title);
-      }
-    } catch {}
-  }
-
-  for (const q of cleanCandidates) {
-    try {
-      const fallbackArgs = [
-        ...commonFlags,
-        "-q",
-        "--no-warnings",
-        "--no-progress",
-        "-o", "-",
-        "-f", "ba/bestaudio/best",
-        `scsearch1:${q}`,
-      ];
-      const resource = await tryPipedStream(ytdlpPath, fallbackArgs, seekSeconds, 10000);
-      logger.info({ query: q }, "Streaming via yt-dlp resilient search fallback");
-      return resource;
-    } catch (scErr) {
-      logger.warn({ scErr: (scErr as Error).message, query: q }, "yt-dlp fallback candidate failed");
-    }
+    logger.warn({ err: (err as Error).message }, "Tier 5 (direct URL) failed");
   }
 
   throw new Error("Gagal memutar audio dari YouTube. Pastikan link atau judul lagu valid.");
