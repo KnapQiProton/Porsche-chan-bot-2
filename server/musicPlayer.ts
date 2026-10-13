@@ -1862,68 +1862,56 @@ export async function createAudioResourceFromYtDlp(
     logger.warn({ err: (err as Error).message }, "Tier 4 (direct URL) failed");
   }
 
-  if (ENABLE_SOUNDCLOUD) {
-    // Tier 4: SoundCloud fallback audio stream
-    const candidatesToSearch = [
-      fallbackSearchQuery,
-      urlOrQuery,
-    ].filter(Boolean) as string[];
+  // Tier 5: Resilient audio fallback via yt-dlp search (Bypasses YouTube datacenter bot-blocks with zero dependencies)
+  const candidatesToSearch = [
+    fallbackSearchQuery,
+    urlOrQuery,
+  ].filter(Boolean) as string[];
 
-    const cleanCandidates: string[] = [];
-    for (const raw of candidatesToSearch) {
-      const stripped = raw
-        .replace(/https?:\/\/\S+/gi, "")
-        .replace(/\b(Artis YouTube|YouTube Audio|Official Video|Official Music Video|Official Audio|Lyric Video|Full Album|Audio|Video)\b/gi, "")
-        .replace(/[|•\-_[\]()#]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (stripped && stripped.length > 2) {
-        cleanCandidates.push(stripped);
-        const words = stripped.split(" ");
-        if (words.length > 3) {
-          cleanCandidates.push(words.slice(0, 3).join(" "));
-        }
+  const cleanCandidates: string[] = [];
+  for (const raw of candidatesToSearch) {
+    const stripped = raw
+      .replace(/https?:\/\/\S+/gi, "")
+      .replace(/\b(Artis YouTube|YouTube Audio|Official Video|Official Music Video|Official Audio|Lyric Video|Full Album|Audio|Video)\b/gi, "")
+      .replace(/[|•\-_[\]()#]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (stripped && stripped.length > 2) {
+      cleanCandidates.push(stripped);
+      const words = stripped.split(" ");
+      if (words.length > 3) {
+        cleanCandidates.push(words.slice(0, 3).join(" "));
       }
     }
+  }
 
-    if (cleanCandidates.length === 0 && (urlOrQuery.includes("youtube.com") || urlOrQuery.includes("youtu.be"))) {
-      try {
-        const oembed = await getYouTubeOEmbed(urlOrQuery);
-        if (oembed && oembed.title) {
-          const parsed = parseTitleAndArtist(oembed.title, oembed.author);
-          cleanCandidates.push(`${parsed.title} ${parsed.artist}`.trim());
-          cleanCandidates.push(parsed.title);
-        }
-      } catch {}
-    }
-
-    for (const q of cleanCandidates) {
-      try {
-        const scClientId = await playdl.getFreeClientID();
-        await playdl.setToken({ soundcloud: { client_id: scClientId } });
-        const res = await playdl.search(q, { source: { soundcloud: "tracks" }, limit: 5 });
-        if (res && res.length > 0) {
-          const scoredSc = res
-            .map((item: any, idx: number) => ({
-              item,
-              score: scoreTrackCandidate(q, "", undefined, {
-                name: item.name || item.title || "",
-                user: { name: item.user?.name || item.artist || "" },
-                durationInSec: item.durationInSec,
-              }, idx),
-            }))
-            .filter((s) => s.score >= 50)
-            .sort((a, b) => b.score - a.score);
-
-          const targetTrack = scoredSc.length > 0 ? scoredSc[0].item : res[0];
-          if (targetTrack && targetTrack.url) {
-            logger.info({ query: q, scUrl: targetTrack.url }, "Streaming via verified SoundCloud fallback");
-            return await createAudioResourceFromTrackUrl(targetTrack.url, seekSeconds);
-          }
-        }
-      } catch (scErr) {
-        logger.warn({ scErr }, "SoundCloud fallback candidate search failed");
+  if (cleanCandidates.length === 0 && (urlOrQuery.includes("youtube.com") || urlOrQuery.includes("youtu.be"))) {
+    try {
+      const oembed = await getYouTubeOEmbed(urlOrQuery);
+      if (oembed && oembed.title) {
+        const parsed = parseTitleAndArtist(oembed.title, oembed.author);
+        cleanCandidates.push(`${parsed.title} ${parsed.artist}`.trim());
+        cleanCandidates.push(parsed.title);
       }
+    } catch {}
+  }
+
+  for (const q of cleanCandidates) {
+    try {
+      const fallbackArgs = [
+        ...commonFlags,
+        "-q",
+        "--no-warnings",
+        "--no-progress",
+        "-o", "-",
+        "-f", "ba/bestaudio/best",
+        `scsearch1:${q}`,
+      ];
+      const resource = await tryPipedStream(ytdlpPath, fallbackArgs, seekSeconds, 10000);
+      logger.info({ query: q }, "Streaming via yt-dlp resilient search fallback");
+      return resource;
+    } catch (scErr) {
+      logger.warn({ scErr: (scErr as Error).message, query: q }, "yt-dlp fallback candidate failed");
     }
   }
 
