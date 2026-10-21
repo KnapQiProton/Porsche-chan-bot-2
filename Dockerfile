@@ -30,7 +30,8 @@ RUN npm install --legacy-peer-deps --include=dev
 COPY server/ ./server/
 COPY src/ ./src/
 COPY public/ ./public/
-COPY server.ts index.html ./
+COPY server.ts index.html entrypoint.sh ./
+RUN chmod +x entrypoint.sh || true
 
 # Build frontend and backend
 RUN npm run build
@@ -46,4 +47,5 @@ ENV NODE_OPTIONS="--max-old-space-size=384"
 
 EXPOSE 3000
 
+ENTRYPOINT ["./entrypoint.sh"]
 CMD ["npm", "start"]

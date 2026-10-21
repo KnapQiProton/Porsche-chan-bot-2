@@ -46,18 +46,80 @@ if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
   }
 }
 
-// Dynamic extractor arguments:
-// web_creator bypasses most datacenter bot blocks (Studio-like client)
-// android is fallback for when web_creator fails
+// Helper to extract visitor_data (VISITOR_INFO1_LIVE) from cookies or env
+export function getVisitorDataFromCookies(): string | undefined {
+  if (process.env.YOUTUBE_VISITOR_DATA && process.env.YOUTUBE_VISITOR_DATA.trim()) {
+    return process.env.YOUTUBE_VISITOR_DATA.trim();
+  }
+  if (process.env.VISITOR_DATA && process.env.VISITOR_DATA.trim()) {
+    return process.env.VISITOR_DATA.trim();
+  }
+
+  const cookieCandidates = [
+    path.join(process.cwd(), "cookies.txt"),
+    "/app/cookies.txt",
+    path.join(process.cwd(), "cookies.full.txt"),
+    path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt"),
+  ];
+
+  let rawContent = "";
+  for (const p of cookieCandidates) {
+    if (fs.existsSync(p)) {
+      try {
+        const content = fs.readFileSync(p, "utf-8");
+        if (content && content.length > 10) {
+          rawContent = content;
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  if (!rawContent) {
+    const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
+    if (envCookie && envCookie.trim()) {
+      let c = envCookie.trim();
+      if (!c.includes("\t") && !c.startsWith("#") && c.length > 50) {
+        try {
+          c = Buffer.from(c, "base64").toString("utf-8");
+        } catch {}
+      }
+      rawContent = c;
+    }
+  }
+
+  if (rawContent) {
+    const lines = rawContent.split(/\r?\n/);
+    for (const line of lines) {
+      const parts = line.trim().split("\t");
+      if (parts.length >= 7 && parts[5] === "VISITOR_INFO1_LIVE") {
+        return parts[6].trim();
+      }
+    }
+  }
+
+  return undefined;
+}
+
+// Extractor arguments with fallback chain: web,android,web_embedded
+// Prioritizes PO Token & visitor_data (from sanitized cookies or env) on web client
 export function getYtExtractorArgs(hasCookies?: boolean): string[] {
-  if (process.env.YOUTUBE_PLAYER_CLIENT && process.env.YOUTUBE_PLAYER_CLIENT.trim()) {
-    return ["--extractor-args", `youtube:player_client=${process.env.YOUTUBE_PLAYER_CLIENT.trim()}`];
+  const customClient = process.env.YOUTUBE_PLAYER_CLIENT?.trim();
+  const playerClients = customClient || "web,android,web_embedded";
+  const parts: string[] = [`player_client=${playerClients}`];
+
+  const poToken = process.env.YOUTUBE_PO_TOKEN?.trim() || process.env.PO_TOKEN?.trim();
+  const visitorData = process.env.YOUTUBE_VISITOR_DATA?.trim() || process.env.VISITOR_DATA?.trim() || getVisitorDataFromCookies();
+
+  if (poToken) {
+    const formattedToken = poToken.includes("+") ? poToken : `web+${poToken}`;
+    parts.push(`po_token=${formattedToken}`);
   }
-  const cookiesPresent = hasCookies !== undefined ? hasCookies : hasYouTubeCookies();
-  if (cookiesPresent) {
-    return ["--extractor-args", "youtube:player_client=web_creator,web_embedded,web"];
+  if (visitorData) {
+    parts.push(`visitor_data=${visitorData}`);
   }
-  return ["--extractor-args", "youtube:player_client=web_embedded,web"];
+
+  return ["--extractor-args", `youtube:${parts.join(";")}`];
 }
 
 // Common yt-dlp flags for Railway/datacenter environments
@@ -244,29 +306,79 @@ export async function getOrDownloadYtDlp(): Promise<string> {
   }
 }
 
-// Auto-update yt-dlp to nightly (latest YouTube anti-bot patches)
-let ytdlpUpdateAttempted = false;
-export async function autoUpdateYtDlp(): Promise<void> {
-  if (ytdlpUpdateAttempted) return;
-  ytdlpUpdateAttempted = true;
-  try {
-    const ytdlpPath = await getOrDownloadYtDlp();
-    logger.info("Checking yt-dlp version & updates...");
-    if (process.platform !== "win32") {
-      try {
-        spawnSync("pipx", ["upgrade", "--pip-args=--pre", "yt-dlp"], { timeout: 45_000, stdio: "ignore" });
-      } catch {}
-    }
+// Ensure yt-dlp is updated to the latest nightly version (critical for YouTube anti-bot patches)
+let ytDlpUpdatedOnce = false;
+let ytDlpUpdatingPromise: Promise<void> | null = null;
+
+export async function ensureYtDlpUpdated(): Promise<void> {
+  if (ytDlpUpdatedOnce) return;
+  if (ytDlpUpdatingPromise) return ytDlpUpdatingPromise;
+
+  ytDlpUpdatingPromise = (async () => {
+    logger.info("Checking yt-dlp version...");
+    const isWin = process.platform === "win32";
+
+    // 1. Try pipx upgrade --pip-args="--pre" yt-dlp
+    let updated = false;
     try {
-      spawnSync(ytdlpPath, ["--update-to", "nightly"], { timeout: 30_000, stdio: "ignore" });
+      const pipxRes = spawnSync("pipx", ["upgrade", "--pip-args=--pre", "yt-dlp"], {
+        timeout: 60_000,
+        stdio: "pipe",
+        encoding: "utf-8",
+      });
+      if (pipxRes.status === 0) {
+        updated = true;
+      }
     } catch {}
-    const verProc = spawnSync(ytdlpPath, ["--version"], { timeout: 5000, stdio: "pipe" });
-    const version = verProc.stdout?.toString()?.trim() || "unknown";
-    logger.info({ version }, "Active yt-dlp version for audio engine");
-  } catch (err) {
-    logger.warn({ err }, "yt-dlp version check completed");
-  }
+
+    // 2. Fallback: python3 -m pip install --upgrade --pre yt-dlp
+    if (!updated) {
+      const pyCommands = isWin ? ["python", "python3"] : ["python3", "python"];
+      for (const py of pyCommands) {
+        try {
+          const pipRes = spawnSync(py, ["-m", "pip", "install", "--upgrade", "--pre", "yt-dlp"], {
+            timeout: 60_000,
+            stdio: "pipe",
+            encoding: "utf-8",
+          });
+          if (pipRes.status === 0) {
+            updated = true;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    // 3. Fallback: yt-dlp --update-to nightly for standalone binary release
+    const ytdlpPath = await getOrDownloadYtDlp();
+    try {
+      spawnSync(ytdlpPath, ["--update-to", "nightly"], {
+        timeout: 30_000,
+        stdio: "pipe",
+      });
+    } catch {}
+
+    // 4. Determine final version and log
+    try {
+      const verProc = spawnSync(ytdlpPath, ["--version"], {
+        timeout: 5_000,
+        stdio: "pipe",
+        encoding: "utf-8",
+      });
+      const version = verProc.stdout?.trim() || "unknown";
+      logger.info({ version }, `yt-dlp updated to ${version}`);
+      ytDlpUpdatedOnce = true;
+    } catch (verErr) {
+      logger.warn({ verErr }, "Failed to inspect yt-dlp version");
+    }
+  })().finally(() => {
+    ytDlpUpdatingPromise = null;
+  });
+
+  return ytDlpUpdatingPromise;
 }
+
+export const autoUpdateYtDlp = ensureYtDlpUpdated;
 // SoundCloud Integration Toggle (temporary disable per user request)
 export const ENABLE_SOUNDCLOUD = false;
 
@@ -1615,23 +1727,52 @@ function tryPipedStream(
         ytdlpStderr += d.toString();
       });
 
+      // FFmpeg arguments optimized for raw pipe streaming (no seek flags on pipe:0)
       const ffmpegArgs: string[] = [
-        "-analyzeduration", "2000000",
-        "-probesize", "32768",
+        "-analyzeduration", "5000000",
+        "-probesize", "65536",
+        "-fflags", "+igndts",
+        "-flags", "low_delay",
         "-loglevel", "error",
+        "-i", "pipe:0",
+        "-f", "s16le",
+        "-ar", "48000",
+        "-ac", "2",
+        "pipe:1"
       ];
-      if (seekSeconds > 0) {
-        ffmpegArgs.push("-ss", seekSeconds.toString());
-      }
-      ffmpegArgs.push("-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
       ffmpeg = spawn(FFMPEG_BIN, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
     } catch (spawnErr) {
       return reject(spawnErr);
     }
 
-    ytdlp.stdout.on("error", () => {});
-    ffmpeg.stdin.on("error", () => {});
-    ffmpeg.stdout.on("error", () => {});
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      try {
+        if (ytdlp && !ytdlp.killed) ytdlp.kill("SIGKILL");
+      } catch {}
+      try {
+        if (ffmpeg && !ffmpeg.killed) ffmpeg.kill("SIGKILL");
+      } catch {}
+    };
+
+    // Catch EPIPE on stdout/stdin to prevent backpressure crashes
+    ytdlp.stdout.on("error", (err: any) => {
+      if (err?.code !== "EPIPE") {
+        logger.warn({ err }, "yt-dlp stdout error");
+      }
+    });
+    ffmpeg.stdin.on("error", (err: any) => {
+      if (err?.code !== "EPIPE") {
+        logger.warn({ err }, "ffmpeg stdin error");
+      }
+    });
+    ffmpeg.stdout.on("error", (err: any) => {
+      if (err?.code !== "EPIPE") {
+        logger.warn({ err }, "ffmpeg stdout error");
+      }
+    });
 
     let ffmpegStderr = "";
     ffmpeg.stderr.on("data", (d: Buffer) => {
@@ -1639,13 +1780,13 @@ function tryPipedStream(
     });
     ffmpeg.stderr.on("error", () => {});
 
-    ytdlp.stdout.pipe(ffmpeg.stdin);
+    // Pipe yt-dlp stdout to ffmpeg stdin without auto-ending stdin on yt-dlp restart
+    ytdlp.stdout.pipe(ffmpeg.stdin, { end: false });
 
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
-        try { ytdlp.kill("SIGKILL"); } catch {}
-        try { ffmpeg.kill("SIGKILL"); } catch {}
+        cleanup();
         reject(new Error("Piped audio stream timeout"));
       }
     }, timeoutMs);
@@ -1654,8 +1795,10 @@ function tryPipedStream(
       if (!settled) {
         settled = true;
         clearTimeout(timer);
-        try { ffmpeg.kill("SIGKILL"); } catch {}
+        cleanup();
         reject(err);
+      } else {
+        cleanup();
       }
     });
 
@@ -1663,8 +1806,10 @@ function tryPipedStream(
       if (!settled) {
         settled = true;
         clearTimeout(timer);
-        try { ytdlp.kill("SIGKILL"); } catch {}
+        cleanup();
         reject(err);
+      } else {
+        cleanup();
       }
     });
 
@@ -1672,7 +1817,7 @@ function tryPipedStream(
       if (!settled && code !== 0) {
         settled = true;
         clearTimeout(timer);
-        try { ffmpeg.kill("SIGKILL"); } catch {}
+        cleanup();
         const detail = ytdlpStderr.trim() ? `: ${ytdlpStderr.trim().slice(0, 300)}` : "";
         reject(new Error(`yt-dlp exited with error code ${code}${detail}`));
       }
@@ -1682,9 +1827,11 @@ function tryPipedStream(
       if (!settled && code !== 0) {
         settled = true;
         clearTimeout(timer);
-        try { ytdlp.kill("SIGKILL"); } catch {}
+        cleanup();
         const detail = ffmpegStderr.trim() ? `: ${ffmpegStderr.trim().slice(0, 300)}` : "";
         reject(new Error(`FFmpeg exited with error code ${code}${detail}`));
+      } else if (settled) {
+        cleanup();
       }
     });
 
@@ -1697,13 +1844,10 @@ function tryPipedStream(
         pt.write(chunk);
         ffmpeg.stdout.pipe(pt);
 
-        const cleanup = () => {
-          try { ytdlp.kill("SIGKILL"); } catch {}
-          try { ffmpeg.kill("SIGKILL"); } catch {}
-        };
         pt.on("close", cleanup);
         pt.on("end", cleanup);
         pt.on("error", cleanup);
+        pt.on("finish", cleanup);
 
         const resource = createAudioResource(pt, { inputType: StreamType.Raw });
         (resource as any)._cleanupProcesses = cleanup;
@@ -1810,6 +1954,8 @@ export async function createAudioResourceFromYtDlp(
   const buildPipeArgs = (extraArgs: string[], useCookies = true) => [
     ...commonFlags,
     ...(useCookies ? cookieArgs : []),
+    ...(FFMPEG_BIN ? ["--ffmpeg-location", FFMPEG_BIN] : []),
+    ...(seekSeconds > 0 ? ["--download-sections", `*${seekSeconds}-inf`] : []),
     ...extraArgs,
     "-q",
     "--no-warnings",
@@ -1820,30 +1966,45 @@ export async function createAudioResourceFromYtDlp(
     targetUrl,
   ];
 
-  // Tier 1: Web Embedded client WITHOUT cookies (Bypasses datacenter bot-detection & SABR on Railway, pure YouTube)
+  // Tier 1: Fallback chain (web,android,web_embedded) with cookies & PO Token (if available)
   try {
-    const resource = await tryPipedStream(ytdlpPath, buildPipeArgs(["--extractor-args", "youtube:player_client=web_embedded"], false), seekSeconds, 10000);
-    logger.info({ targetUrl }, "Tier 1 (web_embedded no-cookies) stream started");
+    const resource = await tryPipedStream(
+      ytdlpPath,
+      buildPipeArgs(getYtExtractorArgs(cookieArgs.length > 0), cookieArgs.length > 0),
+      seekSeconds,
+      12000
+    );
+    logger.info({ targetUrl, seekSeconds }, "Tier 1 (web,android,web_embedded with cookies/po_token) stream started");
     return resource;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 1 (web_embedded no-cookies) failed");
+    logger.warn({ err: (err as Error).message }, "Tier 1 (web,android,web_embedded) failed");
   }
 
-  // Tier 2: Web Embedded client with cookies (if cookies provided)
+  // Tier 2: Fallback chain (web,android,web_embedded) WITHOUT cookies
   if (cookieArgs.length > 0) {
     try {
-      const resource = await tryPipedStream(ytdlpPath, buildPipeArgs(["--extractor-args", "youtube:player_client=web_embedded"], true), seekSeconds, 10000);
-      logger.info({ targetUrl }, "Tier 2 (web_embedded with cookies) stream started");
+      const resource = await tryPipedStream(
+        ytdlpPath,
+        buildPipeArgs(getYtExtractorArgs(false), false),
+        seekSeconds,
+        12000
+      );
+      logger.info({ targetUrl, seekSeconds }, "Tier 2 (web,android,web_embedded no-cookies) stream started");
       return resource;
     } catch (err) {
-      logger.warn({ err: (err as Error).message }, "Tier 2 (web_embedded with cookies) failed");
+      logger.warn({ err: (err as Error).message }, "Tier 2 (web,android,web_embedded no-cookies) failed");
     }
   }
 
-  // Tier 3: Android client WITHOUT cookies (Clean Android player fallback)
+  // Tier 3: Android client dedicated (Clean Android player fallback)
   try {
-    const resource = await tryPipedStream(ytdlpPath, buildPipeArgs(["--extractor-args", "youtube:player_client=android"], false), seekSeconds, 10000);
-    logger.info({ targetUrl }, "Tier 3 (android no-cookies) stream started");
+    const resource = await tryPipedStream(
+      ytdlpPath,
+      buildPipeArgs(["--extractor-args", "youtube:player_client=android"], false),
+      seekSeconds,
+      10000
+    );
+    logger.info({ targetUrl, seekSeconds }, "Tier 3 (android no-cookies) stream started");
     return resource;
   } catch (err) {
     logger.warn({ err: (err as Error).message }, "Tier 3 (android no-cookies) failed");
@@ -1851,8 +2012,13 @@ export async function createAudioResourceFromYtDlp(
 
   // Tier 4: Smart Native yt-dlp (Lets yt-dlp dynamically choose the best client)
   try {
-    const resource = await tryPipedStream(ytdlpPath, buildPipeArgs([], false), seekSeconds, 10000);
-    logger.info({ targetUrl }, "Tier 4 (smart native no-cookies) stream started");
+    const resource = await tryPipedStream(
+      ytdlpPath,
+      buildPipeArgs([], false),
+      seekSeconds,
+      10000
+    );
+    logger.info({ targetUrl, seekSeconds }, "Tier 4 (smart native no-cookies) stream started");
     return resource;
   } catch (err) {
     logger.warn({ err: (err as Error).message }, "Tier 4 (smart native no-cookies) failed");
@@ -1860,10 +2026,10 @@ export async function createAudioResourceFromYtDlp(
 
   // Tier 5: Direct URL extraction -> ffmpeg (pure YouTube direct link)
   try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000, []);
+    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000, cookieArgs);
     if (directUrl) {
       const resource = await tryPipedUrlStream(directUrl, seekSeconds, 8000);
-      logger.info({ targetUrl }, "Tier 5 (direct URL) stream started");
+      logger.info({ targetUrl, seekSeconds }, "Tier 5 (direct URL) stream started");
       return resource;
     }
   } catch (err) {
@@ -2629,6 +2795,7 @@ export class MusicService {
     if (!session.currentTrack) return;
     try {
       session.isSeeking = true;
+      MusicService.cleanupSessionProcesses(session);
       const resource = await session.currentTrack.createStream(targetSec);
       session.seekOffsetSec = targetSec;
       session.currentResource = resource;

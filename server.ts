@@ -8,6 +8,7 @@ import fs from "fs";
 import cors from "cors";
 import { createServer as createViteServer } from "vite";
 import { logger, getRecentLogs } from "./server/logger";
+import { ensureYtDlpUpdated } from "./server/musicPlayer";
 import {
   startBot,
   getBotStatus,
@@ -364,6 +365,11 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   }
+
+  // Automatically ensure yt-dlp is updated to nightly version at startup
+  ensureYtDlpUpdated().catch((err) => {
+    logger.warn({ err }, "yt-dlp auto-update at startup had warnings (non-fatal)");
+  });
 
   // Attempt non-blocking startup of Discord Bot
   try {

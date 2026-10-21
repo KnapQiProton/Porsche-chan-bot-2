@@ -42,6 +42,7 @@ import {
   safeDestroyVoiceConnection,
   saveUploadedCookies,
   getCookieStatus,
+  ensureYtDlpUpdated,
   autoUpdateYtDlp,
   initSoundCloud,
   ENABLE_SOUNDCLOUD,
@@ -2671,8 +2672,8 @@ client.once(Events.ClientReady, async (c) => {
 
   logger.info({ tag: c.user.tag, guilds: c.guilds.cache.size }, "Discord bot ready and connected!");
 
-  // Initialize music subsystems (non-blocking)
-  autoUpdateYtDlp().catch((err) => logger.warn({ err }, "yt-dlp auto-update failed (non-fatal)"));
+  // Initialize music subsystems & ensure yt-dlp is nightly
+  ensureYtDlpUpdated().catch((err) => logger.warn({ err }, "yt-dlp auto-update failed (non-fatal)"));
   if (ENABLE_SOUNDCLOUD) {
     initSoundCloud().catch((err) => logger.warn({ err }, "SoundCloud init failed (non-fatal)"));
   }
