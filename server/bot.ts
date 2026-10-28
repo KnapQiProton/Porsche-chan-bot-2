@@ -71,7 +71,8 @@ export function getLoreData(): string {
     creator: "KnapQiProton",
     traits: "Tsundere, suka otomotif, pengguna Arch Linux, ahli jaringan/IT.",
     server_rules: "Dilarang spam, saling menghargai, no NSFW.",
-    terminology: "Sebut karakter orisinal sebagai 'Figure'."
+    terminology: "Sebut karakter orisinal sebagai 'Figure'.",
+    music_architecture: "Botnya pakai arsitektur Live Piped Stream: yt-dlp langsung streaming outputnya ke stdin FFmpeg, lalu FFmpeg transcode ke Raw PCM 48kHz secara real-time dan dikirim ke Discord via @discordjs/voice. Jadi nggak ada proses download file MP3 ke storage. Buat bypass blokir bot YouTube, botnya pakai multi-tier client (Android & Web client) dengan Node.js JS-challenge solver + cookie sanitizer."
   }, null, 2);
 }
 
