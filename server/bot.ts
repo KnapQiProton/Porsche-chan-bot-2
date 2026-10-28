@@ -53,6 +53,7 @@ import {
   ParsedAnimeQuery,
   BooruPostResult,
 } from "./animeTagEngine";
+import { handleYtFixCommand, handleYtFixMessage } from "./ytDiagnostics";
 
 export const CREATOR_ID = "591807486244290600";
 export const CREATOR_NAME = "KnapQi";
@@ -2633,6 +2634,14 @@ export const COMMANDS = [
     .setName("cookies-status")
     .setDescription("Cek status cookies / autentikasi YouTube untuk pemutaran musik")
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("ytfix")
+    .setDescription("Auto-Diagnose & Auto-Fix masalah pemutar YouTube (yt-dlp) di server / Pterodactyl")
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("check")
+    .setDescription("Diagnosa kesehatan YouTube engine & auto-update yt-dlp jika terblokir")
+    .toJSON(),
 ];
 
 // Discord Client
@@ -3285,6 +3294,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     await interaction.reply({ embeds: [embed], ephemeral: true });
     return;
   }
+
+  if (interaction.commandName === "ytfix" || interaction.commandName === "check") {
+    await handleYtFixCommand(interaction);
+    return;
+  }
 }
 
 // Flag reactions for translation (AI-Powered)
@@ -3449,6 +3463,11 @@ client.on(Events.MessageCreate, async (message: Message) => {
       )
       .setFooter({ text: "Gunakan /cookies untuk mengupload cookies.txt" });
     await message.reply({ embeds: [embed] });
+    return;
+  }
+
+  if (rawContent === "!ytfix" || rawContent === "!check") {
+    await handleYtFixMessage(message);
     return;
   }
 

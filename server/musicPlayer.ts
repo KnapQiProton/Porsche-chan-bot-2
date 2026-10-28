@@ -224,6 +224,10 @@ export function safeDestroyVoiceConnection(conn?: VoiceConnection | null): void 
 // Cached yt-dlp path to avoid repeated checks / downloads
 let cachedYtDlpPath: string | null = null;
 
+export function clearCachedYtDlpPath(): void {
+  cachedYtDlpPath = null;
+}
+
 // Ensure yt-dlp binary is available
 export async function getOrDownloadYtDlp(): Promise<string> {
   if (cachedYtDlpPath) return cachedYtDlpPath;
@@ -252,10 +256,13 @@ export async function getOrDownloadYtDlp(): Promise<string> {
     return localYtDlp;
   }
 
-  // 3. Check known Linux paths (pipx, nixpacks, standard)
+  // 3. Check known Linux paths (Pterodactyl container, pip --user, pipx, nixpacks, standard)
+  const homeDir = os.homedir();
   const sysCandidates = isWin
     ? [path.join(process.env.APPDATA || "", "Python", "Scripts", "yt-dlp.exe")]
     : [
+        path.join(homeDir, ".local", "bin", "yt-dlp"),
+        "/home/container/.local/bin/yt-dlp",
         "/root/.local/bin/yt-dlp",
         "/usr/local/bin/yt-dlp",
         "/usr/bin/yt-dlp",
