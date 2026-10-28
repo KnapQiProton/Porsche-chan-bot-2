@@ -101,14 +101,75 @@ export function getVisitorDataFromCookies(): string | undefined {
   return undefined;
 }
 
-// Extractor arguments with fallback chain: web,android,web_embedded
-// Prioritizes PO Token & visitor_data (from sanitized cookies or env) on web client
-export function getYtExtractorArgs(hasCookies?: boolean): string[] {
-  const customClient = process.env.YOUTUBE_PLAYER_CLIENT?.trim();
-  const playerClients = customClient || "web,android,web_embedded";
+// Extract PO Token from environment variables or cookies.txt (critical for YouTube bot detection bypass)
+export function getPoTokenFromCookies(): string | undefined {
+  const envPo = process.env.YOUTUBE_PO_TOKEN?.trim() || process.env.PO_TOKEN?.trim();
+  if (envPo) return envPo;
+
+  const cookieCandidates = [
+    path.join(process.cwd(), "cookies.txt"),
+    "/app/cookies.txt",
+    path.join(process.cwd(), "cookies.full.txt"),
+    path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt"),
+  ];
+
+  let rawContent = "";
+  for (const p of cookieCandidates) {
+    if (fs.existsSync(p)) {
+      try {
+        const content = fs.readFileSync(p, "utf-8");
+        if (content && content.length > 10) {
+          rawContent = content;
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  if (!rawContent) {
+    const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
+    if (envCookie && envCookie.trim()) {
+      let c = envCookie.trim();
+      if (!c.includes("\t") && !c.startsWith("#") && c.length > 50) {
+        try {
+          c = Buffer.from(c, "base64").toString("utf-8");
+        } catch {}
+      }
+      rawContent = c;
+    }
+  }
+
+  if (rawContent) {
+    const lines = rawContent.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Match comment line like: # po_token: <token> or # POT: <token>
+      const commentMatch = trimmed.match(/^#\s*(?:po_token|pot)\s*[:=]\s*(.+)$/i);
+      if (commentMatch) {
+        return commentMatch[1].trim();
+      }
+      const parts = trimmed.split("\t");
+      if (parts.length >= 7) {
+        const name = parts[5].toUpperCase();
+        if (name === "PO_TOKEN" || name === "POT" || name === "__SECURE-POT") {
+          return parts[6].trim();
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+// Extractor arguments with priority chain: android,ios,web_creator,web,web_embedded
+// (Android/iOS clients are much harder for YouTube to block on datacenter IPs)
+// Automatically injects PO Token (from env or cookies.txt) and visitor_data
+export function getYtExtractorArgs(hasCookies?: boolean, clientOverride?: string): string[] {
+  const customClient = clientOverride || process.env.YOUTUBE_PLAYER_CLIENT?.trim();
+  const playerClients = customClient || "android,ios,web_creator,web,web_embedded";
   const parts: string[] = [`player_client=${playerClients}`];
 
-  const poToken = process.env.YOUTUBE_PO_TOKEN?.trim() || process.env.PO_TOKEN?.trim();
+  const poToken = getPoTokenFromCookies();
   const visitorData = process.env.YOUTUBE_VISITOR_DATA?.trim() || process.env.VISITOR_DATA?.trim() || getVisitorDataFromCookies();
 
   if (poToken) {
@@ -325,49 +386,57 @@ export async function ensureYtDlpUpdated(): Promise<void> {
     logger.info("Checking yt-dlp version...");
     const isWin = process.platform === "win32";
 
-    // 1. Try pipx upgrade --pip-args="--pre" yt-dlp
-    let updated = false;
-    try {
-      const pipxRes = spawnSync("pipx", ["upgrade", "--pip-args=--pre", "yt-dlp"], {
-        timeout: 60_000,
-        stdio: "pipe",
-        encoding: "utf-8",
-      });
-      if (pipxRes.status === 0) {
-        updated = true;
-      }
-    } catch {}
+    const updateCommands = isWin
+      ? [
+          { cmd: "python", args: ["-m", "pip", "install", "--upgrade", "--pre", "yt-dlp"] },
+          { cmd: "pip", args: ["install", "--upgrade", "--pre", "yt-dlp"] },
+        ]
+      : [
+          // 1. Primary command for container / Linux
+          { cmd: "pip3", args: ["install", "--upgrade", "--pre", "yt-dlp"] },
+          // 2. Fallback for Pterodactyl container permission: pip install --user --upgrade --pre yt-dlp
+          { cmd: "pip", args: ["install", "--user", "--upgrade", "--pre", "yt-dlp"] },
+          { cmd: "pip3", args: ["install", "--user", "--upgrade", "--pre", "yt-dlp"] },
+          { cmd: "pip3", args: ["install", "--break-system-packages", "--upgrade", "--pre", "yt-dlp"] },
+          // 3. Fallback pipx
+          { cmd: "pipx", args: ["upgrade", "--pip-args=--pre", "yt-dlp"] },
+          { cmd: "pipx", args: ["upgrade", "yt-dlp"] },
+          // 4. python3 -m pip fallback
+          { cmd: "python3", args: ["-m", "pip", "install", "--user", "--upgrade", "--pre", "yt-dlp"] },
+        ];
 
-    // 2. Fallback: python3 -m pip install --upgrade --pre yt-dlp
-    if (!updated) {
-      const pyCommands = isWin ? ["python", "python3"] : ["python3", "python"];
-      for (const py of pyCommands) {
-        try {
-          const pipRes = spawnSync(py, ["-m", "pip", "install", "--upgrade", "--pre", "yt-dlp"], {
-            timeout: 60_000,
-            stdio: "pipe",
-            encoding: "utf-8",
-          });
-          if (pipRes.status === 0) {
-            updated = true;
-            break;
-          }
-        } catch {}
-      }
+    let updated = false;
+    for (const step of updateCommands) {
+      try {
+        const res = spawnSync(step.cmd, step.args, {
+          timeout: 45_000,
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        if (res.status === 0) {
+          updated = true;
+          clearCachedYtDlpPath();
+          break;
+        }
+      } catch {}
     }
 
-    // 3. Fallback: yt-dlp --update-to nightly for standalone binary release
+    // 5. Fallback: yt-dlp --update-to nightly for standalone binary release
     const ytdlpPath = await getOrDownloadYtDlp();
-    try {
-      spawnSync(ytdlpPath, ["--update-to", "nightly"], {
-        timeout: 30_000,
-        stdio: "pipe",
-      });
-    } catch {}
+    if (!updated) {
+      try {
+        spawnSync(ytdlpPath, ["--update-to", "nightly"], {
+          timeout: 30_000,
+          stdio: "pipe",
+        });
+        clearCachedYtDlpPath();
+      } catch {}
+    }
 
-    // 4. Determine final version and log
+    // 6. Determine final version and log
     try {
-      const verProc = spawnSync(ytdlpPath, ["--version"], {
+      const finalYtDlp = await getOrDownloadYtDlp();
+      const verProc = spawnSync(finalYtDlp, ["--version"], {
         timeout: 5_000,
         stdio: "pipe",
         encoding: "utf-8",
@@ -1942,7 +2011,7 @@ function tryPipedUrlStream(
   });
 }
 
-// Create AudioResource from YouTube with robust multi-tier live piped streaming architecture
+// Create AudioResource from YouTube with robust multi-tier live piped streaming architecture and auto-retry
 export async function createAudioResourceFromYtDlp(
   urlOrQuery: string,
   seekSeconds: number = 0,
@@ -1973,77 +2042,124 @@ export async function createAudioResourceFromYtDlp(
     targetUrl,
   ];
 
-  // Tier 1: Fallback chain (web,android,web_embedded) with cookies & PO Token (if available)
-  try {
-    const resource = await tryPipedStream(
-      ytdlpPath,
-      buildPipeArgs(getYtExtractorArgs(cookieArgs.length > 0), cookieArgs.length > 0),
-      seekSeconds,
-      12000
-    );
-    logger.info({ targetUrl, seekSeconds }, "Tier 1 (web,android,web_embedded with cookies/po_token) stream started");
-    return resource;
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 1 (web,android,web_embedded) failed");
-  }
+  const attemptStream = async (attempt: number): Promise<any> => {
+    logger.info({ attempt, targetUrl }, `Attempting YouTube stream (Percobaan ${attempt}/2)...`);
 
-  // Tier 2: Fallback chain (web,android,web_embedded) WITHOUT cookies
-  if (cookieArgs.length > 0) {
+    // Tier 1: Fallback chain (android,ios,web_creator,web,web_embedded) with cookies & PO Token
     try {
+      const client = "android,ios,web_creator,web,web_embedded";
+      logger.info({ client, tier: 1 }, `Starting yt-dlp with client: ${client} (cookies: ${cookieArgs.length > 0})`);
       const resource = await tryPipedStream(
         ytdlpPath,
-        buildPipeArgs(getYtExtractorArgs(false), false),
+        buildPipeArgs(getYtExtractorArgs(cookieArgs.length > 0, client), cookieArgs.length > 0),
         seekSeconds,
         12000
       );
-      logger.info({ targetUrl, seekSeconds }, "Tier 2 (web,android,web_embedded no-cookies) stream started");
+      logger.info({ client, tier: 1 }, `Stream started successfully with client: ${client}`);
       return resource;
-    } catch (err) {
-      logger.warn({ err: (err as Error).message }, "Tier 2 (web,android,web_embedded no-cookies) failed");
+    } catch (err: any) {
+      logger.warn({ client: "fallback_chain_cookies", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
     }
-  }
 
-  // Tier 3: Android client dedicated (Clean Android player fallback)
-  try {
-    const resource = await tryPipedStream(
-      ytdlpPath,
-      buildPipeArgs(["--extractor-args", "youtube:player_client=android"], false),
-      seekSeconds,
-      10000
-    );
-    logger.info({ targetUrl, seekSeconds }, "Tier 3 (android no-cookies) stream started");
-    return resource;
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 3 (android no-cookies) failed");
-  }
+    // Tier 2: Fallback chain WITHOUT cookies (in case cookies are invalid or blocked)
+    if (cookieArgs.length > 0) {
+      try {
+        const client = "android,ios,web_creator,web,web_embedded";
+        logger.info({ client, tier: 2 }, `Starting yt-dlp with client: ${client} (no cookies)`);
+        const resource = await tryPipedStream(
+          ytdlpPath,
+          buildPipeArgs(getYtExtractorArgs(false, client), false),
+          seekSeconds,
+          12000
+        );
+        logger.info({ client, tier: 2 }, `Stream started successfully with client: ${client} (no cookies)`);
+        return resource;
+      } catch (err: any) {
+        logger.warn({ client: "fallback_chain_no_cookies", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+      }
+    }
 
-  // Tier 4: Smart Native yt-dlp (Lets yt-dlp dynamically choose the best client)
-  try {
-    const resource = await tryPipedStream(
-      ytdlpPath,
-      buildPipeArgs([], false),
-      seekSeconds,
-      10000
-    );
-    logger.info({ targetUrl, seekSeconds }, "Tier 4 (smart native no-cookies) stream started");
-    return resource;
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 4 (smart native no-cookies) failed");
-  }
-
-  // Tier 5: Direct URL extraction -> ffmpeg (pure YouTube direct link)
-  try {
-    const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000, cookieArgs);
-    if (directUrl) {
-      const resource = await tryPipedUrlStream(directUrl, seekSeconds, 8000);
-      logger.info({ targetUrl, seekSeconds }, "Tier 5 (direct URL) stream started");
+    // Tier 3: Dedicated android client (high bypass rate on datacenter IPs)
+    try {
+      const client = "android";
+      logger.info({ client, tier: 3 }, `Starting yt-dlp with client: ${client}`);
+      const resource = await tryPipedStream(
+        ytdlpPath,
+        buildPipeArgs(["--extractor-args", `youtube:player_client=${client}`], false),
+        seekSeconds,
+        10000
+      );
+      logger.info({ client, tier: 3 }, `Stream started successfully with client: ${client}`);
       return resource;
+    } catch (err: any) {
+      logger.warn({ client: "android", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
     }
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, "Tier 5 (direct URL) failed");
+
+    // Tier 4: Dedicated ios client
+    try {
+      const client = "ios";
+      logger.info({ client, tier: 4 }, `Starting yt-dlp with client: ${client}`);
+      const resource = await tryPipedStream(
+        ytdlpPath,
+        buildPipeArgs(["--extractor-args", `youtube:player_client=${client}`], false),
+        seekSeconds,
+        10000
+      );
+      logger.info({ client, tier: 4 }, `Stream started successfully with client: ${client}`);
+      return resource;
+    } catch (err: any) {
+      logger.warn({ client: "ios", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+    }
+
+    // Tier 5: Dedicated web_creator client
+    try {
+      const client = "web_creator";
+      logger.info({ client, tier: 5 }, `Starting yt-dlp with client: ${client}`);
+      const resource = await tryPipedStream(
+        ytdlpPath,
+        buildPipeArgs(["--extractor-args", `youtube:player_client=${client}`], false),
+        seekSeconds,
+        10000
+      );
+      logger.info({ client, tier: 5 }, `Stream started successfully with client: ${client}`);
+      return resource;
+    } catch (err: any) {
+      logger.warn({ client: "web_creator", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+    }
+
+    // Tier 6: Direct URL extraction -> FFmpeg (fallback)
+    try {
+      logger.info({ tier: 6 }, "Starting yt-dlp with client: direct_url");
+      const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000, cookieArgs);
+      if (directUrl) {
+        const resource = await tryPipedUrlStream(directUrl, seekSeconds, 8000);
+        logger.info({ tier: 6 }, "Stream started successfully via direct URL pipe");
+        return resource;
+      }
+    } catch (err: any) {
+      logger.warn({ tier: 6, err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+    }
+
+    throw new Error("Semua tier streaming yt-dlp gagal memuat audio.");
+  };
+
+  // Attempt 1
+  try {
+    return await attemptStream(1);
+  } catch (err1: any) {
+    logger.warn({ err: err1?.message }, "YouTube stream attempt 1 failed. Retrying in 2 seconds...");
   }
 
-  throw new Error("Gagal memutar audio dari YouTube. Pastikan link atau judul lagu valid.");
+  // Delay 2s before retry (Attempt 2)
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Attempt 2
+  try {
+    return await attemptStream(2);
+  } catch (err2: any) {
+    logger.error({ err: err2?.message }, "YouTube stream attempt 2 (retry) also failed.");
+    throw new Error("Gagal memutar audio dari YouTube setelah 2 kali percobaan. YouTube memblokir akses atau IP throttled. Jalankan `/check` untuk perbaikan otomatis.");
+  }
 }
 
 // Main Track Resolver: handles YouTube, YouTube Music, Spotify, SoundCloud, and Text Query (Prioritizing User Links)
@@ -2878,22 +2994,41 @@ export class MusicService {
     const forcePlaylist = interaction.options.getBoolean("playlist") ?? false;
     await interaction.deferReply();
 
+    // Strict 14.5s interaction timeout watchdog to guarantee bot never stays stuck in "thinking..."
+    let timedOut = false;
+    let completed = false;
+    const timeoutHandle = setTimeout(async () => {
+      if (completed) return;
+      timedOut = true;
+      try {
+        await interaction.editReply("⏱️ **Waktu Proses Habis (Timeout 15 detik):** YouTube tidak merespons atau IP server terkena throttling/blokir (403/429). Silakan jalankan `/check` untuk perbaikan otomatis atau coba beberapa saat lagi.");
+      } catch {}
+    }, 14500);
+
     try {
       const musicResult = await resolveMusic(queryOrUrl, {
         name: interaction.user.displayName || interaction.user.username,
         id: interaction.user.id,
       }, { forcePlaylist });
 
+      if (timedOut) return;
+
       const textChannel = interaction.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
+
+      if (timedOut) return;
 
       if (musicResult.isPlaylist) {
         if (session.isPlaying && session.currentTrack) {
           session.queue.push(...musicResult.tracks);
           const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, true);
-          await interaction.editReply({ embeds: [embed] });
-          const noticeMsg = await interaction.fetchReply().catch(() => null);
-          if (noticeMsg) setTimeout(() => noticeMsg.delete().catch(() => {}), 7_000);
+          completed = true;
+          clearTimeout(timeoutHandle);
+          if (!timedOut) {
+            await interaction.editReply({ embeds: [embed] });
+            const noticeMsg = await interaction.fetchReply().catch(() => null);
+            if (noticeMsg) setTimeout(() => noticeMsg.delete().catch(() => {}), 7_000);
+          }
         } else {
           if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
             try {
@@ -2913,11 +3048,15 @@ export class MusicService {
 
           const embed = buildPlaylistEmbed(musicResult, interaction.user.displayName || interaction.user.username, false);
           await MusicService.deletePreviewMessage(session);
-          await interaction.editReply({
-            embeds: [embed],
-            components: buildMusicComponents(session),
-          });
-          session.previewMessage = await interaction.fetchReply().catch(() => null);
+          completed = true;
+          clearTimeout(timeoutHandle);
+          if (!timedOut) {
+            await interaction.editReply({
+              embeds: [embed],
+              components: buildMusicComponents(session),
+            });
+            session.previewMessage = await interaction.fetchReply().catch(() => null);
+          }
 
           try {
             const resource = await firstTrack.createStream(0);
@@ -2939,9 +3078,13 @@ export class MusicService {
         if (session.isPlaying && session.currentTrack) {
           session.queue.push(track);
           const embed = buildNowPlayingEmbed(track, true);
-          await interaction.editReply({ embeds: [embed] });
-          const noticeMsg = await interaction.fetchReply().catch(() => null);
-          if (noticeMsg) setTimeout(() => noticeMsg.delete().catch(() => {}), 7_000);
+          completed = true;
+          clearTimeout(timeoutHandle);
+          if (!timedOut) {
+            await interaction.editReply({ embeds: [embed] });
+            const noticeMsg = await interaction.fetchReply().catch(() => null);
+            if (noticeMsg) setTimeout(() => noticeMsg.delete().catch(() => {}), 7_000);
+          }
         } else {
           if (session.connection.state.status !== VoiceConnectionStatus.Ready && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
             try {
@@ -2958,11 +3101,15 @@ export class MusicService {
 
           const embed = buildNowPlayingEmbed(track, false);
           await MusicService.deletePreviewMessage(session);
-          await interaction.editReply({
-            embeds: [embed],
-            components: buildMusicComponents(session),
-          });
-          session.previewMessage = await interaction.fetchReply().catch(() => null);
+          completed = true;
+          clearTimeout(timeoutHandle);
+          if (!timedOut) {
+            await interaction.editReply({
+              embeds: [embed],
+              components: buildMusicComponents(session),
+            });
+            session.previewMessage = await interaction.fetchReply().catch(() => null);
+          }
 
           try {
             const resource = await track.createStream(0);
@@ -2986,6 +3133,9 @@ export class MusicService {
         }
       }
     } catch (err) {
+      completed = true;
+      clearTimeout(timeoutHandle);
+      if (timedOut) return;
       logger.error({ err, queryOrUrl }, "Error resolving and playing track");
       await interaction.editReply(`❌ Gagal memutar musik: ${(err as Error).message || "Sumber tidak ditemukan"}`);
     }
