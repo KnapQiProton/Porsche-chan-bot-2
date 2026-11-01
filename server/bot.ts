@@ -35,6 +35,7 @@ import { spawn } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import * as cheerio from "cheerio";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { logger } from "./logger";
 import {
@@ -2704,6 +2705,10 @@ client.once(Events.ClientReady, async (c) => {
   botStatusInfo.error = null;
 
   logger.info({ tag: c.user.tag, guilds: c.guilds.cache.size }, "Discord bot ready and connected!");
+  logger.info(
+    { instance: INSTANCE_ID, platform: INSTANCE_PLATFORM },
+    "Bot instance online — pastikan hanya SATU instance yang memakai token ini"
+  );
 
   // Initialize music subsystems & ensure yt-dlp is nightly
   ensureYtDlpUpdated().catch((err) => logger.warn({ err }, "yt-dlp auto-update failed (non-fatal)"));
@@ -2855,8 +2860,45 @@ client.on(Events.VoiceStateUpdate, async (_oldState, newState) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Anti double-reply: dedupe event yang sama di dalam satu proses.
+// Catatan: ini TIDAK bisa mencegah duplikasi jika bot berjalan di 2 server
+// sekaligus (mis. Railway + KeritCloud dengan token yang sama). Gunakan
+// `!instance` untuk mendeteksi kondisi tersebut.
+// ---------------------------------------------------------------------------
+const INSTANCE_ID = `${os.hostname()}#${process.pid}`;
+const INSTANCE_PLATFORM = process.env.RAILWAY_ENVIRONMENT
+  ? "Railway"
+  : process.env.P_SERVER_UUID || fs.existsSync("/home/container")
+    ? "KeritCloud/Pterodactyl"
+    : process.platform === "win32"
+      ? "Local (Windows)"
+      : "Unknown";
+
+const processedEventIds = new Map<string, number>();
+const EVENT_DEDUPE_TTL_MS = 60_000;
+
+function isDuplicateEvent(id: string): boolean {
+  const now = Date.now();
+  if (processedEventIds.size > 2000) {
+    for (const [key, ts] of processedEventIds) {
+      if (now - ts > EVENT_DEDUPE_TTL_MS) processedEventIds.delete(key);
+    }
+  }
+  if (processedEventIds.has(id)) return true;
+  processedEventIds.set(id, now);
+  return false;
+}
+
 // Slash Command & Button Interaction Handler
 client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+  // Guard: abaikan interaksi dari bot sendiri / bot lain dan event duplikat
+  if (interaction.user.bot || interaction.user.id === client.user?.id) return;
+  if (isDuplicateEvent(`i:${interaction.id}`)) {
+    logger.warn({ id: interaction.id }, "Duplicate interaction event ignored");
+    return;
+  }
+
   // Handle pagination button clicks for /think and /illust
   if (interaction.isButton()) {
     const customId = interaction.customId;
@@ -3412,8 +3454,21 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 // Direct Messages & Mentions
 client.on(Events.MessageCreate, async (message: Message) => {
   if (message.author.bot) return;
+  if (isDuplicateEvent(`m:${message.id}`)) {
+    logger.warn({ id: message.id }, "Duplicate message event ignored");
+    return;
+  }
 
   const rawContent = message.content.trim();
+
+  // Diagnosa double reply: setiap instance bot yang aktif akan membalas
+  // dengan identitasnya. Jika muncul 2 balasan, berarti ada 2 bot berjalan.
+  if (rawContent === "!instance") {
+    await message.reply(
+      `🖥️ Instance aktif: **${INSTANCE_PLATFORM}** \`${INSTANCE_ID}\` • uptime ${Math.round(process.uptime())}s`
+    );
+    return;
+  }
 
   // Voice channel join prefix commands: !join, !masuk
   if (rawContent === "!join" || rawContent === "!masuk") {
