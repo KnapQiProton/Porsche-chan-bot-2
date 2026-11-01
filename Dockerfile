@@ -30,6 +30,9 @@ RUN npm install --legacy-peer-deps --include=dev
 COPY server/ ./server/
 COPY src/ ./src/
 COPY public/ ./public/
+COPY lib/ ./lib/
+COPY data/ ./data/
+COPY commands/ ./commands/
 COPY server.ts index.html entrypoint.sh ./
 RUN chmod +x entrypoint.sh || true
 

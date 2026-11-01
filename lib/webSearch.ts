@@ -1,4 +1,4 @@
-import { search, SafeSearchType } from "duck-duck-scrape";
+import { search } from 'duck-duck-scrape';
 
 export interface SearchResult {
   title: string;
@@ -11,22 +11,18 @@ export type WebSearchResult = SearchResult;
 export async function searchWeb(query: string, timeoutMs: number = 5000): Promise<SearchResult[]> {
   try {
     const results = await search(query, {
-      safeSearch: SafeSearchType.STRICT,
-      time: "y",
+      safeSearch: 'strict' as any,
+      time: 'y',
     });
-
-    if (!results || !Array.isArray(results.results) || results.results.length === 0) {
-      return [];
-    }
-
-    return results.results.slice(0, 3).map((r) => ({
-      title: r.title || "Tanpa Judul",
-      snippet: r.description || (r as any).snippet || "Tidak ada deskripsi.",
-      url: r.url || "",
+    
+    return results.results.slice(0, 3).map(r => ({
+      title: r.title,
+      snippet: r.description || (r as any).snippet || 'Tidak ada deskripsi.',
+      url: r.url
     }));
   } catch (error) {
-    console.error("[WebSearch] Gagal mencari:", (error as Error).message);
-    return [];
+    console.error('[WebSearch] Gagal mencari:', (error as Error).message);
+    return []; // Return array kosong agar bot tidak crash
   }
 }
 
