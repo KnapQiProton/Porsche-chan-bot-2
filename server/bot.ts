@@ -54,6 +54,11 @@ import {
   BooruPostResult,
 } from "./animeTagEngine";
 import { handleYtFixCommand, handleYtFixMessage } from "./ytDiagnostics";
+import {
+  searchWeb,
+  shouldAutoSearchWeb,
+  formatWebSearchSnippets,
+} from "../lib/webSearch";
 
 export const CREATOR_ID = "591807486244290600";
 export const CREATOR_NAME = "KnapQi";
@@ -76,7 +81,7 @@ export function getLoreData(): string {
   }, null, 2);
 }
 
-export function buildPersona(isCreator: boolean): string {
+export function buildPersona(isCreator: boolean, webSearchContext?: string): string {
   const lore = getLoreData();
   const basePrompt = `Kamu adalah Porsche-chan, asisten AI bot Discord.
 PANDUAN LORE & IDENTITAS RESMI (data/lore.json):
@@ -89,12 +94,18 @@ ATURAN ANTI-HALUSINASI & GAYA BICARA:
    - Jawab hanya berdasarkan fakta akurat atau data yang tertera di lore di atas.
    - Jika ada hal yang tidak kamu ketahui atau tidak ada di data lore, jawab dengan jujur: "Maaf, aku belum tahu~".
    - JANGAN MENGARANG FAKTA (NO HALLUCINATION).
+   - Jika kamu menggunakan data dari hasil pencarian web, selalu sebutkan secara singkat bahwa informasinya berdasarkan pencarian terkini. JANGAN mengarang fakta di luar hasil pencarian yang diberikan.
 4. Singkat & Padat: Berikan jawaban yang to-the-point dan hemat kata.`;
 
-  if (isCreator) {
-    return `${basePrompt}\n\n[USER INI ADALAH CREATOR KAMU (${CREATOR_NAME})]: Kamu lebih hormat, akrab, dan responsif membantu keperluannya.`;
+  let finalPrompt = isCreator
+    ? `${basePrompt}\n\n[USER INI ADALAH CREATOR KAMU (${CREATOR_NAME})]: Kamu lebih hormat, akrab, dan responsif membantu keperluannya.`
+    : basePrompt;
+
+  if (webSearchContext && webSearchContext.trim()) {
+    finalPrompt += `\n\n[DATA HASIL PENCARIAN WEB TERKINI (REAL-TIME)]:\n${webSearchContext}\nGunakan data pencarian di atas untuk menjawab pertanyaan user secara akurat dan sertakan sumbernya.`;
   }
-  return basePrompt;
+
+  return finalPrompt;
 }
 
 export const FLAG_TARGET_LANGUAGES: Record<string, string> = {
@@ -2513,11 +2524,21 @@ export const COMMANDS = [
     .toJSON(),
   new SlashCommandBuilder()
     .setName("search")
-    .setDescription("Search DuckDuckGo and get a Gemini-powered summary")
+    .setDescription("Cari informasi fakta terkini di internet secara real-time")
     .addStringOption((opt) =>
       opt
         .setName("query")
-        .setDescription("What do you want to search for?")
+        .setDescription("Pertanyaan atau topik yang ingin dicari di internet")
+        .setRequired(true),
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("cari")
+    .setDescription("Cari informasi fakta terkini di internet secara real-time")
+    .addStringOption((opt) =>
+      opt
+        .setName("pertanyaan")
+        .setDescription("Pertanyaan atau topik yang ingin dicari di internet")
         .setRequired(true),
     )
     .toJSON(),
@@ -3038,36 +3059,61 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     await interaction.reply({ embeds: [embed] });
   }
 
-  if (interaction.commandName === "search") {
-    const query = interaction.options.getString("query", true);
-    await interaction.deferReply();
+  if (interaction.commandName === "search" || interaction.commandName === "cari") {
+    const query =
+      interaction.options.getString("query") ||
+      interaction.options.getString("pertanyaan") ||
+      "";
+
+    await interaction.reply({
+      content: `🔍 Sedang mencari di internet tentang **"${query}"**...`,
+    });
+
     try {
-      const results = await searchDuckDuckGo(query);
+      const results = await searchWeb(query, 5000);
       if (results.length === 0) {
-        await interaction.editReply("❌ Tidak ada hasil ditemukan untuk pencarian tersebut.");
+        await interaction.editReply({
+          content: "Maaf, aku tidak menemukan informasi yang jelas tentang itu~ (๑•́ ₃ •̀๑)",
+        });
         return;
       }
-      const resultsText = results.map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`).join("\n\n");
-      const prompt = `Berdasarkan hasil pencarian DuckDuckGo berikut untuk query "${query}", berikan ringkasan yang informatif dan mudah dipahami dalam bahasa yang sama dengan query:\n\n${resultsText}`;
-      const { text: summary } = await generateText([{ role: "user", text: prompt }]);
-      const truncated = summary.length > 4000 ? summary.slice(0, 4000) + "…" : summary;
+
+      const snippetsText = formatWebSearchSnippets(results);
+      const prompt =
+        `Berdasarkan hasil pencarian berikut:\n${snippetsText}\n\n` +
+        `Jawab pertanyaan user: '${query}' dengan singkat, padat, dan sertakan sumbernya. ` +
+        `Jika hasil pencarian tidak relevan, katakan 'Maaf, aku tidak menemukan informasi yang jelas tentang itu~'.`;
+
+      const isCreator = interaction.user.id === CREATOR_ID;
+      const systemPrompt = buildPersona(isCreator);
+      const { text: summary, model: modelName } = await generateText(
+        [{ role: "user", text: prompt }],
+        systemPrompt
+      );
+      const truncated = summary.length > 3800 ? summary.slice(0, 3797) + "..." : summary;
 
       const embed = new EmbedBuilder()
         .setColor(0x3b82f6)
         .setTitle(`🔍 ${query}`.slice(0, 256))
-        .setDescription(truncated || "Tidak ada ringkasan.")
+        .setDescription(truncated || "Maaf, aku tidak menemukan informasi yang jelas tentang itu~")
         .addFields(
-          results.slice(0, 5).map((r, i) => ({
+          results.slice(0, 3).map((r, i) => ({
             name: `${i + 1}. ${r.title}`.slice(0, 256),
-            value: (r.url || "—").slice(0, 1024),
+            value: `${r.snippet}\n🔗 [Sumber](${r.url})`.slice(0, 1024),
             inline: false,
           }))
         )
-        .setFooter({ text: "Sumber: DuckDuckGo • Ringkasan: AI Multi-provider" });
-      await interaction.editReply({ embeds: [embed] });
+        .setFooter({
+          text: `Sumber: DuckDuckGo Real-Time Search${modelName ? ` • AI: ${modelName}` : ""}`,
+        })
+        .setTimestamp();
+
+      await interaction.editReply({ content: null, embeds: [embed] });
     } catch (err) {
       logger.error({ err }, "Error in /search command");
-      await interaction.editReply("❌ Gagal melakukan pencarian. Coba lagi nanti.");
+      await interaction.editReply({
+        content: "❌ Gagal melakukan pencarian di internet. Coba lagi nanti ya~",
+      });
     }
   }
 
@@ -3862,7 +3908,20 @@ client.on(Events.MessageCreate, async (message: Message) => {
         updatedHistory.splice(0, updatedHistory.length - MAX_HISTORY);
       }
 
-      const systemPrompt = buildPersona(isCreator);
+      // Metode B: Auto-Detect kebutuhan pencarian web pada chat biasa (hemat token, hanya jika cocok keyword)
+      let webSearchContext = "";
+      if (shouldAutoSearchWeb(userText)) {
+        try {
+          const searchResults = await searchWeb(userText, 5000);
+          if (searchResults.length > 0) {
+            webSearchContext = formatWebSearchSnippets(searchResults);
+          }
+        } catch (searchErr) {
+          logger.warn({ searchErr, userText }, "Auto web-search failed in chat");
+        }
+      }
+
+      const systemPrompt = buildPersona(isCreator, webSearchContext);
       const { text: reply, model: modelName } = await generateText(updatedHistory, systemPrompt);
 
       const finalHistory = [...updatedHistory, { role: "model" as const, text: reply }];
