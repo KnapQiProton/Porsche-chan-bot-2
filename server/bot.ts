@@ -2868,6 +2868,9 @@ const INSTANCE_PID = process.pid;
 const INSTANCE_SERVICE = process.env.RAILWAY_SERVICE_NAME || process.env.SERVICE_NAME || "Default";
 const INSTANCE_DEPLOYMENT = process.env.RAILWAY_DEPLOYMENT_ID ? process.env.RAILWAY_DEPLOYMENT_ID.slice(0, 8) : "";
 const INSTANCE_REPLICA = process.env.RAILWAY_REPLICA_INDEX ?? process.env.REPLICA_INDEX ?? "";
+const INSTANCE_ENV_NAME = process.env.RAILWAY_ENVIRONMENT_NAME || "";
+const INSTANCE_PROJECT_NAME = process.env.RAILWAY_PROJECT_NAME || "";
+const INSTANCE_BRANCH = process.env.RAILWAY_GIT_BRANCH || "";
 const INSTANCE_PLATFORM = process.env.RAILWAY_ENVIRONMENT
   ? "Railway"
   : process.env.P_SERVER_UUID || fs.existsSync("/home/container")
@@ -3470,6 +3473,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
     const details = [
       `🖥️ **Platform:** ${INSTANCE_PLATFORM}`,
       `📦 **Service:** \`${INSTANCE_SERVICE}\``,
+      INSTANCE_PROJECT_NAME ? `📁 **Project:** \`${INSTANCE_PROJECT_NAME}\`` : null,
+      INSTANCE_ENV_NAME ? `🌍 **Env:** \`${INSTANCE_ENV_NAME}\`` : null,
+      INSTANCE_BRANCH ? `🌿 **Branch:** \`${INSTANCE_BRANCH}\`` : null,
       INSTANCE_REPLICA !== "" ? `🔢 **Replica:** \`#${INSTANCE_REPLICA}\`` : null,
       INSTANCE_DEPLOYMENT ? `🚀 **Deploy:** \`${INSTANCE_DEPLOYMENT}\`` : null,
       `🆔 **Host:** \`${INSTANCE_ID}\``,
