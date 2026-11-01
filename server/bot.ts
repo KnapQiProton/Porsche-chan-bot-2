@@ -2861,12 +2861,13 @@ client.on(Events.VoiceStateUpdate, async (_oldState, newState) => {
 });
 
 // ---------------------------------------------------------------------------
-// Anti double-reply: dedupe event yang sama di dalam satu proses.
-// Catatan: ini TIDAK bisa mencegah duplikasi jika bot berjalan di 2 server
-// sekaligus (mis. Railway + KeritCloud dengan token yang sama). Gunakan
-// `!instance` untuk mendeteksi kondisi tersebut.
+// Anti double-reply & Instance Diagnostics
 // ---------------------------------------------------------------------------
-const INSTANCE_ID = `${os.hostname()}#${process.pid}`;
+const INSTANCE_HOSTNAME = os.hostname();
+const INSTANCE_PID = process.pid;
+const INSTANCE_SERVICE = process.env.RAILWAY_SERVICE_NAME || process.env.SERVICE_NAME || "Default";
+const INSTANCE_DEPLOYMENT = process.env.RAILWAY_DEPLOYMENT_ID ? process.env.RAILWAY_DEPLOYMENT_ID.slice(0, 8) : "";
+const INSTANCE_REPLICA = process.env.RAILWAY_REPLICA_INDEX ?? process.env.REPLICA_INDEX ?? "";
 const INSTANCE_PLATFORM = process.env.RAILWAY_ENVIRONMENT
   ? "Railway"
   : process.env.P_SERVER_UUID || fs.existsSync("/home/container")
@@ -2874,6 +2875,8 @@ const INSTANCE_PLATFORM = process.env.RAILWAY_ENVIRONMENT
     : process.platform === "win32"
       ? "Local (Windows)"
       : "Unknown";
+
+const INSTANCE_ID = `${INSTANCE_HOSTNAME}#${INSTANCE_PID}`;
 
 const processedEventIds = new Map<string, number>();
 const EVENT_DEDUPE_TTL_MS = 60_000;
@@ -3464,9 +3467,16 @@ client.on(Events.MessageCreate, async (message: Message) => {
   // Diagnosa double reply: setiap instance bot yang aktif akan membalas
   // dengan identitasnya. Jika muncul 2 balasan, berarti ada 2 bot berjalan.
   if (rawContent === "!instance") {
-    await message.reply(
-      `🖥️ Instance aktif: **${INSTANCE_PLATFORM}** \`${INSTANCE_ID}\` • uptime ${Math.round(process.uptime())}s`
-    );
+    const details = [
+      `🖥️ **Platform:** ${INSTANCE_PLATFORM}`,
+      `📦 **Service:** \`${INSTANCE_SERVICE}\``,
+      INSTANCE_REPLICA !== "" ? `🔢 **Replica:** \`#${INSTANCE_REPLICA}\`` : null,
+      INSTANCE_DEPLOYMENT ? `🚀 **Deploy:** \`${INSTANCE_DEPLOYMENT}\`` : null,
+      `🆔 **Host:** \`${INSTANCE_ID}\``,
+      `⏱️ **Uptime:** \`${Math.round(process.uptime())}s\``,
+    ].filter(Boolean).join(" • ");
+
+    await message.reply(details);
     return;
   }
 
@@ -4711,6 +4721,22 @@ export function startBot(): Promise<string> | void {
   if (!token || token === "MY_DISCORD_BOT_TOKEN" || token.trim().length < 10) {
     logger.warn("DISCORD_BOT_TOKEN is not configured or is placeholder. Bot will stay in Standby mode until token is configured in Settings.");
     botStatusInfo.error = "DISCORD_BOT_TOKEN belum diset di Secrets. Bot dalam mode standby.";
+    return;
+  }
+
+  // Safeguard: jika env DISABLE_DISCORD_BOT diset "true", abaikan login Discord
+  if (process.env.DISABLE_DISCORD_BOT === "true") {
+    logger.warn("DISABLE_DISCORD_BOT is true. Bot tidak akan login ke Discord.");
+    botStatusInfo.error = "Bot dimatikan via DISABLE_DISCORD_BOT environment variable.";
+    return;
+  }
+
+  // Safeguard: jika di Railway atau cluster diset multi-replica, hanya replica 0 yang connect ke Discord
+  // agar tidak ada duplicate bot yang merespons event yang sama (double reply).
+  const replicaIndex = process.env.RAILWAY_REPLICA_INDEX ?? process.env.REPLICA_INDEX;
+  if (replicaIndex && replicaIndex !== "0") {
+    logger.warn({ replicaIndex }, "Secondary replica terdeteksi. Melewati login Discord untuk mencegah double reply.");
+    botStatusInfo.error = `Replica #${replicaIndex} standby (hanya replica #0 yang aktif di Discord).`;
     return;
   }
 
