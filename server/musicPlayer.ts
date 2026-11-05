@@ -3014,16 +3014,16 @@ export class MusicService {
     const forcePlaylist = interaction.options.getBoolean("playlist") ?? false;
     await interaction.deferReply();
 
-    // Strict 14.5s interaction timeout watchdog to guarantee bot never stays stuck in "thinking..."
+    // 2-minute generous interaction timeout watchdog for heavy YouTube/yt-dlp resolution
     let timedOut = false;
     let completed = false;
     const timeoutHandle = setTimeout(async () => {
       if (completed) return;
       timedOut = true;
       try {
-        await interaction.editReply("⏱️ **Waktu Proses Habis (Timeout 15 detik):** YouTube tidak merespons atau IP server terkena throttling/blokir (403/429). Silakan jalankan `/check` untuk perbaikan otomatis atau coba beberapa saat lagi.");
+        await interaction.editReply("⏱️ **Waktu Proses Agak Lama:** YouTube sedang memproses resolusi lagu di server Railway. Mohon sebentar ya... (๑•̀ㅂ•́)و✧").catch(() => {});
       } catch {}
-    }, 14500);
+    }, 120000);
 
     try {
       const musicResult = await resolveMusic(queryOrUrl, {
@@ -3031,12 +3031,8 @@ export class MusicService {
         id: interaction.user.id,
       }, { forcePlaylist });
 
-      if (timedOut) return;
-
       const textChannel = interaction.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
-
-      if (timedOut) return;
 
       if (musicResult.isPlaylist) {
         if (session.isPlaying && session.currentTrack) {
