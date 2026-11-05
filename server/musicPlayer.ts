@@ -865,16 +865,26 @@ export async function getYouTubeMetadata(urlOrVideoId: string, ytdlpPath?: strin
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : urlOrVideoId;
   const binPath = ytdlpPath || (await getOrDownloadYtDlp());
 
-  // 1. Try yt-dlp first (most accurate for exact duration, title, uploader & thumbnail)
+  // 1. Try fast YouTube oEmbed first (fastest, lightweight, no yt-dlp delay)
+  const oembed = await getYouTubeOEmbed(targetUrl);
+  if (oembed && videoId) {
+    const parsed = parseTitleAndArtist(oembed.title, oembed.author);
+    return {
+      id: videoId,
+      url: targetUrl,
+      title: parsed.title,
+      artist: parsed.artist || oembed.author || "Artis YouTube",
+      duration: "Audio",
+      durationSec: undefined,
+      thumbnail: oembed.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    };
+  }
+
+  // 2. Try yt-dlp second (for exact duration and detailed metadata)
   try {
-    const ytdlpMeta = await getYtDlpMetadata(targetUrl, binPath, 8000);
+    const ytdlpMeta = await getYtDlpMetadata(targetUrl, binPath, 4000);
     if (ytdlpMeta) {
       return ytdlpMeta;
-    }
-    // Fallback: retry without cookies in case cookies are expired/blocking
-    const noCookieMeta = await getYtDlpMetadata(targetUrl, binPath, 6000, []);
-    if (noCookieMeta) {
-      return noCookieMeta;
     }
   } catch {}
 
