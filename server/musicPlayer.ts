@@ -912,18 +912,18 @@ export async function getYouTubeMetadata(urlOrVideoId: string, ytdlpPath?: strin
     }
   } catch {}
 
-  // 3. Fallback to YouTube oEmbed
-  const oembed = await getYouTubeOEmbed(targetUrl);
-  if (oembed) {
-    const parsed = parseTitleAndArtist(oembed.title, oembed.author);
+  // 3. Fallback to YouTube oEmbed (if not already tried)
+  const oembedFallback = await getYouTubeOEmbed(targetUrl);
+  if (oembedFallback) {
+    const parsed = parseTitleAndArtist(oembedFallback.title, oembedFallback.author);
     return {
       id: videoId || "",
       url: targetUrl,
       title: parsed.title,
-      artist: parsed.artist || oembed.author || "Artis YouTube",
+      artist: parsed.artist || oembedFallback.author || "Artis YouTube",
       duration: "Audio",
       durationSec: undefined,
-      thumbnail: oembed.thumbnail || (videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : undefined),
+      thumbnail: oembedFallback.thumbnail || (videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : undefined),
     };
   }
 
