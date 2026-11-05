@@ -166,7 +166,7 @@ export function getPoTokenFromCookies(): string | undefined {
 // Automatically injects PO Token (from env or cookies.txt) and visitor_data
 export function getYtExtractorArgs(hasCookies?: boolean, clientOverride?: string): string[] {
   const customClient = clientOverride || process.env.YOUTUBE_PLAYER_CLIENT?.trim();
-  const playerClients = customClient || "android,ios,web_creator,web,web_embedded";
+  const playerClients = customClient || "tv_embedded,mweb,web_safari,android,ios";
   const parts: string[] = [`player_client=${playerClients}`];
 
   const poToken = getPoTokenFromCookies();
@@ -2045,9 +2045,9 @@ export async function createAudioResourceFromYtDlp(
   const attemptStream = async (attempt: number): Promise<any> => {
     logger.info({ attempt, targetUrl }, `Attempting YouTube stream (Percobaan ${attempt}/2)...`);
 
-    // Tier 1: Fallback chain (android,ios,web_creator,web,web_embedded) with cookies & PO Token
+    // Tier 1: Fallback chain (tv_embedded,mweb,web_safari,android,ios) with cookies & PO Token
     try {
-      const client = "android,ios,web_creator,web,web_embedded";
+      const client = "tv_embedded,mweb,web_safari,android,ios";
       logger.info({ client, tier: 1 }, `Starting yt-dlp with client: ${client} (cookies: ${cookieArgs.length > 0})`);
       const resource = await tryPipedStream(
         ytdlpPath,
@@ -2061,27 +2061,25 @@ export async function createAudioResourceFromYtDlp(
       logger.warn({ client: "fallback_chain_cookies", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
     }
 
-    // Tier 2: Fallback chain WITHOUT cookies (in case cookies are invalid or blocked)
-    if (cookieArgs.length > 0) {
-      try {
-        const client = "android,ios,web_creator,web,web_embedded";
-        logger.info({ client, tier: 2 }, `Starting yt-dlp with client: ${client} (no cookies)`);
-        const resource = await tryPipedStream(
-          ytdlpPath,
-          buildPipeArgs(getYtExtractorArgs(false, client), false),
-          seekSeconds,
-          12000
-        );
-        logger.info({ client, tier: 2 }, `Stream started successfully with client: ${client} (no cookies)`);
-        return resource;
-      } catch (err: any) {
-        logger.warn({ client: "fallback_chain_no_cookies", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
-      }
+    // Tier 2: Dedicated tv_embedded client (bypasses datacenter bot block without cookies)
+    try {
+      const client = "tv_embedded";
+      logger.info({ client, tier: 2 }, `Starting yt-dlp with client: ${client}`);
+      const resource = await tryPipedStream(
+        ytdlpPath,
+        buildPipeArgs(["--extractor-args", `youtube:player_client=${client}`], false),
+        seekSeconds,
+        10000
+      );
+      logger.info({ client, tier: 2 }, `Stream started successfully with client: ${client}`);
+      return resource;
+    } catch (err: any) {
+      logger.warn({ client: "tv_embedded", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
     }
 
-    // Tier 3: Dedicated android client (high bypass rate on datacenter IPs)
+    // Tier 3: Dedicated mweb client
     try {
-      const client = "android";
+      const client = "mweb";
       logger.info({ client, tier: 3 }, `Starting yt-dlp with client: ${client}`);
       const resource = await tryPipedStream(
         ytdlpPath,
@@ -2092,12 +2090,12 @@ export async function createAudioResourceFromYtDlp(
       logger.info({ client, tier: 3 }, `Stream started successfully with client: ${client}`);
       return resource;
     } catch (err: any) {
-      logger.warn({ client: "android", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+      logger.warn({ client: "mweb", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
     }
 
-    // Tier 4: Dedicated ios client
+    // Tier 4: Dedicated android client
     try {
-      const client = "ios";
+      const client = "android";
       logger.info({ client, tier: 4 }, `Starting yt-dlp with client: ${client}`);
       const resource = await tryPipedStream(
         ytdlpPath,
@@ -2108,12 +2106,12 @@ export async function createAudioResourceFromYtDlp(
       logger.info({ client, tier: 4 }, `Stream started successfully with client: ${client}`);
       return resource;
     } catch (err: any) {
-      logger.warn({ client: "ios", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+      logger.warn({ client: "android", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
     }
 
-    // Tier 5: Dedicated web_creator client
+    // Tier 5: Dedicated ios client
     try {
-      const client = "web_creator";
+      const client = "ios";
       logger.info({ client, tier: 5 }, `Starting yt-dlp with client: ${client}`);
       const resource = await tryPipedStream(
         ytdlpPath,
@@ -2124,10 +2122,10 @@ export async function createAudioResourceFromYtDlp(
       logger.info({ client, tier: 5 }, `Stream started successfully with client: ${client}`);
       return resource;
     } catch (err: any) {
-      logger.warn({ client: "web_creator", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+      logger.warn({ client: "ios", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
     }
 
-    // Tier 6: Direct URL extraction -> FFmpeg (fallback)
+    // Tier 6: Direct URL extraction -> FFmpeg
     try {
       logger.info({ tier: 6 }, "Starting yt-dlp with client: direct_url");
       const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000, cookieArgs);
@@ -2138,6 +2136,18 @@ export async function createAudioResourceFromYtDlp(
       }
     } catch (err: any) {
       logger.warn({ tier: 6, err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+    }
+
+    // Tier 7: play-dl streaming fallback (works without yt-dlp)
+    try {
+      logger.info({ tier: 7 }, "Attempting stream via play-dl fallback...");
+      const resource = await createAudioResourceFromTrackUrl(targetUrl, seekSeconds);
+      if (resource) {
+        logger.info({ tier: 7 }, "Stream started successfully via play-dl fallback");
+        return resource;
+      }
+    } catch (err: any) {
+      logger.warn({ tier: 7, err: err?.message || err }, `play-dl stream fallback failed: [${err?.message || err}]`);
     }
 
     throw new Error("Semua tier streaming yt-dlp gagal memuat audio.");

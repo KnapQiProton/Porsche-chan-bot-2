@@ -16,7 +16,8 @@ RUN apt-get update && apt-get install -y \
 ENV PATH="/root/.local/bin:$PATH"
 
 # Install yt-dlp via pipx (Python-based, supports plugins and --update-to nightly)
-RUN pipx install --pip-args="--pre" "yt-dlp[default]"
+RUN pipx install --pip-args="--pre" "yt-dlp[default]" && \
+    pipx inject yt-dlp bgutil-ytdlp-pot-provider 2>/dev/null || true
 
 WORKDIR /app
 
