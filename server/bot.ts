@@ -55,7 +55,7 @@ import {
   ParsedAnimeQuery,
   BooruPostResult,
 } from "./animeTagEngine";
-import { handleYtFixCommand, handleYtFixMessage } from "./ytDiagnostics";
+import { handleYtCheckButton, handleYtFixCommand, handleYtFixMessage } from "./ytDiagnostics";
 import {
   searchWeb,
   shouldAutoSearchWeb,
@@ -2915,6 +2915,11 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   // Handle pagination button clicks for /think and /illust
   if (interaction.isButton()) {
     const customId = interaction.customId;
+    if (customId.startsWith("ytcheck_close")) {
+      await handleYtCheckButton(interaction);
+      return;
+    }
+
     if (customId.startsWith("think_page1_") || customId.startsWith("think_page2_")) {
       const page = customId.startsWith("think_page1_") ? 1 : 2;
       const thinkId = customId.replace(/^think_page[12]_/, "");

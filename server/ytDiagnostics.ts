@@ -1,4 +1,8 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonInteraction,
+  ButtonStyle,
   ChatInputCommandInteraction,
   EmbedBuilder,
   GuildMember,
@@ -412,6 +416,46 @@ export function isAuthorizedUser(userId: string, member: GuildMember | null): bo
 }
 
 /**
+ * Build the close button row for a `/check` result message.
+ * The invoker id is embedded so only they (or an admin) can dismiss it.
+ */
+export function buildCheckCloseRow(userId: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ytcheck_close:${userId}`)
+      .setLabel("Tutup")
+      .setEmoji("✖️")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+/**
+ * Handle the close button attached to a `/check` diagnostic message.
+ */
+export async function handleYtCheckButton(interaction: ButtonInteraction): Promise<void> {
+  const invokerId = interaction.customId.split(":")[1];
+  const member = interaction.member as GuildMember | null;
+
+  if (invokerId !== interaction.user.id && !isAuthorizedUser(interaction.user.id, member)) {
+    await interaction.reply({
+      content: "❌ Hanya pemanggil `/check` atau Administrator yang bisa menutup pesan ini.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  try {
+    await interaction.message.delete();
+  } catch (error) {
+    logger.warn({ error }, "Gagal menghapus pesan /check via tombol close");
+    await interaction.reply({
+      content: "⚠️ Gagal menghapus pesan. Mungkin sudah dihapus atau bot tidak punya izin Manage Messages.",
+      ephemeral: true,
+    });
+  }
+}
+
+/**
  * Handle Slash Command `/ytfix` and `/check`
  */
 export async function handleYtFixCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -512,7 +556,10 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
       .setFooter({ text: "Diagnosa Selesai • Sistem Normal" })
       .setTimestamp();
 
-    await interaction.editReply({ embeds: [healthyEmbed] });
+    await interaction.editReply({
+      embeds: [healthyEmbed],
+      components: [buildCheckCloseRow(interaction.user.id)],
+    });
     return;
   }
 
@@ -588,7 +635,10 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
       .setFooter({ text: "Auto-Fix Berhasil!" })
       .setTimestamp();
 
-    await interaction.editReply({ embeds: [fixedEmbed] });
+    await interaction.editReply({
+      embeds: [fixedEmbed],
+      components: [buildCheckCloseRow(interaction.user.id)],
+    });
   } else {
     const failedEmbed = new EmbedBuilder()
       .setColor(0xed4245) // Merah
@@ -624,7 +674,10 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
       .setFooter({ text: "Auto-Fix Selesai • Diperlukan Tindakan Manual" })
       .setTimestamp();
 
-    await interaction.editReply({ embeds: [failedEmbed] });
+    await interaction.editReply({
+      embeds: [failedEmbed],
+      components: [buildCheckCloseRow(interaction.user.id)],
+    });
   }
 }
 
@@ -719,7 +772,10 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
       .setFooter({ text: "Diagnosa Selesai • Sistem Normal" })
       .setTimestamp();
 
-    await replyMsg.edit({ embeds: [healthyEmbed] });
+    await replyMsg.edit({
+      embeds: [healthyEmbed],
+      components: [buildCheckCloseRow(message.author.id)],
+    });
     return;
   }
 
@@ -784,7 +840,10 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
       .setFooter({ text: "Auto-Fix Berhasil!" })
       .setTimestamp();
 
-    await replyMsg.edit({ embeds: [fixedEmbed] });
+    await replyMsg.edit({
+      embeds: [fixedEmbed],
+      components: [buildCheckCloseRow(message.author.id)],
+    });
   } else {
     const failedEmbed = new EmbedBuilder()
       .setColor(0xed4245)
@@ -820,6 +879,9 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
       .setFooter({ text: "Auto-Fix Selesai • Diperlukan Tindakan Manual" })
       .setTimestamp();
 
-    await replyMsg.edit({ embeds: [failedEmbed] });
+    await replyMsg.edit({
+      embeds: [failedEmbed],
+      components: [buildCheckCloseRow(message.author.id)],
+    });
   }
 }
