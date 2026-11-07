@@ -232,6 +232,171 @@ export async function checkPotProvider(): Promise<{ reachable: boolean; url: str
   }
 }
 
+// ---------------------------------------------------------------------------
+// Structured YouTube failure diagnostics
+//
+// Every playback failure ends up as ONE copy-pasteable block prefixed with
+// [YT-FAIL]. The block is written to the logs verbatim, kept in memory for
+// `/check` (and `/logs`), and a compact version is shown to the user. That way
+// troubleshooting does not depend on guessing which tier failed or why.
+// ---------------------------------------------------------------------------
+
+export interface TierFailureDiagnostics {
+  attempt: number;
+  tier: number;
+  clients: string;
+  cookies: boolean;
+  elapsedMs: number;
+  stage: "yt-dlp" | "ffmpeg" | "timeout" | "spawn" | "unknown";
+  ytdlpExitCode?: number | null;
+  ffmpegExitCode?: number | null;
+  ytdlpStderr?: string;
+  ffmpegStderr?: string;
+  reason: string;
+}
+
+export interface YtFailureDiagnostic {
+  full: string;
+  short: string;
+}
+
+export interface LastYtFailure {
+  at: string;
+  videoId?: string;
+  url: string;
+  report: string;
+}
+
+let lastYtFailure: LastYtFailure | null = null;
+let cachedYtDlpVersion: string | undefined;
+
+export function getLastYtFailure(): LastYtFailure | null {
+  return lastYtFailure;
+}
+
+/**
+ * Turn raw child-process stderr into a few readable lines: drop ANSI colors,
+ * download progress noise, and duplicate lines, then prefer real error lines.
+ */
+export function cleanProcessStderr(raw: string, maxLines = 6): string {
+  if (!raw) return "";
+
+  const lines = raw
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^\[(download|info|debug)\]/i.test(line))
+    .filter((line) => !/^frame=\s*\d+/i.test(line) && !/^size=\s*\d+/i.test(line))
+    .filter((line) => !/^time=\S+/i.test(line));
+
+  const important = lines.filter((line) =>
+    /(error|warning|denied|forbidden|403|401|429|not a bot|sign in|unable|failed|timed? ?out|no such file)/i.test(line)
+  );
+
+  const picked = (important.length ? important : lines).slice(-maxLines);
+  const unique = [...new Set(picked)];
+  return unique.join(" ⏎ ").slice(0, 1200);
+}
+
+function summarizeYtdlpError(raw: string): string {
+  const cleaned = cleanProcessStderr(raw, 4);
+  return cleaned ? cleaned.split(" ⏎ ")[0].slice(0, 400) : "";
+}
+
+function getYtDlpVersion(ytdlpPath: string): string {
+  if (cachedYtDlpVersion) return cachedYtDlpVersion;
+  try {
+    const res = spawnSync(ytdlpPath, ["--version"], { timeout: 2500, encoding: "utf-8" });
+    if (res.status === 0 && res.stdout) {
+      cachedYtDlpVersion = String(res.stdout).trim().split("\n")[0];
+    }
+  } catch {}
+  return cachedYtDlpVersion || "unknown";
+}
+
+/**
+ * Build the full diagnostic block (for logs / attached .txt) plus a compact
+ * version (for the Discord error message). Never throws.
+ */
+export async function buildYtFailureReport(input: {
+  url: string;
+  videoId?: string;
+  seekSeconds: number;
+  attempts: number;
+  botCheck: boolean;
+  tiers: Array<{ clients: string; timeoutMs: number }>;
+  failures: TierFailureDiagnostics[];
+  ytdlpPath: string;
+}): Promise<YtFailureDiagnostic> {
+  let cookie: { hasCookies: boolean; path?: string; loggedIn: boolean; cookieCount: number } = {
+    hasCookies: false,
+    loggedIn: false,
+    cookieCount: 0,
+  };
+  let pot: { reachable: boolean; url: string; version?: string } = { reachable: false, url: "unknown" };
+
+  try {
+    cookie = getCookieAuthInfo();
+  } catch {}
+  try {
+    pot = await checkPotProvider();
+  } catch {}
+
+  const proxy = process.env.YTDLP_PROXY?.trim() || process.env.YOUTUBE_PROXY?.trim() || "none";
+  const ytdlpVersion = getYtDlpVersion(input.ytdlpPath);
+  const cookieLabel = cookie.hasCookies
+    ? `yes | login=${cookie.loggedIn ? "YES" : "NO (guest)"} | entries=${cookie.cookieCount} | ${cookie.path || "env"}`
+    : "none";
+  const potLabel = `${pot.reachable ? `reachable v${pot.version || "?"}` : "UNREACHABLE"} | ${pot.url}`;
+
+  const header: string[] = [
+    `time       : ${new Date().toISOString()}`,
+    `url        : ${input.url}`,
+    `videoId    : ${input.videoId || "n/a"}${input.seekSeconds ? ` | seek=${input.seekSeconds}s` : ""}`,
+    `attempts   : ${input.attempts}`,
+    `bot-check  : ${input.botCheck ? "YES — IP diblokir, butuh cookies login / proxy residential" : "no"}`,
+    `cookies    : ${cookieLabel}`,
+    `pot        : ${potLabel}`,
+    `proxy      : ${proxy}`,
+    `yt-dlp     : ${ytdlpVersion}`,
+    `node       : ${process.version} | ${process.platform}/${process.arch}`,
+    `tiers      : ${input.tiers.map((t, i) => `T${i + 1}=${t.clients}(${t.timeoutMs}ms)`).join(" | ")}`,
+  ];
+
+  const failureLines: string[] = [];
+  for (const f of input.failures.slice(-12)) {
+    const exits = [
+      f.ytdlpExitCode !== undefined && f.ytdlpExitCode !== null ? `yt-dlp-exit=${f.ytdlpExitCode}` : "",
+      f.ffmpegExitCode !== undefined && f.ffmpegExitCode !== null ? `ffmpeg-exit=${f.ffmpegExitCode}` : "",
+    ].filter(Boolean).join(" | ");
+    failureLines.push(
+      `[T${f.tier} ${f.clients} | attempt=${f.attempt} | cookies=${f.cookies ? "yes" : "no"} | ` +
+      `${f.elapsedMs}ms | stage=${f.stage}${exits ? ` | ${exits}` : ""}]`
+    );
+    failureLines.push(`  reason: ${f.reason.replace(/\s+/g, " ")}`);
+    if (f.ytdlpStderr) failureLines.push(`  yt-dlp: ${f.ytdlpStderr}`);
+    if (f.ffmpegStderr) failureLines.push(`  ffmpeg: ${f.ffmpegStderr}`);
+  }
+
+  const full = [
+    "==================== [YT-FAIL] ====================",
+    ...header,
+    "--- failures (terakhir) ---",
+    ...(failureLines.length ? failureLines : ["  (tidak ada detail tier)"]),
+    "===================================================",
+  ].join("\n");
+
+  const short = [
+    `[YT-FAIL] video=${input.videoId || "n/a"} bot-check=${input.botCheck ? "YES" : "no"} ` +
+      `cookies=${cookie.hasCookies ? (cookie.loggedIn ? `login(${cookie.cookieCount})` : `guest(${cookie.cookieCount})`) : "none"} ` +
+      `pot=${pot.reachable ? "ok" : "DOWN"} proxy=${proxy === "none" ? "none" : "set"} yt-dlp=${ytdlpVersion}`,
+    ...input.failures.slice(-3).map((f) => `T${f.tier} ${f.clients}: ${f.reason}`),
+  ].filter(Boolean).join("\n").slice(0, 900);
+
+  return { full, short };
+}
+
 // Common yt-dlp flags for Railway/datacenter environments
 function getCommonYtDlpFlags(): string[] {
   const flags = [
@@ -363,10 +528,12 @@ export async function getOrDownloadYtDlp(): Promise<string> {
 
   // 1. Check if yt-dlp is available in system PATH directly
   try {
-    const test = spawnSync(cmdName, ["--version"], { timeout: 2000, stdio: "ignore" });
+    const test = spawnSync(cmdName, ["--version"], { timeout: 2000, encoding: "utf-8" });
     if (test.status === 0) {
+      const version = String(test.stdout || "").trim().split("\n")[0];
+      if (version) cachedYtDlpVersion = version;
       cachedYtDlpPath = cmdName;
-      logger.info({ cmd: cmdName }, "Found working yt-dlp in system PATH");
+      logger.info({ cmd: cmdName, version }, "Found working yt-dlp in system PATH");
       return cmdName;
     }
   } catch {}
@@ -379,6 +546,7 @@ export async function getOrDownloadYtDlp(): Promise<string> {
       if (!isWin) fs.chmodSync(localYtDlp, 0o755);
     } catch {}
     cachedYtDlpPath = localYtDlp;
+    getYtDlpVersion(localYtDlp);
     return localYtDlp;
   }
 
@@ -401,6 +569,7 @@ export async function getOrDownloadYtDlp(): Promise<string> {
         if (!isWin) fs.chmodSync(sysPath, 0o755);
       } catch {}
       cachedYtDlpPath = sysPath;
+      getYtDlpVersion(sysPath);
       logger.info({ path: sysPath }, "Found existing yt-dlp binary");
       return sysPath;
     }
@@ -1838,12 +2007,49 @@ function tryPipedStream(
   timeoutMs: number = 15000
 ): Promise<any> {
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     let settled = false;
     let ytdlp: any;
     let ffmpeg: any;
 
     let ytdlpStderr = "";
+    let ffmpegStderr = "";
     let ytdlpExitCode: number | null = null;
+    let ffmpegExitCode: number | null = null;
+    let timer: NodeJS.Timeout | null = null;
+
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      try {
+        if (ytdlp && !ytdlp.killed) ytdlp.kill("SIGKILL");
+      } catch {}
+      try {
+        if (ffmpeg && !ffmpeg.killed) ffmpeg.kill("SIGKILL");
+      } catch {}
+    };
+
+    // Everything a failure report needs, captured at the moment of failure.
+    const buildDiagnostics = (stage: TierFailureDiagnostics["stage"]) => ({
+      stage,
+      elapsedMs: Date.now() - startedAt,
+      ytdlpExitCode,
+      ffmpegExitCode,
+      ytdlpStderr: cleanProcessStderr(ytdlpStderr),
+      ffmpegStderr: cleanProcessStderr(ffmpegStderr),
+    });
+
+    const fail = (stage: TierFailureDiagnostics["stage"], message: string, cause?: any) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      cleanup();
+      const error: any = cause instanceof Error ? cause : new Error(message);
+      if (!error.message || error.message === "undefined") error.message = message;
+      error.diagnostics = buildDiagnostics(stage);
+      reject(error);
+    };
 
     try {
       ytdlp = spawn(ytdlpPath, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
@@ -1865,21 +2071,9 @@ function tryPipedStream(
         "pipe:1"
       ];
       ffmpeg = spawn(FFMPEG_BIN, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
-    } catch (spawnErr) {
-      return reject(spawnErr);
+    } catch (spawnErr: any) {
+      return fail("spawn", `Gagal menjalankan proses stream: ${spawnErr?.message || spawnErr}`, spawnErr);
     }
-
-    let cleanedUp = false;
-    const cleanup = () => {
-      if (cleanedUp) return;
-      cleanedUp = true;
-      try {
-        if (ytdlp && !ytdlp.killed) ytdlp.kill("SIGKILL");
-      } catch {}
-      try {
-        if (ffmpeg && !ffmpeg.killed) ffmpeg.kill("SIGKILL");
-      } catch {}
-    };
 
     // Catch EPIPE on stdout/stdin to prevent backpressure crashes
     ytdlp.stdout.on("error", (err: any) => {
@@ -1898,7 +2092,6 @@ function tryPipedStream(
       }
     });
 
-    let ffmpegStderr = "";
     ffmpeg.stderr.on("data", (d: Buffer) => {
       ffmpegStderr = (ffmpegStderr + d.toString()).slice(-4000);
     });
@@ -1909,29 +2102,23 @@ function tryPipedStream(
     ytdlp.stdout.pipe(ffmpeg.stdin);
 
     const getErrorDetail = () => {
-      const ytErr = ytdlpStderr.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
-      const ffErr = ffmpegStderr.trim().split("\n").filter(Boolean).slice(-2).join(" | ");
+      const ytErr = summarizeYtdlpError(ytdlpStderr);
+      const ffErr = cleanProcessStderr(ffmpegStderr, 2);
       const parts: string[] = [];
       if (ytdlpExitCode !== null) parts.push(`yt-dlp exit ${ytdlpExitCode}`);
+      if (ffmpegExitCode !== null) parts.push(`ffmpeg exit ${ffmpegExitCode}`);
       if (ytErr) parts.push(`yt-dlp: ${ytErr}`);
       if (ffErr) parts.push(`ffmpeg: ${ffErr}`);
       return parts.join(" — ").slice(0, 700) || "stream berhenti tanpa detail error";
     };
 
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        cleanup();
-        reject(new Error("Piped audio stream timeout"));
-      }
+    timer = setTimeout(() => {
+      fail("timeout", `Piped audio stream timeout (${timeoutMs}ms) — tidak ada data audio dari YouTube`);
     }, timeoutMs);
 
     ytdlp.on("error", (err: any) => {
       if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        cleanup();
-        reject(err);
+        fail("spawn", `yt-dlp gagal dijalankan: ${err?.message || err}`, err);
       } else {
         cleanup();
       }
@@ -1939,10 +2126,7 @@ function tryPipedStream(
 
     ffmpeg.on("error", (err: any) => {
       if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        cleanup();
-        reject(err);
+        fail("spawn", `FFmpeg gagal dijalankan: ${err?.message || err}`, err);
       } else {
         cleanup();
       }
@@ -1951,21 +2135,16 @@ function tryPipedStream(
     ytdlp.on("close", (code: number) => {
       ytdlpExitCode = code;
       if (!settled && code !== 0) {
-        settled = true;
-        clearTimeout(timer);
-        cleanup();
-        const detail = ytdlpStderr.trim() ? `: ${ytdlpStderr.trim().slice(0, 300)}` : "";
-        reject(new Error(`yt-dlp exited with error code ${code}${detail}`));
+        const summary = summarizeYtdlpError(ytdlpStderr);
+        fail("yt-dlp", `yt-dlp exited with error code ${code}${summary ? `: ${summary}` : ""}`);
       }
     });
 
     ffmpeg.on("close", (code: number) => {
+      ffmpegExitCode = code;
       if (!settled && code !== 0) {
-        settled = true;
-        clearTimeout(timer);
-        cleanup();
-        const detail = ffmpegStderr.trim() ? `: ${ffmpegStderr.trim().slice(0, 300)}` : "";
-        reject(new Error(`FFmpeg exited with error code ${code}${detail}`));
+        const summary = cleanProcessStderr(ffmpegStderr, 2);
+        fail("ffmpeg", `FFmpeg exited with error code ${code}${summary ? `: ${summary}` : ""}`);
       } else if (settled) {
         cleanup();
       }
@@ -1974,7 +2153,7 @@ function tryPipedStream(
     const onData = (chunk: Buffer) => {
       if (!settled) {
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         ffmpeg.stdout.removeListener("data", onData);
         const pt = new PassThrough();
         pt.write(chunk);
@@ -1988,6 +2167,7 @@ function tryPipedStream(
         const resource = createAudioResource(pt, { inputType: StreamType.Raw });
         (resource as any)._cleanupProcesses = cleanup;
         (resource as any)._getErrorDetail = getErrorDetail;
+        (resource as any)._diagnostics = buildDiagnostics("unknown");
         resolve(resource);
       }
     };
@@ -2131,6 +2311,7 @@ export async function createAudioResourceFromYtDlp(
       ];
 
   const tierErrors: string[] = [];
+  const tierFailures: TierFailureDiagnostics[] = [];
   let botCheckDetected = false;
 
   const attemptStream = async (attempt: number): Promise<any> => {
@@ -2158,10 +2339,24 @@ export async function createAudioResourceFromYtDlp(
         if (/sign in to confirm|not a bot|confirm you(?:'|’)?re not a bot/i.test(rawMsg)) {
           botCheckDetected = true;
         }
+        const diag = err?.diagnostics || {};
+        tierFailures.push({
+          attempt,
+          tier: i + 1,
+          clients: tier.clients,
+          cookies: useCookies,
+          elapsedMs: Number(diag.elapsedMs) || 0,
+          stage: diag.stage || "unknown",
+          ytdlpExitCode: diag.ytdlpExitCode ?? null,
+          ffmpegExitCode: diag.ffmpegExitCode ?? null,
+          ytdlpStderr: diag.ytdlpStderr || "",
+          ffmpegStderr: diag.ffmpegStderr || "",
+          reason: rawMsg.slice(0, 500),
+        });
         const msg = `T${i + 1} ${tier.clients}: ${rawMsg}`;
         tierErrors.push(msg);
         logger.warn(
-          { tier: i + 1, clients: tier.clients, err: rawMsg },
+          { tier: i + 1, clients: tier.clients, stage: diag.stage, err: rawMsg },
           `Stream tier ${i + 1} failed: [${rawMsg}]`
         );
       }
@@ -2176,9 +2371,31 @@ export async function createAudioResourceFromYtDlp(
         logger.info({ tier: 6 }, "Stream started successfully via direct URL pipe");
         return resource;
       }
+      const noUrlMsg = "yt-dlp tidak mengembalikan URL audio (null)";
+      tierErrors.push(`T6 direct-url: ${noUrlMsg}`);
+      tierFailures.push({
+        attempt,
+        tier: 6,
+        clients: "direct-url",
+        cookies: cookieArgs.length > 0,
+        elapsedMs: 0,
+        stage: "unknown",
+        reason: noUrlMsg,
+      });
+      logger.warn({ tier: 6 }, `Stream failed: [${noUrlMsg}]`);
     } catch (err: any) {
-      tierErrors.push(`T6 direct-url: ${err?.message || err}`);
-      logger.warn({ tier: 6, err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+      const rawMsg = String(err?.message || err);
+      tierErrors.push(`T6 direct-url: ${rawMsg}`);
+      tierFailures.push({
+        attempt,
+        tier: 6,
+        clients: "direct-url",
+        cookies: cookieArgs.length > 0,
+        elapsedMs: 0,
+        stage: "unknown",
+        reason: rawMsg.slice(0, 500),
+      });
+      logger.warn({ tier: 6, err: rawMsg }, `Stream failed: [${rawMsg}]`);
     }
 
     // Tier 7: play-dl streaming fallback (works without yt-dlp)
@@ -2190,8 +2407,18 @@ export async function createAudioResourceFromYtDlp(
         return resource;
       }
     } catch (err: any) {
-      tierErrors.push(`T7 play-dl: ${err?.message || err}`);
-      logger.warn({ tier: 7, err: err?.message || err }, `play-dl stream fallback failed: [${err?.message || err}]`);
+      const rawMsg = String(err?.message || err);
+      tierErrors.push(`T7 play-dl: ${rawMsg}`);
+      tierFailures.push({
+        attempt,
+        tier: 7,
+        clients: "play-dl",
+        cookies: cookieArgs.length > 0,
+        elapsedMs: 0,
+        stage: "unknown",
+        reason: rawMsg.slice(0, 500),
+      });
+      logger.warn({ tier: 7, err: rawMsg }, `play-dl stream fallback failed: [${rawMsg}]`);
     }
 
     const detail = tierErrors.slice(-4).join(" | ");
@@ -2214,21 +2441,48 @@ export async function createAudioResourceFromYtDlp(
   try {
     return await attemptStream(2);
   } catch (err2: any) {
-    logger.error({ err: err2?.message }, "YouTube stream attempt 2 (retry) also failed.");
     const isBotCheck =
       Boolean(err2?.botCheck) ||
       /sign in to confirm|not a bot|confirm you(?:'|’)?re not a bot/i.test(String(err2?.message || ""));
-    if (isBotCheck) {
-      throw new Error(
-        "YouTube memblokir IP server ini dengan verifikasi login (\"Sign in to confirm you're not a bot\"). " +
-        "PO Token saja tidak cukup untuk IP datacenter seperti Railway. " +
-        "Upload cookies akun YouTube lewat `/cookies` (sekali saja) atau set env `YOUTUBE_COOKIE`, lalu coba `/play` lagi. " +
-        `Detail: ${String(err2?.message || err2).slice(0, 350)}`
-      );
-    }
-    throw new Error(
-      `Gagal memutar audio dari YouTube setelah 2 percobaan. YouTube memblokir IP server (403) atau provider PO Token tidak aktif. Jalankan \`/check\` untuk diagnosa. Detail: ${String(err2?.message || err2).slice(0, 500)}`
+
+    // One structured block for the logs, one compact block for the user.
+    const diagnostic = await buildYtFailureReport({
+      url: targetUrl,
+      videoId: videoId || undefined,
+      seekSeconds,
+      attempts: 2,
+      botCheck: isBotCheck,
+      tiers: streamTiers,
+      failures: tierFailures,
+      ytdlpPath,
+    });
+
+    lastYtFailure = {
+      at: new Date().toISOString(),
+      videoId: videoId || undefined,
+      url: targetUrl,
+      report: diagnostic.full,
+    };
+
+    logger.error(
+      `YouTube playback failed — diagnostic report\n${diagnostic.full}\n` +
+        `Semua tier gagal. Detail singkat: ${String(err2?.message || err2).slice(0, 300)}`
     );
+
+    const head = isBotCheck
+      ? "YouTube memblokir IP server ini dengan verifikasi login (\"Sign in to confirm you're not a bot\"). " +
+        "PO Token saja tidak cukup untuk IP datacenter seperti Railway. " +
+        "Upload cookies akun YouTube lewat `/cookies` (sekali saja) atau set env `YOUTUBE_COOKIE`, lalu coba `/play` lagi."
+      : "Gagal memutar audio dari YouTube setelah 2 percobaan. YouTube memblokir IP server (403) atau provider PO Token tidak aktif. Jalankan `/check` untuk diagnosa.";
+
+    const error: any = new Error(
+      `${head}\n\n${diagnostic.short}\n\n` +
+      "Salin blok [YT-FAIL] di atas (atau jalankan `/check` untuk file diagnosa lengkap)."
+    );
+    error.botCheck = isBotCheck;
+    error.report = diagnostic.full;
+    error.shortReport = diagnostic.short;
+    throw error;
   }
 }
 
@@ -2838,14 +3092,39 @@ export class MusicService {
       .replace(/\s+/g, " ")
       .slice(0, 900);
 
+    // Same copy-pasteable shape as the pre-stream failure report, so both kinds
+    // of failure are easy to grep in Railway logs and easy to read in chat.
+    const cookie = getCookieAuthInfo();
+    const pot = await checkPotProvider().catch(() => ({ reachable: false, url: "unknown", version: undefined }));
+    const block = [
+      "==================== [YT-FAIL mid-stream] ====================",
+      `time       : ${new Date().toISOString()}`,
+      `track      : ${title}`,
+      `url        : ${track?.url || "unknown"}`,
+      `tier       : ${tier || "unknown"}`,
+      `reason     : ${cleanReason}`,
+      `cookies    : ${cookie.hasCookies ? `yes | login=${cookie.loggedIn ? "YES" : "NO (guest)"} | entries=${cookie.cookieCount}` : "none"}`,
+      `pot        : ${pot.reachable ? `reachable v${pot.version || "?"}` : "UNREACHABLE"} | ${pot.url}`,
+      `yt-dlp     : ${cachedYtDlpVersion || "unknown"}`,
+      "==============================================================",
+    ].join("\n");
+    logger.error(block);
+    lastYtFailure = {
+      at: new Date().toISOString(),
+      videoId: extractYouTubeVideoId(track?.url || "") || undefined,
+      url: track?.url || "unknown",
+      report: block,
+    };
+
     const embed = new EmbedBuilder()
       .setColor(0xed4245)
       .setTitle("❌ Stream Terputus")
       .setDescription(
         `Gagal memutar **${title}**${tier ? ` • ${tier}` : ""}.\n` +
           `\`\`\`\n${cleanReason}\n\`\`\`\n` +
-          `> Jalankan \`/check\` untuk diagnosa YouTube.`
+          `> Jalankan \`/check\` untuk diagnosa, atau \`/logs\` untuk laporan lengkap.`
       )
+      .setFooter({ text: "Log lengkap tersimpan sebagai [YT-FAIL] di console" })
       .setTimestamp();
 
     if (!session.textChannel || !("send" in session.textChannel)) return;

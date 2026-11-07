@@ -56,7 +56,7 @@ import {
   ParsedAnimeQuery,
   BooruPostResult,
 } from "./animeTagEngine";
-import { handleYtCheckButton, handleYtFixCommand, handleYtFixMessage } from "./ytDiagnostics";
+import { handleYtCheckButton, handleYtFixCommand, handleYtFixMessage, handleLogsCommand, handleLogsMessage } from "./ytDiagnostics";
 import {
   searchWeb,
   shouldAutoSearchWeb,
@@ -2669,6 +2669,30 @@ export const COMMANDS = [
     .setName("check")
     .setDescription("Diagnosa kesehatan YouTube engine & auto-update yt-dlp jika terblokir")
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("logs")
+    .setDescription("Ambil log bot terbaru + laporan error YouTube ([YT-FAIL]) untuk troubleshooting")
+    .addIntegerOption((opt) =>
+      opt
+        .setName("jumlah")
+        .setDescription("Jumlah entri log yang diambil (5-150, default 60)")
+        .setMinValue(5)
+        .setMaxValue(150)
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("level")
+        .setDescription("Filter level log")
+        .setRequired(false)
+        .addChoices(
+          { name: "Semua", value: "semua" },
+          { name: "Error", value: "error" },
+          { name: "Warning", value: "warn" },
+          { name: "Info", value: "info" }
+        )
+    )
+    .toJSON(),
 ];
 
 // Discord Client
@@ -3416,6 +3440,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     await handleYtFixCommand(interaction);
     return;
   }
+
+  if (interaction.commandName === "logs") {
+    await handleLogsCommand(interaction);
+    return;
+  }
 }
 
 // Flag reactions for translation (AI-Powered)
@@ -3608,6 +3637,11 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   if (rawContent === "!ytfix" || rawContent === "!check") {
     await handleYtFixMessage(message);
+    return;
+  }
+
+  if (rawContent === "!logs") {
+    await handleLogsMessage(message);
     return;
   }
 

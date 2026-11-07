@@ -1,5 +1,6 @@
 import {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
@@ -12,7 +13,7 @@ import {
 import { exec } from "child_process";
 import path from "path";
 import os from "os";
-import { logger } from "./logger";
+import { logger, getRecentLogs } from "./logger";
 import { CREATOR_ID } from "./bot";
 import {
   getOrDownloadYtDlp,
@@ -24,6 +25,7 @@ import {
   createAudioResourceFromYtDlp,
   getCookieStatus,
   getCookieAuthInfo,
+  getLastYtFailure,
   FFMPEG_BIN,
 } from "./musicPlayer";
 
@@ -32,6 +34,35 @@ const COOKIE_SOLUTION_TEXT =
   "2. Alternatif permanen: set env `YOUTUBE_COOKIE` (isi base64 dari `/cookies`) di Railway → Variables.\n" +
   "3. Agar upload `/cookies` tidak hilang saat redeploy, mount Railway Volume — bot otomatis menyimpan ke `RAILWAY_VOLUME_MOUNT_PATH`.\n" +
   "4. Opsional: set `YTDLP_PROXY` ke proxy residential jika punya.";
+
+/**
+ * Show the latest [YT-FAIL] block from a real playback attempt. This is the
+ * fastest way to see WHICH tier failed and WHY without digging in Railway logs.
+ */
+function buildLastFailureField(): { name: string; value: string; inline: boolean } | null {
+  const last = getLastYtFailure();
+  if (!last) return null;
+  return {
+    name: "🧾 Diagnosa Error Terakhir",
+    value: `\`\`\`text\n${last.report.slice(0, 980)}\n\`\`\``,
+    inline: false,
+  };
+}
+
+/**
+ * Full report as a .txt attachment (Discord embed fields cap at 1024 chars).
+ */
+function buildLastFailureFiles(): AttachmentBuilder[] {
+  const last = getLastYtFailure();
+  if (!last) return [];
+  const safeId = (last.videoId || "report").replace(/[^a-zA-Z0-9_-]/g, "") || "report";
+  return [
+    new AttachmentBuilder(Buffer.from(last.report, "utf-8"), {
+      name: `yt-fail-${safeId}.txt`,
+      description: "Laporan diagnosa YouTube lengkap ([YT-FAIL])",
+    }),
+  ];
+}
 
 export interface ShellExecResult {
   stdout: string;
@@ -463,6 +494,96 @@ export async function handleYtCheckButton(interaction: ButtonInteraction): Promi
 }
 
 /**
+ * `/logs` — dump recent in-memory logs + the latest [YT-FAIL] report as a .txt
+ * attachment. Owner/admin only, because logs can reveal cookie paths and URLs.
+ */
+export async function handleLogsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const member = interaction.member as GuildMember | null;
+  if (!isAuthorizedUser(interaction.user.id, member)) {
+    await interaction.reply({
+      content: "❌ Command ini hanya dapat dipanggil oleh Owner Bot atau Administrator server.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const limit = Math.min(Math.max(interaction.options.getInteger("jumlah") ?? 60, 5), 150);
+  const level = (interaction.options.getString("level") || "semua").toLowerCase();
+  await interaction.editReply(buildLogsPayload(limit, level));
+}
+
+/**
+ * `!logs` — same output as `/logs`.
+ */
+export async function handleLogsMessage(message: Message): Promise<void> {
+  if (!isAuthorizedUser(message.author.id, message.member)) {
+    const denied = await message.reply("❌ Command ini hanya dapat digunakan oleh Owner Bot atau Administrator server.");
+    setTimeout(() => denied.delete().catch(() => {}), 5000);
+    return;
+  }
+  await message.reply(buildLogsPayload(60, "semua"));
+}
+
+function buildLogsPayload(limit: number, level: string): { embeds: EmbedBuilder[]; files: AttachmentBuilder[] } {
+  const entries = getRecentLogs()
+    .filter((entry) => (level === "semua" ? true : entry.level === level))
+    .slice(-limit);
+  const last = getLastYtFailure();
+
+  const stringifyMeta = (meta: any): string => {
+    try {
+      return JSON.stringify(meta, (_key, value) =>
+        value instanceof Error
+          ? { name: value.name, message: value.message, stack: String(value.stack || "").split("\n").slice(0, 3) }
+          : value
+      ).slice(0, 600);
+    } catch {
+      return String(meta).slice(0, 300);
+    }
+  };
+
+  const body = [
+    "===== BOT LOGS =====",
+    `generated  : ${new Date().toISOString()}`,
+    `entries    : ${entries.length} (level=${level})`,
+    `node       : ${process.version} | ${process.platform}/${process.arch}`,
+    "--------------------",
+    ...(entries.length
+      ? entries.map((entry) => {
+          const meta = entry.meta !== undefined ? ` ${stringifyMeta(entry.meta)}` : "";
+          return `[${entry.timestamp}] [${entry.level.toUpperCase()}] ${entry.message}${meta}`;
+        })
+      : ["(belum ada log di memori)"]),
+    "",
+    last ? "===== LAST [YT-FAIL] REPORT =====" : "",
+    last ? last.report : "",
+  ].filter((line) => line !== "").join("\n");
+
+  const file = new AttachmentBuilder(Buffer.from(body, "utf-8"), {
+    name: `bot-logs-${Date.now()}.txt`,
+    description: "Log bot terbaru + laporan [YT-FAIL] terakhir",
+  });
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("🧾 Log Bot")
+    .setDescription(
+      `Terlampir **${entries.length}** entri log${last ? " + laporan **[YT-FAIL]** terakhir" : ""}.\n` +
+        "Kirim file `.txt` ini ke assistant untuk troubleshooting."
+    )
+    .addFields(
+      { name: "🎚️ Level", value: level, inline: true },
+      { name: "🧾 YT-FAIL", value: last ? `✅ Ada (${last.videoId || last.url})` : "— Belum ada", inline: true }
+    )
+    .setFooter({ text: "Log disimpan di memori (maks. 200 entri terakhir)" })
+    .setTimestamp();
+
+  return { embeds: [embed], files: [file] };
+}
+
+/**
  * Handle Slash Command `/ytfix` and `/check`
  */
 export async function handleYtFixCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -520,6 +641,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
   // 7. Case A: Live Test Success -> Sistem Sehat (Hijau) atau Audio Gagal (Merah)
   if (test.success) {
     const streamOk = !streamTest || streamTest.success;
+    const lastFailureField = streamOk ? null : buildLastFailureField();
     const healthyEmbed = new EmbedBuilder()
       .setColor(streamOk ? 0x57f287 : 0xed4245) // Hijau / Merah
       .setTitle(streamOk ? "Sistem Sehat ✅" : "⚠️ Metadata OK — Audio Gagal ❌")
@@ -573,6 +695,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
             : "⏭️ Dilewati (live test metadata gagal)",
           inline: false,
         },
+        ...(lastFailureField ? [lastFailureField] : []),
         {
           name: streamOk ? "✨ Status Bot" : "💡 Solusi",
           value: streamOk ? "Siap memutar musik via command `/play`" : COOKIE_SOLUTION_TEXT,
@@ -582,9 +705,11 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
       .setFooter({ text: streamOk ? "Diagnosa Selesai • Sistem Normal" : "Diagnosa Selesai • Perlu Cookies Login" })
       .setTimestamp();
 
+    const files = streamOk ? [] : buildLastFailureFiles();
     await interaction.editReply({
       embeds: [healthyEmbed],
       components: [buildCheckCloseRow(interaction.user.id)],
+      ...(files.length ? { files } : {}),
     });
     return;
   }
@@ -666,6 +791,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
       components: [buildCheckCloseRow(interaction.user.id)],
     });
   } else {
+    const lastFailureField = buildLastFailureField();
     const failedEmbed = new EmbedBuilder()
       .setColor(0xed4245) // Merah
       .setTitle("Gagal Diperbaiki ❌")
@@ -682,6 +808,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
           value: `\`\`\`text\n${retest.rawError || test.rawError || "Tidak ada detail error"}\n\`\`\``,
           inline: false,
         },
+        ...(lastFailureField ? [lastFailureField] : []),
         {
           name: "⚠️ Analisis",
           value:
@@ -697,9 +824,11 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
       .setFooter({ text: "Auto-Fix Selesai • Diperlukan Tindakan Manual" })
       .setTimestamp();
 
+    const files = buildLastFailureFiles();
     await interaction.editReply({
       embeds: [failedEmbed],
       components: [buildCheckCloseRow(interaction.user.id)],
+      ...(files.length ? { files } : {}),
     });
   }
 }
@@ -752,6 +881,7 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
 
   if (test.success) {
     const streamOk = !streamTest || streamTest.success;
+    const lastFailureField = streamOk ? null : buildLastFailureField();
     const healthyEmbed = new EmbedBuilder()
       .setColor(streamOk ? 0x57f287 : 0xed4245)
       .setTitle(streamOk ? "Sistem Sehat ✅" : "⚠️ Metadata OK — Audio Gagal ❌")
@@ -805,6 +935,7 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
             : "⏭️ Dilewati (live test metadata gagal)",
           inline: false,
         },
+        ...(lastFailureField ? [lastFailureField] : []),
         {
           name: streamOk ? "✨ Status Bot" : "💡 Solusi",
           value: streamOk ? "Siap memutar musik via command `!play` atau `/play`" : COOKIE_SOLUTION_TEXT,
@@ -814,9 +945,11 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
       .setFooter({ text: streamOk ? "Diagnosa Selesai • Sistem Normal" : "Diagnosa Selesai • Perlu Cookies Login" })
       .setTimestamp();
 
+    const files = streamOk ? [] : buildLastFailureFiles();
     await replyMsg.edit({
       embeds: [healthyEmbed],
       components: [buildCheckCloseRow(message.author.id)],
+      ...(files.length ? { files } : {}),
     });
     return;
   }
@@ -887,6 +1020,7 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
       components: [buildCheckCloseRow(message.author.id)],
     });
   } else {
+    const lastFailureField = buildLastFailureField();
     const failedEmbed = new EmbedBuilder()
       .setColor(0xed4245)
       .setTitle("Gagal Diperbaiki ❌")
@@ -903,6 +1037,7 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
           value: `\`\`\`text\n${retest.rawError || test.rawError || "Tidak ada detail error"}\n\`\`\``,
           inline: false,
         },
+        ...(lastFailureField ? [lastFailureField] : []),
         {
           name: "⚠️ Analisis",
           value:
@@ -918,9 +1053,11 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
       .setFooter({ text: "Auto-Fix Selesai • Diperlukan Tindakan Manual" })
       .setTimestamp();
 
+    const files = buildLastFailureFiles();
     await replyMsg.edit({
       embeds: [failedEmbed],
       components: [buildCheckCloseRow(message.author.id)],
+      ...(files.length ? { files } : {}),
     });
   }
 }
