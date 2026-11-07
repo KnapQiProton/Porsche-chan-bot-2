@@ -15,6 +15,8 @@ import {
   clearCachedYtDlpPath,
   getYtDlpCookieArgs,
   getYtExtractorArgs,
+  getPotProviderArgs,
+  checkPotProvider,
   getCookieStatus,
   FFMPEG_BIN,
 } from "./musicPlayer";
@@ -169,11 +171,14 @@ export async function runYtLiveTest(ytdlpBin: string): Promise<LiveTestResult> {
 
   const cookieArgs = getYtDlpCookieArgs();
   const extractorArgs = getYtExtractorArgs(cookieArgs.length > 0);
+  const potArgs = getPotProviderArgs();
 
   const testCmd = [
     `"${ytdlpBin}"`,
     "--force-ipv4",
     "--no-check-certificates",
+    "--js-runtimes", "node",
+    ...potArgs,
     "-j",
     "--skip-download",
     "--print title",
@@ -346,6 +351,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
 
   // 4. Gather System Versions
   const sys = await getSystemVersions();
+  const pot = await checkPotProvider();
 
   // 5. Update Status: Running Live Test (Kuning)
   const testingEmbed = new EmbedBuilder()
@@ -377,6 +383,11 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
         { name: "🎵 yt-dlp", value: `\`${sys.ytdlp}\``, inline: true },
         { name: "🎬 FFmpeg", value: `\`${sys.ffmpeg}\``, inline: true },
         { name: "🍪 Cookies Aktif", value: `\`${getCookieStatus().source}\``, inline: true },
+        {
+          name: "🔑 PO Token Provider",
+          value: pot.reachable ? `✅ Aktif (\`${pot.url}\`)` : `⚠️ Tidak aktif (\`${pot.url}\`)`,
+          inline: true,
+        },
         {
           name: "📡 Hasil Live Test",
           value: `✅ Berhasil mengekstrak judul:\n**${test.title}** (${test.durationMs}ms)`,
@@ -528,6 +539,7 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
 
   // Gather versions
   const sys = await getSystemVersions();
+  const pot = await checkPotProvider();
 
   const testEmbed = new EmbedBuilder()
     .setColor(0xfee75c)
@@ -556,6 +568,11 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
         { name: "🎵 yt-dlp", value: `\`${sys.ytdlp}\``, inline: true },
         { name: "🎬 FFmpeg", value: `\`${sys.ffmpeg}\``, inline: true },
         { name: "🍪 Cookies Aktif", value: `\`${getCookieStatus().source}\``, inline: true },
+        {
+          name: "🔑 PO Token Provider",
+          value: pot.reachable ? `✅ Aktif (\`${pot.url}\`)` : `⚠️ Tidak aktif (\`${pot.url}\`)`,
+          inline: true,
+        },
         {
           name: "📡 Hasil Live Test",
           value: `✅ Berhasil mengekstrak judul:\n**${test.title}** (${test.durationMs}ms)`,

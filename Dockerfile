@@ -17,7 +17,15 @@ ENV PATH="/root/.local/bin:$PATH"
 
 # Install yt-dlp via pipx (Python-based, supports plugins and --update-to nightly)
 RUN pipx install --pip-args="--pre" "yt-dlp[default]" && \
-    pipx inject yt-dlp bgutil-ytdlp-pot-provider 2>/dev/null || true
+    pipx inject yt-dlp "bgutil-ytdlp-pot-provider==2.0.2" 2>/dev/null || true
+
+# Build the bgutil PO Token provider HTTP server (generates YouTube PO tokens without cookies).
+# Started on 127.0.0.1:4416 by entrypoint.sh.
+RUN git clone --depth 1 --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil-pot \
+    && cd /opt/bgutil-pot/server \
+    && npm ci \
+    && npx tsc \
+    && npm cache clean --force
 
 WORKDIR /app
 

@@ -161,12 +161,14 @@ export function getPoTokenFromCookies(): string | undefined {
   return undefined;
 }
 
-// Extractor arguments with priority chain: android,ios,web_creator,web,web_embedded
-// (Android/iOS clients are much harder for YouTube to block on datacenter IPs)
+// Valid player clients for yt-dlp 2026.x:
+// web, web_safari, web_embedded, web_music, web_creator, mweb, ios, visionos,
+// android, android_vr, tv, tv_downgraded, tv_samsung, tv_simply
+// NOTE: "tv_embedded" was removed upstream — passing it makes extraction fail.
 // Automatically injects PO Token (from env or cookies.txt) and visitor_data
 export function getYtExtractorArgs(hasCookies?: boolean, clientOverride?: string): string[] {
   const customClient = clientOverride || process.env.YOUTUBE_PLAYER_CLIENT?.trim();
-  const playerClients = customClient || "tv_embedded,mweb,web_safari,android,ios";
+  const playerClients = customClient || "default";
   const parts: string[] = [`player_client=${playerClients}`];
 
   const poToken = getPoTokenFromCookies();
@@ -183,12 +185,33 @@ export function getYtExtractorArgs(hasCookies?: boolean, clientOverride?: string
   return ["--extractor-args", `youtube:${parts.join(";")}`];
 }
 
+// Optional external bgutil POT provider (local server runs on 127.0.0.1:4416 by default)
+export function getPotProviderArgs(): string[] {
+  const baseUrl = process.env.YOUTUBE_POT_PROVIDER_URL?.trim();
+  if (!baseUrl) return [];
+  return ["--extractor-args", `youtubepot-bgutilhttp:base_url=${baseUrl}`];
+}
+
+// Quick health probe for the POT provider (used by /check diagnostics)
+export async function checkPotProvider(): Promise<{ reachable: boolean; url: string; version?: string }> {
+  const baseUrl = process.env.YOUTUBE_POT_PROVIDER_URL?.trim() || "http://127.0.0.1:4416";
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/ping`, { signal: AbortSignal.timeout(1500) });
+    if (!res.ok) return { reachable: false, url: baseUrl };
+    const data: any = await res.json().catch(() => ({}));
+    return { reachable: true, url: baseUrl, version: data?.version };
+  } catch {
+    return { reachable: false, url: baseUrl };
+  }
+}
+
 // Common yt-dlp flags for Railway/datacenter environments
 function getCommonYtDlpFlags(): string[] {
   const flags = [
     "--force-ipv4",
     "--no-check-certificates",
     "--js-runtimes", "node",
+    ...getPotProviderArgs(),
   ];
   return flags;
 }
@@ -2052,95 +2075,49 @@ export async function createAudioResourceFromYtDlp(
     targetUrl,
   ];
 
+  // Player-client tiers tuned for yt-dlp 2026.x ("tv_embedded" was removed upstream).
+  // Ordered from most capable to most permissive for datacenter IPs.
+  const streamTiers: Array<{ clients: string; timeoutMs: number; useCookies: boolean }> = [
+    { clients: "default", timeoutMs: 22000, useCookies: true },
+    { clients: "tv_simply", timeoutMs: 15000, useCookies: false },
+    { clients: "android_vr,visionos", timeoutMs: 15000, useCookies: false },
+    { clients: "mweb,tv,web_safari", timeoutMs: 15000, useCookies: false },
+    { clients: "ios,web_embedded", timeoutMs: 15000, useCookies: false },
+  ];
+
   const attemptStream = async (attempt: number): Promise<any> => {
     logger.info({ attempt, targetUrl }, `Attempting YouTube stream (Percobaan ${attempt}/2)...`);
 
-    // Tier 1: Fallback chain (tv_embedded,mweb,web_safari,android,ios) with cookies & PO Token
-    try {
-      const client = "tv_embedded,mweb,web_safari,android,ios";
-      logger.info({ client, tier: 1 }, `Starting yt-dlp with client: ${client} (cookies: ${cookieArgs.length > 0})`);
-      const resource = await tryPipedStream(
-        ytdlpPath,
-        buildPipeArgs(getYtExtractorArgs(cookieArgs.length > 0, client), cookieArgs.length > 0),
-        seekSeconds,
-        12000
-      );
-      logger.info({ client, tier: 1 }, `Stream started successfully with client: ${client}`);
-      return resource;
-    } catch (err: any) {
-      logger.warn({ client: "fallback_chain_cookies", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
-    }
-
-    // Tier 2: Dedicated tv_embedded client (bypasses datacenter bot block without cookies)
-    try {
-      const client = "tv_embedded";
-      logger.info({ client, tier: 2 }, `Starting yt-dlp with client: ${client}`);
-      const resource = await tryPipedStream(
-        ytdlpPath,
-        buildPipeArgs(["--extractor-args", `youtube:player_client=${client}`], false),
-        seekSeconds,
-        10000
-      );
-      logger.info({ client, tier: 2 }, `Stream started successfully with client: ${client}`);
-      return resource;
-    } catch (err: any) {
-      logger.warn({ client: "tv_embedded", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
-    }
-
-    // Tier 3: Dedicated mweb client
-    try {
-      const client = "mweb";
-      logger.info({ client, tier: 3 }, `Starting yt-dlp with client: ${client}`);
-      const resource = await tryPipedStream(
-        ytdlpPath,
-        buildPipeArgs(["--extractor-args", `youtube:player_client=${client}`], false),
-        seekSeconds,
-        10000
-      );
-      logger.info({ client, tier: 3 }, `Stream started successfully with client: ${client}`);
-      return resource;
-    } catch (err: any) {
-      logger.warn({ client: "mweb", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
-    }
-
-    // Tier 4: Dedicated android client
-    try {
-      const client = "android";
-      logger.info({ client, tier: 4 }, `Starting yt-dlp with client: ${client}`);
-      const resource = await tryPipedStream(
-        ytdlpPath,
-        buildPipeArgs(["--extractor-args", `youtube:player_client=${client}`], false),
-        seekSeconds,
-        10000
-      );
-      logger.info({ client, tier: 4 }, `Stream started successfully with client: ${client}`);
-      return resource;
-    } catch (err: any) {
-      logger.warn({ client: "android", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
-    }
-
-    // Tier 5: Dedicated ios client
-    try {
-      const client = "ios";
-      logger.info({ client, tier: 5 }, `Starting yt-dlp with client: ${client}`);
-      const resource = await tryPipedStream(
-        ytdlpPath,
-        buildPipeArgs(["--extractor-args", `youtube:player_client=${client}`], false),
-        seekSeconds,
-        10000
-      );
-      logger.info({ client, tier: 5 }, `Stream started successfully with client: ${client}`);
-      return resource;
-    } catch (err: any) {
-      logger.warn({ client: "ios", err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
+    for (let i = 0; i < streamTiers.length; i++) {
+      const tier = streamTiers[i];
+      const useCookies = tier.useCookies && cookieArgs.length > 0;
+      try {
+        logger.info(
+          { tier: i + 1, clients: tier.clients, cookies: useCookies },
+          `Starting yt-dlp stream tier ${i + 1}: ${tier.clients}`
+        );
+        const resource = await tryPipedStream(
+          ytdlpPath,
+          buildPipeArgs(getYtExtractorArgs(useCookies, tier.clients), useCookies),
+          seekSeconds,
+          tier.timeoutMs
+        );
+        logger.info({ tier: i + 1, clients: tier.clients }, `Stream started successfully on tier ${i + 1}`);
+        return resource;
+      } catch (err: any) {
+        logger.warn(
+          { tier: i + 1, clients: tier.clients, err: err?.message || err },
+          `Stream tier ${i + 1} failed: [${err?.message || err}]`
+        );
+      }
     }
 
     // Tier 6: Direct URL extraction -> FFmpeg
     try {
       logger.info({ tier: 6 }, "Starting yt-dlp with client: direct_url");
-      const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 8000, cookieArgs);
+      const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 12000, cookieArgs);
       if (directUrl) {
-        const resource = await tryPipedUrlStream(directUrl, seekSeconds, 8000);
+        const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
         logger.info({ tier: 6 }, "Stream started successfully via direct URL pipe");
         return resource;
       }

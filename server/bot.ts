@@ -45,6 +45,7 @@ import {
   getCookieStatus,
   ensureYtDlpUpdated,
   autoUpdateYtDlp,
+  checkPotProvider,
   initSoundCloud,
   ENABLE_SOUNDCLOUD,
 } from "./musicPlayer";
@@ -2712,6 +2713,12 @@ client.once(Events.ClientReady, async (c) => {
 
   // Initialize music subsystems & ensure yt-dlp is nightly
   ensureYtDlpUpdated().catch((err) => logger.warn({ err }, "yt-dlp auto-update failed (non-fatal)"));
+  checkPotProvider()
+    .then((pot) => {
+      if (pot.reachable) logger.info({ url: pot.url, version: pot.version }, "POT provider reachable");
+      else logger.warn({ url: pot.url }, "POT provider NOT reachable — YouTube may return 403");
+    })
+    .catch(() => {});
   if (ENABLE_SOUNDCLOUD) {
     initSoundCloud().catch((err) => logger.warn({ err }, "SoundCloud init failed (non-fatal)"));
   }
