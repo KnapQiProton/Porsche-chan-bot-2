@@ -11,6 +11,12 @@ RUN apt-get update && apt-get install -y \
     git \
     build-essential \
     python3-dev \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libjpeg62-turbo \
+    libgif7 \
+    librsvg2-2 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.local/bin:$PATH"
@@ -20,12 +26,13 @@ RUN pipx install --pip-args="--pre" "yt-dlp[default]" && \
     pipx inject yt-dlp "bgutil-ytdlp-pot-provider==2.0.2" 2>/dev/null || true
 
 # Build the bgutil PO Token provider HTTP server (generates YouTube PO tokens without cookies).
-# Started on 127.0.0.1:4416 by entrypoint.sh.
+# Started on 127.0.0.1:4416 by entrypoint.sh. Non-fatal: if this build ever fails,
+# the bot must still deploy (it just runs without PO tokens).
 RUN git clone --depth 1 --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil-pot \
     && cd /opt/bgutil-pot/server \
-    && npm ci \
-    && npx tsc \
-    && npm cache clean --force
+    && (npm ci && npx tsc) \
+    || echo "WARNING: POT provider build skipped" \
+    && npm cache clean --force || true
 
 WORKDIR /app
 

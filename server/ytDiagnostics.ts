@@ -160,6 +160,14 @@ export interface LiveTestResult {
   durationMs: number;
   rawError?: string;
   timedOut: boolean;
+  /** yt-dlp plugin providers line, e.g. "bgutil:http-2.0.2 (external)" */
+  potProviders?: string;
+  /** true when yt-dlp actually asked the provider for a PO token */
+  potGenerated?: boolean;
+  /** e.g. "Generating a gvs PO Token for web client via bgutil HTTP server" */
+  potDetail?: string;
+  /** player clients yt-dlp used for the extraction */
+  usedClients?: string;
 }
 
 /**
@@ -175,6 +183,7 @@ export async function runYtLiveTest(ytdlpBin: string): Promise<LiveTestResult> {
 
   const testCmd = [
     `"${ytdlpBin}"`,
+    "-v",
     "--force-ipv4",
     "--no-check-certificates",
     "--js-runtimes", "node",
@@ -191,12 +200,27 @@ export async function runYtLiveTest(ytdlpBin: string): Promise<LiveTestResult> {
   const res = await execWithTimeout(testCmd, 15000);
   const durationMs = Date.now() - startTime;
 
+  const debugOut = `${res.stdout}\n${res.stderr}`;
+  const potProviders = debugOut.match(/PO Token Providers:\s*(.+)/)?.[1]?.trim();
+  const potDetail = debugOut.match(/\[pot:[^\]]+\]\s*Generating a[^\n]+/)?.[0]?.trim();
+  const usedClients = debugOut
+    .match(/Downloading [a-z_ ]+? player API JSON/gi)
+    ?.map((m) => m.replace(/Downloading /i, "").replace(/ player API JSON/i, "").trim())
+    .join(", ");
+  const potInfo = {
+    potProviders,
+    potGenerated: !!potDetail,
+    potDetail,
+    usedClients,
+  };
+
   if (res.timedOut) {
     return {
       success: false,
       durationMs,
       timedOut: true,
       rawError: "Timeout: Eksekusi YouTube melebihi batas waktu 15 detik (server tidak merespons atau throttled).",
+      ...potInfo,
     };
   }
 
@@ -210,6 +234,7 @@ export async function runYtLiveTest(ytdlpBin: string): Promise<LiveTestResult> {
       title,
       durationMs,
       timedOut: false,
+      ...potInfo,
     };
   }
 
@@ -239,6 +264,7 @@ export async function runYtLiveTest(ytdlpBin: string): Promise<LiveTestResult> {
     durationMs,
     rawError: truncatedError,
     timedOut: false,
+    ...potInfo,
   };
 }
 
@@ -387,6 +413,18 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
           name: "🔑 PO Token Provider",
           value: pot.reachable ? `✅ Aktif (\`${pot.url}\`)` : `⚠️ Tidak aktif (\`${pot.url}\`)`,
           inline: true,
+        },
+        {
+          name: "🧩 Plugin POT",
+          value: `\`${(test.potProviders || "tidak terdeteksi").slice(0, 200)}\``,
+          inline: false,
+        },
+        {
+          name: "🎟️ Token Digenerate",
+          value: test.potGenerated
+            ? `✅ ${(test.potDetail || "").slice(0, 250)}`
+            : "⚠️ Tidak ada (client terpilih tidak memicu PO Token)",
+          inline: false,
         },
         {
           name: "📡 Hasil Live Test",
@@ -572,6 +610,18 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
           name: "🔑 PO Token Provider",
           value: pot.reachable ? `✅ Aktif (\`${pot.url}\`)` : `⚠️ Tidak aktif (\`${pot.url}\`)`,
           inline: true,
+        },
+        {
+          name: "🧩 Plugin POT",
+          value: `\`${(test.potProviders || "tidak terdeteksi").slice(0, 200)}\``,
+          inline: false,
+        },
+        {
+          name: "🎟️ Token Digenerate",
+          value: test.potGenerated
+            ? `✅ ${(test.potDetail || "").slice(0, 250)}`
+            : "⚠️ Tidak ada (client terpilih tidak memicu PO Token)",
+          inline: false,
         },
         {
           name: "📡 Hasil Live Test",

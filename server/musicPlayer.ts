@@ -262,6 +262,14 @@ export interface GuildSession {
   seekOffsetSec: number;
   previewMessage?: Message | null;
   queuePage?: number;
+  /** Timestamp when the current resource actually started playing */
+  playbackStartedAt?: number;
+  /** Tier label of the resource currently playing (for diagnostics) */
+  currentTier?: string;
+  /** Set while the bot itself stops the player (prevents false "stream died" reports) */
+  manualStop?: boolean;
+  /** Last error reported by the audio player / stream (for diagnostics) */
+  lastStreamError?: string;
 }
 
 const sessions = new Map<string, GuildSession>();
@@ -1829,11 +1837,12 @@ function tryPipedStream(
     let ffmpeg: any;
 
     let ytdlpStderr = "";
+    let ytdlpExitCode: number | null = null;
 
     try {
       ytdlp = spawn(ytdlpPath, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
       ytdlp.stderr.on("data", (d: Buffer) => {
-        ytdlpStderr += d.toString();
+        ytdlpStderr = (ytdlpStderr + d.toString()).slice(-4000);
       });
 
       // FFmpeg arguments optimized for raw pipe streaming (no seek flags on pipe:0)
@@ -1885,12 +1894,23 @@ function tryPipedStream(
 
     let ffmpegStderr = "";
     ffmpeg.stderr.on("data", (d: Buffer) => {
-      ffmpegStderr += d.toString();
+      ffmpegStderr = (ffmpegStderr + d.toString()).slice(-4000);
     });
     ffmpeg.stderr.on("error", () => {});
 
-    // Pipe yt-dlp stdout to ffmpeg stdin without auto-ending stdin on yt-dlp restart
-    ytdlp.stdout.pipe(ffmpeg.stdin, { end: false });
+    // Pipe yt-dlp stdout into ffmpeg. End ffmpeg's stdin when yt-dlp finishes so
+    // FFmpeg flushes the tail of the track and the player advances the queue.
+    ytdlp.stdout.pipe(ffmpeg.stdin);
+
+    const getErrorDetail = () => {
+      const ytErr = ytdlpStderr.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+      const ffErr = ffmpegStderr.trim().split("\n").filter(Boolean).slice(-2).join(" | ");
+      const parts: string[] = [];
+      if (ytdlpExitCode !== null) parts.push(`yt-dlp exit ${ytdlpExitCode}`);
+      if (ytErr) parts.push(`yt-dlp: ${ytErr}`);
+      if (ffErr) parts.push(`ffmpeg: ${ffErr}`);
+      return parts.join(" — ").slice(0, 700) || "stream berhenti tanpa detail error";
+    };
 
     const timer = setTimeout(() => {
       if (!settled) {
@@ -1923,6 +1943,7 @@ function tryPipedStream(
     });
 
     ytdlp.on("close", (code: number) => {
+      ytdlpExitCode = code;
       if (!settled && code !== 0) {
         settled = true;
         clearTimeout(timer);
@@ -1960,6 +1981,7 @@ function tryPipedStream(
 
         const resource = createAudioResource(pt, { inputType: StreamType.Raw });
         (resource as any)._cleanupProcesses = cleanup;
+        (resource as any)._getErrorDetail = getErrorDetail;
         resolve(resource);
       }
     };
@@ -2066,6 +2088,11 @@ export async function createAudioResourceFromYtDlp(
     ...(FFMPEG_BIN ? ["--ffmpeg-location", FFMPEG_BIN] : []),
     ...(seekSeconds > 0 ? ["--download-sections", `*${seekSeconds}-inf`] : []),
     ...extraArgs,
+    // Retry transient googlevideo 403/timeouts instead of dying mid-track
+    "--retries", "5",
+    "--fragment-retries", "5",
+    "--extractor-retries", "2",
+    "--socket-timeout", "15",
     "-q",
     "--no-warnings",
     "--no-progress",
@@ -2077,13 +2104,18 @@ export async function createAudioResourceFromYtDlp(
 
   // Player-client tiers tuned for yt-dlp 2026.x ("tv_embedded" was removed upstream).
   // Ordered from most capable to most permissive for datacenter IPs.
+  // `default` = tv_samsung+visionos+web (HLS/m3u8, works without a PO token).
+  // The rest are fallbacks; clients needing GVS PO tokens are covered by the
+  // bgutil provider running on 127.0.0.1:4416.
   const streamTiers: Array<{ clients: string; timeoutMs: number; useCookies: boolean }> = [
     { clients: "default", timeoutMs: 22000, useCookies: true },
+    { clients: "mweb,tv,web_safari", timeoutMs: 15000, useCookies: false },
     { clients: "tv_simply", timeoutMs: 15000, useCookies: false },
     { clients: "android_vr,visionos", timeoutMs: 15000, useCookies: false },
-    { clients: "mweb,tv,web_safari", timeoutMs: 15000, useCookies: false },
     { clients: "ios,web_embedded", timeoutMs: 15000, useCookies: false },
   ];
+
+  const tierErrors: string[] = [];
 
   const attemptStream = async (attempt: number): Promise<any> => {
     logger.info({ attempt, targetUrl }, `Attempting YouTube stream (Percobaan ${attempt}/2)...`);
@@ -2102,9 +2134,12 @@ export async function createAudioResourceFromYtDlp(
           seekSeconds,
           tier.timeoutMs
         );
+        (resource as any)._tier = `tier ${i + 1} (${tier.clients})`;
         logger.info({ tier: i + 1, clients: tier.clients }, `Stream started successfully on tier ${i + 1}`);
         return resource;
       } catch (err: any) {
+        const msg = `T${i + 1} ${tier.clients}: ${err?.message || err}`;
+        tierErrors.push(msg);
         logger.warn(
           { tier: i + 1, clients: tier.clients, err: err?.message || err },
           `Stream tier ${i + 1} failed: [${err?.message || err}]`
@@ -2122,6 +2157,7 @@ export async function createAudioResourceFromYtDlp(
         return resource;
       }
     } catch (err: any) {
+      tierErrors.push(`T6 direct-url: ${err?.message || err}`);
       logger.warn({ tier: 6, err: err?.message || err }, `Stream failed: [${err?.message || err}]`);
     }
 
@@ -2134,10 +2170,12 @@ export async function createAudioResourceFromYtDlp(
         return resource;
       }
     } catch (err: any) {
+      tierErrors.push(`T7 play-dl: ${err?.message || err}`);
       logger.warn({ tier: 7, err: err?.message || err }, `play-dl stream fallback failed: [${err?.message || err}]`);
     }
 
-    throw new Error("Semua tier streaming yt-dlp gagal memuat audio.");
+    const detail = tierErrors.slice(-4).join(" | ");
+    throw new Error(`Semua tier streaming yt-dlp gagal memuat audio.${detail ? ` (${detail})` : ""}`);
   };
 
   // Attempt 1
@@ -2155,7 +2193,9 @@ export async function createAudioResourceFromYtDlp(
     return await attemptStream(2);
   } catch (err2: any) {
     logger.error({ err: err2?.message }, "YouTube stream attempt 2 (retry) also failed.");
-    throw new Error("Gagal memutar audio dari YouTube setelah 2 kali percobaan. YouTube memblokir akses atau IP throttled. Jalankan `/check` untuk perbaikan otomatis.");
+    throw new Error(
+      `Gagal memutar audio dari YouTube setelah 2 percobaan. YouTube memblokir IP server (403) atau provider PO Token tidak aktif. Jalankan \`/check\` untuk diagnosa. Detail: ${String(err2?.message || err2).slice(0, 500)}`
+    );
   }
 }
 
@@ -2747,6 +2787,45 @@ export class MusicService {
     session.previewMessage = null;
   }
 
+  /**
+   * Tell the user WHY playback died instead of silently deleting the preview.
+   * When `replacePreview` is false the message is sent separately (a new track
+   * is about to take over the preview message).
+   */
+  public static async reportPlaybackFailure(
+    session: GuildSession,
+    track: TrackMetadata | null,
+    reason: string,
+    replacePreview = true,
+    tierLabel?: string
+  ): Promise<void> {
+    const title = track?.title || "Lagu";
+    const tier = tierLabel || session.currentTier;
+    const cleanReason = String(reason || "unknown")
+      .replace(/\s+/g, " ")
+      .slice(0, 900);
+
+    const embed = new EmbedBuilder()
+      .setColor(0xed4245)
+      .setTitle("❌ Stream Terputus")
+      .setDescription(
+        `Gagal memutar **${title}**${tier ? ` • ${tier}` : ""}.\n` +
+          `\`\`\`\n${cleanReason}\n\`\`\`\n` +
+          `> Jalankan \`/check\` untuk diagnosa YouTube.`
+      )
+      .setTimestamp();
+
+    if (!session.textChannel || !("send" in session.textChannel)) return;
+
+    if (replacePreview) {
+      await MusicService.sendOrReplacePreview(session, { embeds: [embed] });
+      return;
+    }
+
+    const msg = await (session.textChannel as any).send({ embeds: [embed] }).catch(() => null);
+    if (msg) setTimeout(() => msg.delete().catch(() => {}), 20_000);
+  }
+
   public static async setPreviewMessage(session: GuildSession, newMessage: Message | null): Promise<void> {
     if (session.previewMessage && session.previewMessage.id !== newMessage?.id) {
       await MusicService.deletePreviewMessage(session);
@@ -2864,13 +2943,52 @@ export class MusicService {
           session!.isSeeking = false;
           return;
         }
+
+        // Snapshot before we clear the session so we can tell a normal ending
+        // apart from a stream that died seconds after it started.
+        const endedTrack = session!.currentTrack;
+        const endedResource = session!.currentResource;
+        const tier = session!.currentTier;
+        const manual = session!.manualStop === true;
+        session!.manualStop = false;
+
+        const playedMs = Number(endedResource?.playbackDuration) || 0;
+        const expectedMs = (endedTrack?.durationSec || 0) * 1000;
+        const streamDetail =
+          (typeof endedResource?._getErrorDetail === "function" ? String(endedResource._getErrorDetail()) : "") ||
+          session!.lastStreamError ||
+          "";
+
+        const premature =
+          !manual &&
+          !!endedTrack &&
+          ((playedMs < 2500 && (expectedMs === 0 || expectedMs > 10000)) ||
+            (expectedMs > 30000 && playedMs < Math.min(15000, expectedMs * 0.5)));
+
         MusicService.cleanupSessionProcesses(session);
-        logger.info({ guildId: guild.id }, "Audio player is idle, advancing queue");
+        logger.info(
+          { guildId: guild.id, playedMs, expectedMs, tier, manual, premature, detail: streamDetail.slice(0, 200) },
+          premature ? "Audio stream ended prematurely" : "Audio player is idle, advancing queue"
+        );
         session!.isPlaying = false;
         session!.isPaused = false;
         session!.currentTrack = null;
         session!.currentResource = null;
         session!.seekOffsetSec = 0;
+        session!.currentTier = undefined;
+        session!.lastStreamError = undefined;
+
+        if (premature) {
+          const nextTrack = session!.queue.shift();
+          const reason = streamDetail || "Stream berhenti sebelum lagu selesai (kemungkinan HTTP 403 / IP diblokir YouTube).";
+          // If another track is waiting, report the failure in the channel and
+          // immediately try the next one instead of silently killing the preview.
+          await MusicService.reportPlaybackFailure(session!, endedTrack, reason, !nextTrack, tier);
+          if (nextTrack) {
+            await MusicService.playTrackInSession(session!, nextTrack);
+          }
+          return;
+        }
 
         if (session!.queue.length > 0) {
           const nextTrack = session!.queue.shift()!;
@@ -2881,23 +2999,11 @@ export class MusicService {
       });
 
       player.on("error", (error) => {
+        // The player emits "idle" right after this, which is where queue
+        // advancing and user-facing reporting happen. Just remember the detail.
+        session!.lastStreamError = String((error as any)?.message || error);
         MusicService.cleanupSessionProcesses(session);
         logger.error({ guildId: guild.id, error }, "Audio player error encountered");
-        if (session!.isSeeking) {
-          session!.isSeeking = false;
-          return;
-        }
-        session!.isPlaying = false;
-        session!.isPaused = false;
-        session!.currentTrack = null;
-        session!.currentResource = null;
-        session!.seekOffsetSec = 0;
-        if (session!.queue.length > 0) {
-          const nextTrack = session!.queue.shift()!;
-          MusicService.playTrackInSession(session!, nextTrack).catch(() => {});
-        } else {
-          MusicService.deletePreviewMessage(session).catch(() => {});
-        }
       });
 
       sessions.set(guild.id, session);
@@ -2919,6 +3025,10 @@ export class MusicService {
       const resource = await session.currentTrack.createStream(targetSec);
       session.seekOffsetSec = targetSec;
       session.currentResource = resource;
+      session.currentTier = (resource as any)?._tier;
+      session.playbackStartedAt = Date.now();
+      session.manualStop = false;
+      session.lastStreamError = undefined;
       session.player.play(resource);
       session.isPlaying = true;
       session.isPaused = false;
@@ -2941,6 +3051,10 @@ export class MusicService {
       const resource = await track.createStream(0);
       session.currentTrack = track;
       session.currentResource = resource;
+      session.currentTier = (resource as any)?._tier;
+      session.playbackStartedAt = Date.now();
+      session.manualStop = false;
+      session.lastStreamError = undefined;
       session.isPlaying = true;
       session.isPaused = false;
       session.isSeeking = false;
@@ -2954,12 +3068,18 @@ export class MusicService {
       });
     } catch (err) {
       logger.error({ err, track: track.title }, "Failed to stream audio resource");
-      if (session.textChannel && "send" in session.textChannel) {
-        const errMsg = await (session.textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(err as Error).message}`).catch(() => null);
-        if (errMsg) setTimeout(() => errMsg.delete().catch(() => {}), 5000);
-      }
-      if (session.queue.length > 0) {
-        const next = session.queue.shift()!;
+      session.isPlaying = false;
+      session.currentTrack = null;
+      session.currentResource = null;
+      session.currentTier = undefined;
+      const next = session.queue.shift();
+      await MusicService.reportPlaybackFailure(
+        session,
+        track,
+        String((err as Error)?.message || err),
+        !next
+      );
+      if (next) {
         await MusicService.playTrackInSession(session, next);
       }
     }
@@ -3054,16 +3174,24 @@ export class MusicService {
           try {
             const resource = await firstTrack.createStream(0);
             session.currentResource = resource;
+            session.currentTier = (resource as any)?._tier;
+            session.playbackStartedAt = Date.now();
+            session.manualStop = false;
+            session.lastStreamError = undefined;
             session.player.play(resource);
           } catch (streamErr) {
             logger.error({ streamErr, track: firstTrack.title }, "Failed to start initial playlist stream");
             session.isPlaying = false;
             session.currentTrack = null;
             session.currentResource = null;
-            if (session.queue.length > 0) {
-              const next = session.queue.shift()!;
-              await MusicService.playTrackInSession(session, next);
-            }
+            const next = session.queue.shift();
+            await MusicService.reportPlaybackFailure(
+              session,
+              firstTrack,
+              String((streamErr as Error)?.message || streamErr),
+              !next
+            );
+            if (next) await MusicService.playTrackInSession(session, next);
           }
         }
       } else {
@@ -3107,6 +3235,10 @@ export class MusicService {
           try {
             const resource = await track.createStream(0);
             session.currentResource = resource;
+            session.currentTier = (resource as any)?._tier;
+            session.playbackStartedAt = Date.now();
+            session.manualStop = false;
+            session.lastStreamError = undefined;
             session.player.play(resource);
           } catch (streamErr) {
             logger.error({ streamErr, track: track.title }, "Failed to start track stream");
@@ -3114,14 +3246,14 @@ export class MusicService {
             session.isPlaying = false;
             session.currentTrack = null;
             session.currentResource = null;
-            if (textChannel && "send" in textChannel) {
-              const errMsg = await (textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(streamErr as Error).message || "Stream error"}`).catch(() => null);
-              if (errMsg) setTimeout(() => errMsg.delete().catch(() => {}), 5000);
-            }
-            if (session.queue.length > 0) {
-              const next = session.queue.shift()!;
-              await MusicService.playTrackInSession(session, next);
-            }
+            const next = session.queue.shift();
+            await MusicService.reportPlaybackFailure(
+              session,
+              track,
+              String((streamErr as Error)?.message || streamErr || "Stream error"),
+              !next
+            );
+            if (next) await MusicService.playTrackInSession(session, next);
           }
         }
       }
@@ -3166,6 +3298,7 @@ export class MusicService {
     session.isPlaying = false;
     session.isPaused = false;
     session.seekOffsetSec = 0;
+    session.manualStop = true;
     session.player.stop(true);
 
     await MusicService.deletePreviewMessage(session);
@@ -3322,6 +3455,7 @@ export class MusicService {
       session.queue = session.queue.slice(index);
       
       MusicService.cleanupSessionProcesses(session);
+      session.manualStop = true;
       session.player.stop(true); // Stop current track, will trigger Idle event and play the next (targetTrack)
 
       await interaction.update({ components: buildMusicComponents(session) }).catch(() => {});
@@ -3466,6 +3600,7 @@ const followMsg = await interaction.followUp({
       session.isPlaying = false;
       session.isPaused = false;
       session.seekOffsetSec = 0;
+      session.manualStop = true;
       session.player.stop(true);
 
       await MusicService.deletePreviewMessage(session);
@@ -3581,16 +3716,24 @@ const followMsg = await interaction.followUp({
           try {
             const resource = await firstTrack.createStream(0);
             session.currentResource = resource;
+            session.currentTier = (resource as any)?._tier;
+            session.playbackStartedAt = Date.now();
+            session.manualStop = false;
+            session.lastStreamError = undefined;
             session.player.play(resource);
           } catch (streamErr) {
             logger.error({ streamErr, track: firstTrack.title }, "Failed to start initial playlist stream");
             session.isPlaying = false;
             session.currentTrack = null;
             session.currentResource = null;
-            if (session.queue.length > 0) {
-              const next = session.queue.shift()!;
-              await MusicService.playTrackInSession(session, next);
-            }
+            const next = session.queue.shift();
+            await MusicService.reportPlaybackFailure(
+              session,
+              firstTrack,
+              String((streamErr as Error)?.message || streamErr),
+              !next
+            );
+            if (next) await MusicService.playTrackInSession(session, next);
           }
         }
       } else {
@@ -3628,19 +3771,24 @@ const followMsg = await interaction.followUp({
           try {
             const resource = await track.createStream(0);
             session.currentResource = resource;
+            session.currentTier = (resource as any)?._tier;
+            session.playbackStartedAt = Date.now();
+            session.manualStop = false;
+            session.lastStreamError = undefined;
             session.player.play(resource);
           } catch (streamErr) {
             logger.error({ streamErr, track: track.title }, "Failed to start track stream");
             session.isPlaying = false;
             session.currentTrack = null;
             session.currentResource = null;
-            if (textChannel && "send" in textChannel) {
-              await (textChannel as any).send(`❌ Gagal memutar lagu **${track.title}**: ${(streamErr as Error).message || "Stream error"}`).catch(() => {});
-            }
-            if (session.queue.length > 0) {
-              const next = session.queue.shift()!;
-              await MusicService.playTrackInSession(session, next);
-            }
+            const next = session.queue.shift();
+            await MusicService.reportPlaybackFailure(
+              session,
+              track,
+              String((streamErr as Error)?.message || streamErr || "Stream error"),
+              !next
+            );
+            if (next) await MusicService.playTrackInSession(session, next);
           }
         }
       }
@@ -3675,6 +3823,7 @@ const followMsg = await interaction.followUp({
     session.isPlaying = false;
     session.isPaused = false;
     session.seekOffsetSec = 0;
+    session.manualStop = true;
     session.player.stop(true);
     await MusicService.deletePreviewMessage(session);
     const stopMsg = await message.reply("⏹️ Musik telah dihentikan dan antrean dibersihkan! (◡ ω ◡)");
@@ -3809,6 +3958,7 @@ const followMsg = await interaction.followUp({
     const nextTitle = hasNext ? session.queue[0]?.title || "Lagu Berikutnya" : "";
     session.isSeeking = false;
     session.seekOffsetSec = 0;
+    session.manualStop = true;
     session.player.stop(true);
 
     const replyContent = hasNext
@@ -3885,11 +4035,13 @@ const followMsg = await interaction.followUp({
       const nextTitle = session.queue[0]?.title || "Lagu Berikutnya";
       session.isSeeking = false;
       session.seekOffsetSec = 0;
+      session.manualStop = true;
       session.player.stop(true);
       const skipMsg = await message.reply(`⏭️ Berhasil skip **${skippedTitle}**! Memutar: **${nextTitle}** (๑˃ᴗ˂)ﻌ`);
       setTimeout(() => skipMsg.delete().catch(() => {}), 4_000);
       setTimeout(() => message.delete().catch(() => {}), 4_000);
     } else {
+      session.manualStop = true;
       session.player.stop(true);
       session.isPlaying = false;
       session.currentTrack = null;
