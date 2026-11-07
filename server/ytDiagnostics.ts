@@ -17,6 +17,7 @@ import {
   getYtExtractorArgs,
   getPotProviderArgs,
   checkPotProvider,
+  createAudioResourceFromYtDlp,
   getCookieStatus,
   FFMPEG_BIN,
 } from "./musicPlayer";
@@ -268,6 +269,71 @@ export async function runYtLiveTest(ytdlpBin: string): Promise<LiveTestResult> {
   };
 }
 
+export interface StreamTestResult {
+  success: boolean;
+  tier?: string;
+  bytes: number;
+  durationMs: number;
+  error?: string;
+}
+
+/**
+ * Actually open the audio stream (yt-dlp -> FFmpeg -> raw PCM) and read a short
+ * chunk of it. Metadata extraction can succeed while the media URL returns 403,
+ * so this is the only test that proves audio can really be produced.
+ */
+export async function runYtStreamTest(ytdlpBin: string): Promise<StreamTestResult> {
+  const startTime = Date.now();
+  const testUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+  let resource: any = null;
+
+  try {
+    resource = await createAudioResourceFromYtDlp(testUrl, 0, ytdlpBin);
+    const tier = resource?._tier;
+    const bytes = await new Promise<number>((resolve) => {
+      let total = 0;
+      let done = false;
+      const finish = (value: number) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      // ~0.5s of 48kHz stereo s16le is enough to prove the pipe works
+      const target = 48000 * 4;
+      const timer = setTimeout(() => finish(total), 10_000);
+      resource.playStream.on("data", (chunk: Buffer) => {
+        total += chunk.length;
+        if (total >= target) finish(total);
+      });
+      resource.playStream.once("end", () => finish(total));
+      resource.playStream.once("error", () => finish(total));
+    });
+
+    try {
+      resource?._cleanupProcesses?.();
+    } catch {}
+
+    return {
+      success: bytes > 0,
+      tier,
+      bytes,
+      durationMs: Date.now() - startTime,
+      error: bytes > 0 ? undefined : "Stream terbuka tapi tidak ada data PCM yang keluar.",
+    };
+  } catch (err: any) {
+    try {
+      resource?._cleanupProcesses?.();
+    } catch {}
+    return {
+      success: false,
+      bytes: 0,
+      durationMs: Date.now() - startTime,
+      error: String(err?.message || err).slice(0, 600),
+    };
+  }
+}
+
 export interface UpdateAttemptResult {
   success: boolean;
   method: string;
@@ -397,6 +463,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
 
   // 6. Run Live Test
   const test = await runYtLiveTest(sys.ytdlpPath);
+  const streamTest = test.success ? await runYtStreamTest(sys.ytdlpPath) : null;
 
   // 7. Case A: Live Test Success -> Sistem Sehat (Hijau)
   if (test.success) {
@@ -429,6 +496,15 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
         {
           name: "📡 Hasil Live Test",
           value: `✅ Berhasil mengekstrak judul:\n**${test.title}** (${test.durationMs}ms)`,
+          inline: false,
+        },
+        {
+          name: "🎧 Tes Audio (PCM)",
+          value: streamTest
+            ? streamTest.success
+              ? `✅ Audio keluar: **${streamTest.bytes.toLocaleString("id-ID")} byte** PCM • ${streamTest.tier || "unknown"} • ${streamTest.durationMs}ms`
+              : `❌ Gagal: ${(streamTest.error || "tidak ada audio").slice(0, 500)}`
+            : "⏭️ Dilewati (live test metadata gagal)",
           inline: false,
         },
         { name: "✨ Status Bot", value: "Siap memutar musik via command `/play`", inline: false }
@@ -595,6 +671,7 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
   await replyMsg.edit({ embeds: [testEmbed] });
 
   const test = await runYtLiveTest(sys.ytdlpPath);
+  const streamTest = test.success ? await runYtStreamTest(sys.ytdlpPath) : null;
 
   if (test.success) {
     const healthyEmbed = new EmbedBuilder()
@@ -626,6 +703,15 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
         {
           name: "📡 Hasil Live Test",
           value: `✅ Berhasil mengekstrak judul:\n**${test.title}** (${test.durationMs}ms)`,
+          inline: false,
+        },
+        {
+          name: "🎧 Tes Audio (PCM)",
+          value: streamTest
+            ? streamTest.success
+              ? `✅ Audio keluar: **${streamTest.bytes.toLocaleString("id-ID")} byte** PCM • ${streamTest.tier || "unknown"} • ${streamTest.durationMs}ms`
+              : `❌ Gagal: ${(streamTest.error || "tidak ada audio").slice(0, 500)}`
+            : "⏭️ Dilewati (live test metadata gagal)",
           inline: false,
         },
         { name: "✨ Status Bot", value: "Siap memutar musik via command `!play` atau `/play`", inline: false }

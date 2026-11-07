@@ -414,6 +414,15 @@ export async function ensureYtDlpUpdated(): Promise<void> {
   if (ytDlpUpdatingPromise) return ytDlpUpdatingPromise;
 
   ytDlpUpdatingPromise = (async () => {
+    // In the Docker image yt-dlp is already installed/updated at build time and
+    // entrypoint.sh re-injects the POT plugin. Skipping the runtime update avoids
+    // blocking the event loop with spawnSync() and never risks wiping the plugin.
+    if (process.env.SKIP_YTDLP_UPDATE === "true") {
+      logger.info("Skipping runtime yt-dlp update (SKIP_YTDLP_UPDATE=true)");
+      ytDlpUpdatedOnce = true;
+      return;
+    }
+
     logger.info("Checking yt-dlp version...");
     const isWin = process.platform === "win32";
 

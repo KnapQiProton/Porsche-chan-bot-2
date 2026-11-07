@@ -63,6 +63,10 @@ RUN pipx upgrade --pip-args="--pre" yt-dlp 2>/dev/null || true && \
 # Runtime environment
 ENV NODE_ENV="production"
 ENV NODE_OPTIONS="--max-old-space-size=384"
+# yt-dlp is installed/updated at build time and the POT plugin is injected by
+# entrypoint.sh; a runtime pip update only risks blocking the event loop and
+# wiping the plugin.
+ENV SKIP_YTDLP_UPDATE="true"
 
 EXPOSE 3000
 
