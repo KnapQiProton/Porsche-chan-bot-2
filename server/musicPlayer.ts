@@ -46,6 +46,78 @@ if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
   }
 }
 
+// Directories that can hold a persisted cookies.txt. Railway wipes the container
+// filesystem on every deploy, but an attached volume survives. If the user has
+// mounted one, RAILWAY_VOLUME_MOUNT_PATH points at it, so uploads via /cookies
+// keep working after redeploys without re-uploading or setting an env var.
+export function getPersistentCookiesDirs(): string[] {
+  const dirs = [
+    process.env.COOKIES_DIR,
+    process.env.RAILWAY_VOLUME_MOUNT_PATH,
+    process.env.DATA_DIR,
+  ].filter((d): d is string => Boolean(d && d.trim()));
+
+  return [...new Set(dirs.map((d) => d.trim()))];
+}
+
+export function getCookieSearchPaths(): string[] {
+  const candidates: string[] = [];
+  for (const dir of getPersistentCookiesDirs()) {
+    candidates.push(path.join(dir, "cookies.txt"));
+    candidates.push(path.join(dir, "data", "cookies.txt"));
+  }
+  candidates.push(path.join(process.cwd(), "cookies.txt"));
+  candidates.push("/app/cookies.txt");
+  candidates.push(path.join(process.cwd(), "cookies.full.txt"));
+  candidates.push(path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt"));
+  return [...new Set(candidates)];
+}
+
+export function findCookiesFile(): string | null {
+  for (const candidate of getCookieSearchPaths()) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).size > 10) {
+        return candidate;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// Decode a cookie payload from an env var (raw Netscape text, escaped newlines, or base64)
+function decodeEnvCookies(raw: string): string {
+  let content = raw.trim();
+  if (
+    (content.startsWith('"') && content.endsWith('"')) ||
+    (content.startsWith("'") && content.endsWith("'"))
+  ) {
+    content = content.slice(1, -1).trim();
+  }
+  if (!content.includes("\t") && !content.startsWith("#") && content.length > 50) {
+    try {
+      const decoded = Buffer.from(content, "base64").toString("utf-8");
+      if (decoded.includes("\t") || decoded.includes("youtube.com")) {
+        content = decoded;
+      }
+    } catch {}
+  }
+  // Railway env vars often carry literal "\n"/"\t" instead of real whitespace
+  if (content.includes("\\n")) {
+    content = content.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+  }
+  return content;
+}
+
+function getEnvCookies(): string | undefined {
+  const raw =
+    process.env.YOUTUBE_COOKIE ||
+    process.env.YOUTUBE_COOKIES ||
+    process.env.COOKIES ||
+    process.env.YOUTUBE_COOKIE_BASE64;
+  if (!raw || !raw.trim()) return undefined;
+  return decodeEnvCookies(raw);
+}
+
 // Helper to extract visitor_data (VISITOR_INFO1_LIVE) from cookies or env
 export function getVisitorDataFromCookies(): string | undefined {
   if (process.env.YOUTUBE_VISITOR_DATA && process.env.YOUTUBE_VISITOR_DATA.trim()) {
@@ -55,37 +127,15 @@ export function getVisitorDataFromCookies(): string | undefined {
     return process.env.VISITOR_DATA.trim();
   }
 
-  const cookieCandidates = [
-    path.join(process.cwd(), "cookies.txt"),
-    "/app/cookies.txt",
-    path.join(process.cwd(), "cookies.full.txt"),
-    path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt"),
-  ];
-
+  const cookiePath = findCookiesFile();
   let rawContent = "";
-  for (const p of cookieCandidates) {
-    if (fs.existsSync(p)) {
-      try {
-        const content = fs.readFileSync(p, "utf-8");
-        if (content && content.length > 10) {
-          rawContent = content;
-          break;
-        }
-      } catch {}
-    }
+  if (cookiePath) {
+    try {
+      rawContent = fs.readFileSync(cookiePath, "utf-8");
+    } catch {}
   }
-
   if (!rawContent) {
-    const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
-    if (envCookie && envCookie.trim()) {
-      let c = envCookie.trim();
-      if (!c.includes("\t") && !c.startsWith("#") && c.length > 50) {
-        try {
-          c = Buffer.from(c, "base64").toString("utf-8");
-        } catch {}
-      }
-      rawContent = c;
-    }
+    rawContent = getEnvCookies() || "";
   }
 
   if (rawContent) {
@@ -106,37 +156,15 @@ export function getPoTokenFromCookies(): string | undefined {
   const envPo = process.env.YOUTUBE_PO_TOKEN?.trim() || process.env.PO_TOKEN?.trim();
   if (envPo) return envPo;
 
-  const cookieCandidates = [
-    path.join(process.cwd(), "cookies.txt"),
-    "/app/cookies.txt",
-    path.join(process.cwd(), "cookies.full.txt"),
-    path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt"),
-  ];
-
+  const cookiePath = findCookiesFile();
   let rawContent = "";
-  for (const p of cookieCandidates) {
-    if (fs.existsSync(p)) {
-      try {
-        const content = fs.readFileSync(p, "utf-8");
-        if (content && content.length > 10) {
-          rawContent = content;
-          break;
-        }
-      } catch {}
-    }
+  if (cookiePath) {
+    try {
+      rawContent = fs.readFileSync(cookiePath, "utf-8");
+    } catch {}
   }
-
   if (!rawContent) {
-    const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
-    if (envCookie && envCookie.trim()) {
-      let c = envCookie.trim();
-      if (!c.includes("\t") && !c.startsWith("#") && c.length > 50) {
-        try {
-          c = Buffer.from(c, "base64").toString("utf-8");
-        } catch {}
-      }
-      rawContent = c;
-    }
+    rawContent = getEnvCookies() || "";
   }
 
   if (rawContent) {
@@ -187,8 +215,7 @@ export function getYtExtractorArgs(hasCookies?: boolean, clientOverride?: string
 
 // Optional external bgutil POT provider (local server runs on 127.0.0.1:4416 by default)
 export function getPotProviderArgs(): string[] {
-  const baseUrl = process.env.YOUTUBE_POT_PROVIDER_URL?.trim();
-  if (!baseUrl) return [];
+  const baseUrl = process.env.YOUTUBE_POT_PROVIDER_URL?.trim() || "http://127.0.0.1:4416";
   return ["--extractor-args", `youtubepot-bgutilhttp:base_url=${baseUrl}`];
 }
 
@@ -213,6 +240,13 @@ function getCommonYtDlpFlags(): string[] {
     "--js-runtimes", "node",
     ...getPotProviderArgs(),
   ];
+
+  // Optional egress proxy (residential proxy bypasses YouTube's datacenter IP checks)
+  const proxy = process.env.YTDLP_PROXY?.trim() || process.env.YOUTUBE_PROXY?.trim();
+  if (proxy) {
+    flags.push("--proxy", proxy);
+  }
+
   return flags;
 }
 
@@ -1081,30 +1115,7 @@ export async function getYouTubePlaylist(url: string, ytdlpPath: string, timeout
 
 // Check if YouTube cookies or authentication is present
 export function hasYouTubeCookies(): boolean {
-  const localCookies = path.join(process.cwd(), "cookies.txt");
-  if (fs.existsSync(localCookies)) {
-    try {
-      if (fs.statSync(localCookies).size > 10) return true;
-    } catch {}
-  }
-  const appCookies = "/app/cookies.txt";
-  if (fs.existsSync(appCookies)) {
-    try {
-      if (fs.statSync(appCookies).size > 10) return true;
-    } catch {}
-  }
-  const fullCookies = path.join(process.cwd(), "cookies.full.txt");
-  if (fs.existsSync(fullCookies)) {
-    try {
-      if (fs.statSync(fullCookies).size > 10) return true;
-    } catch {}
-  }
-  const tmpCookies = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
-  if (fs.existsSync(tmpCookies)) {
-    try {
-      if (fs.statSync(tmpCookies).size > 10) return true;
-    } catch {}
-  }
+  if (findCookiesFile()) return true;
   const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
   if (envCookie && envCookie.trim().length > 10) return true;
   const bearer = process.env.YOUTUBE_OAUTH_TOKEN || process.env.YT_DLP_OAUTH_TOKEN;
@@ -1114,74 +1125,28 @@ export function hasYouTubeCookies(): boolean {
 
 // Helper to check for YouTube cookies (from file or environment variable)
 export function getYtDlpCookieArgs(): string[] {
-  // 1. Check cookies.txt in current working directory
-  const localCookies = path.join(process.cwd(), "cookies.txt");
-  if (fs.existsSync(localCookies)) {
-    try {
-      const stats = fs.statSync(localCookies);
-      if (stats.size > 10) {
-        return ["--cookies", localCookies];
-      }
-    } catch {}
+  // 1. Persisted file (Railway volume) or local cookies.txt
+  const cookieFile = findCookiesFile();
+  if (cookieFile) {
+    return ["--cookies", cookieFile];
   }
 
-  // 2. Check /app/cookies.txt (Railway Docker container path)
-  const appCookies = "/app/cookies.txt";
-  if (fs.existsSync(appCookies)) {
+  // 2. Environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
+  const cookieContent = getEnvCookies();
+  if (cookieContent) {
+    const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
     try {
-      const stats = fs.statSync(appCookies);
-      if (stats.size > 10) {
-        return ["--cookies", appCookies];
-      }
-    } catch {}
-  }
-
-  // 3. Check cookies.full.txt as secondary fallback
-  const fullCookies = path.join(process.cwd(), "cookies.full.txt");
-  if (fs.existsSync(fullCookies)) {
-    try {
-      const stats = fs.statSync(fullCookies);
-      if (stats.size > 10) {
-        return ["--cookies", fullCookies];
-      }
-    } catch {}
-  }
-
-  // 4. Check temporary decoded cookies file ONLY if env var is present
-  const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
-
-  // 5. Check environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
-  const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
-  if (envCookie && envCookie.trim()) {
-    let cookieContent = envCookie.trim();
-    // Strip quotes if user entered them in Railway variable value
-    if ((cookieContent.startsWith('"') && cookieContent.endsWith('"')) || (cookieContent.startsWith("'") && cookieContent.endsWith("'"))) {
-      cookieContent = cookieContent.slice(1, -1).trim();
-    }
-    // If user passed base64 encoded cookies to avoid newline formatting issues in Railway
-    if (!cookieContent.includes("\t") && !cookieContent.startsWith("#") && cookieContent.length > 50) {
-      try {
-        const decoded = Buffer.from(cookieContent, "base64").toString("utf-8");
-        if (decoded.includes("\t") || decoded.includes("youtube.com")) {
-          cookieContent = decoded;
-        }
-      } catch {}
-    }
-    // Handle escaped \n or \t from environment variables
-    if (cookieContent.includes("\\n")) {
-      cookieContent = cookieContent.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
-    }
-
-    try {
-      cookieContent = sanitizeNetscapeCookies(cookieContent);
-    fs.writeFileSync(tmpCookiePath, cookieContent, "utf-8");
+      const normalized = sanitizeNetscapeCookies(
+        cookieContent.includes("\\n") ? cookieContent.replace(/\\n/g, "\n").replace(/\\t/g, "\t") : cookieContent
+      );
+      fs.writeFileSync(tmpCookiePath, normalized, "utf-8");
       return ["--cookies", tmpCookiePath];
     } catch (err) {
       logger.warn({ err }, "Could not write temporary youtube cookie file");
     }
   }
 
-  // 6. OAuth bearer token support
+  // 3. OAuth bearer token support
   const bearer = process.env.YOUTUBE_OAUTH_TOKEN || process.env.YT_DLP_OAUTH_TOKEN;
   if (bearer && bearer.trim()) {
     return ["--add-header", `Authorization: Bearer ${bearer.trim()}`];
@@ -1241,6 +1206,16 @@ export function saveUploadedCookies(cookieData: string | Buffer): {
   const cookiePath = path.join(process.cwd(), "cookies.txt");
   fs.writeFileSync(cookiePath, trimmed, "utf-8");
 
+  // Persist to a Railway volume (if mounted) so redeploys don't wipe the upload
+  for (const dir of getPersistentCookiesDirs()) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "cookies.txt"), trimmed, "utf-8");
+    } catch (err) {
+      logger.warn({ err, dir }, "Could not persist cookies to volume directory");
+    }
+  }
+
   // Also write to tmpdir
   const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
   try {
@@ -1258,32 +1233,54 @@ export function saveUploadedCookies(cookieData: string | Buffer): {
   };
 }
 
+// Inspect the active cookies to tell whether they belong to a logged-in account.
+// Guest cookies are usually not enough to bypass YouTube's datacenter bot check.
+export function getCookieAuthInfo(): {
+  hasCookies: boolean;
+  path?: string;
+  loggedIn: boolean;
+  cookieCount: number;
+} {
+  const cookiePath = findCookiesFile();
+  let content = "";
+  if (cookiePath) {
+    try {
+      content = fs.readFileSync(cookiePath, "utf-8");
+    } catch {}
+  }
+  if (!content) {
+    content = getEnvCookies() || "";
+  }
+
+  const cookieCount = (content.match(/youtube\.com/g) || []).length;
+  const hasLoginInfo = content.includes("\tLOGIN_INFO\t");
+  const hasSapisid =
+    content.includes("\tSAPISID\t") ||
+    content.includes("\t__Secure-1PAPISID\t") ||
+    content.includes("\t__Secure-3PAPISID\t");
+
+  return {
+    hasCookies: Boolean(cookiePath) || content.length > 10,
+    path: cookiePath || undefined,
+    loggedIn: hasLoginInfo && hasSapisid,
+    cookieCount,
+  };
+}
+
 // Get current cookies status
 export function getCookieStatus(): {
   active: boolean;
   source: string;
   detail: string;
 } {
-  const localCookies = path.join(process.cwd(), "cookies.txt");
-  if (fs.existsSync(localCookies)) {
-    try {
-      const stats = fs.statSync(localCookies);
-      if (stats.size > 10) {
-        return {
-          active: true,
-          source: "cookies.txt (Lokal / Uploaded)",
-          detail: `File aktif (${stats.size} bytes).`,
-        };
-      }
-    } catch {}
-  }
-
-  const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
-  if (envCookie && envCookie.trim().length > 10) {
+  const info = getCookieAuthInfo();
+  if (info.hasCookies) {
     return {
       active: true,
-      source: "Environment Variable (YOUTUBE_COOKIE)",
-      detail: `Variabel terpasang di hosting (${envCookie.trim().length} karakter).`,
+      source: info.path ? `cookies.txt (${info.path})` : "Environment Variable (YOUTUBE_COOKIE)",
+      detail: info.loggedIn
+        ? `Login akun terdeteksi (${info.cookieCount} entri YouTube).`
+        : `Cookies terpasang (${info.cookieCount} entri) TAPI tidak ada LOGIN_INFO/SAPISID — ini cookies guest, biasanya belum cukup untuk IP Railway. Export ulang cookies saat sudah login YouTube.`,
     };
   }
 
@@ -2112,26 +2109,36 @@ export async function createAudioResourceFromYtDlp(
   ];
 
   // Player-client tiers tuned for yt-dlp 2026.x ("tv_embedded" was removed upstream).
-  // Ordered from most capable to most permissive for datacenter IPs.
-  // `default` = tv_samsung+visionos+web (HLS/m3u8, works without a PO token).
-  // The rest are fallbacks; clients needing GVS PO tokens are covered by the
-  // bgutil provider running on 127.0.0.1:4416.
-  const streamTiers: Array<{ clients: string; timeoutMs: number; useCookies: boolean }> = [
-    { clients: "default", timeoutMs: 22000, useCookies: true },
-    { clients: "mweb,tv,web_safari", timeoutMs: 15000, useCookies: false },
-    { clients: "tv_simply", timeoutMs: 15000, useCookies: false },
-    { clients: "android_vr,visionos", timeoutMs: 15000, useCookies: false },
-    { clients: "ios,web_embedded", timeoutMs: 15000, useCookies: false },
-  ];
+  // Cookies are passed on EVERY tier when available: `tv`/`web_safari` return DRM or
+  // no HLS formats without an authenticated session, and guest cookies are not enough
+  // on datacenter IPs. PO tokens come from the bgutil provider on 127.0.0.1:4416.
+  // `android_vr` is intentionally absent: yt-dlp upstream reports every format is
+  // 403'd for client version 1.65.10 since 2026.08.17.
+  const streamTiers: Array<{ clients: string; timeoutMs: number }> = cookieArgs.length > 0
+    ? [
+        { clients: "default", timeoutMs: 22000 },
+        { clients: "web,mweb,tv", timeoutMs: 18000 },
+        { clients: "web_embedded", timeoutMs: 15000 },
+        { clients: "tv_simply", timeoutMs: 15000 },
+        { clients: "visionos,tv_downgraded", timeoutMs: 15000 },
+      ]
+    : [
+        { clients: "default", timeoutMs: 22000 },
+        { clients: "web_embedded", timeoutMs: 15000 },
+        { clients: "mweb,tv,web_safari", timeoutMs: 18000 },
+        { clients: "tv_simply", timeoutMs: 15000 },
+        { clients: "visionos,tv_downgraded", timeoutMs: 15000 },
+      ];
 
   const tierErrors: string[] = [];
+  let botCheckDetected = false;
 
   const attemptStream = async (attempt: number): Promise<any> => {
     logger.info({ attempt, targetUrl }, `Attempting YouTube stream (Percobaan ${attempt}/2)...`);
 
     for (let i = 0; i < streamTiers.length; i++) {
       const tier = streamTiers[i];
-      const useCookies = tier.useCookies && cookieArgs.length > 0;
+      const useCookies = cookieArgs.length > 0;
       try {
         logger.info(
           { tier: i + 1, clients: tier.clients, cookies: useCookies },
@@ -2147,11 +2154,15 @@ export async function createAudioResourceFromYtDlp(
         logger.info({ tier: i + 1, clients: tier.clients }, `Stream started successfully on tier ${i + 1}`);
         return resource;
       } catch (err: any) {
-        const msg = `T${i + 1} ${tier.clients}: ${err?.message || err}`;
+        const rawMsg = String(err?.message || err);
+        if (/sign in to confirm|not a bot|confirm you(?:'|’)?re not a bot/i.test(rawMsg)) {
+          botCheckDetected = true;
+        }
+        const msg = `T${i + 1} ${tier.clients}: ${rawMsg}`;
         tierErrors.push(msg);
         logger.warn(
-          { tier: i + 1, clients: tier.clients, err: err?.message || err },
-          `Stream tier ${i + 1} failed: [${err?.message || err}]`
+          { tier: i + 1, clients: tier.clients, err: rawMsg },
+          `Stream tier ${i + 1} failed: [${rawMsg}]`
         );
       }
     }
@@ -2184,7 +2195,9 @@ export async function createAudioResourceFromYtDlp(
     }
 
     const detail = tierErrors.slice(-4).join(" | ");
-    throw new Error(`Semua tier streaming yt-dlp gagal memuat audio.${detail ? ` (${detail})` : ""}`);
+    const streamError = new Error(`Semua tier streaming yt-dlp gagal memuat audio.${detail ? ` (${detail})` : ""}`);
+    (streamError as any).botCheck = botCheckDetected;
+    throw streamError;
   };
 
   // Attempt 1
@@ -2202,6 +2215,17 @@ export async function createAudioResourceFromYtDlp(
     return await attemptStream(2);
   } catch (err2: any) {
     logger.error({ err: err2?.message }, "YouTube stream attempt 2 (retry) also failed.");
+    const isBotCheck =
+      Boolean(err2?.botCheck) ||
+      /sign in to confirm|not a bot|confirm you(?:'|’)?re not a bot/i.test(String(err2?.message || ""));
+    if (isBotCheck) {
+      throw new Error(
+        "YouTube memblokir IP server ini dengan verifikasi login (\"Sign in to confirm you're not a bot\"). " +
+        "PO Token saja tidak cukup untuk IP datacenter seperti Railway. " +
+        "Upload cookies akun YouTube lewat `/cookies` (sekali saja) atau set env `YOUTUBE_COOKIE`, lalu coba `/play` lagi. " +
+        `Detail: ${String(err2?.message || err2).slice(0, 350)}`
+      );
+    }
     throw new Error(
       `Gagal memutar audio dari YouTube setelah 2 percobaan. YouTube memblokir IP server (403) atau provider PO Token tidak aktif. Jalankan \`/check\` untuk diagnosa. Detail: ${String(err2?.message || err2).slice(0, 500)}`
     );

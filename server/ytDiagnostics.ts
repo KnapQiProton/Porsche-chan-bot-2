@@ -23,8 +23,15 @@ import {
   checkPotProvider,
   createAudioResourceFromYtDlp,
   getCookieStatus,
+  getCookieAuthInfo,
   FFMPEG_BIN,
 } from "./musicPlayer";
+
+const COOKIE_SOLUTION_TEXT =
+  "1. **Wajib:** jalankan `/cookies`, export `cookies.txt` dari browser yang SUDAH login YouTube (ekstensi *Get cookies.txt LOCALLY*), lalu upload. Cookies guest tidak cukup untuk IP Railway.\n" +
+  "2. Alternatif permanen: set env `YOUTUBE_COOKIE` (isi base64 dari `/cookies`) di Railway → Variables.\n" +
+  "3. Agar upload `/cookies` tidak hilang saat redeploy, mount Railway Volume — bot otomatis menyimpan ke `RAILWAY_VOLUME_MOUNT_PATH`.\n" +
+  "4. Opsional: set `YTDLP_PROXY` ke proxy residential jika punya.";
 
 export interface ShellExecResult {
   stdout: string;
@@ -488,6 +495,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
   // 4. Gather System Versions
   const sys = await getSystemVersions();
   const pot = await checkPotProvider();
+  const cookieAuth = getCookieAuthInfo();
 
   // 5. Update Status: Running Live Test (Kuning)
   const testingEmbed = new EmbedBuilder()
@@ -509,17 +517,31 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
   const test = await runYtLiveTest(sys.ytdlpPath);
   const streamTest = test.success ? await runYtStreamTest(sys.ytdlpPath) : null;
 
-  // 7. Case A: Live Test Success -> Sistem Sehat (Hijau)
+  // 7. Case A: Live Test Success -> Sistem Sehat (Hijau) atau Audio Gagal (Merah)
   if (test.success) {
+    const streamOk = !streamTest || streamTest.success;
     const healthyEmbed = new EmbedBuilder()
-      .setColor(0x57f287) // Hijau
-      .setTitle("Sistem Sehat ✅")
-      .setDescription("Seluruh komponen pemutar YouTube berfungsi normal! Tidak ada pemblokiran terdeteksi.")
+      .setColor(streamOk ? 0x57f287 : 0xed4245) // Hijau / Merah
+      .setTitle(streamOk ? "Sistem Sehat ✅" : "⚠️ Metadata OK — Audio Gagal ❌")
+      .setDescription(
+        streamOk
+          ? "Seluruh komponen pemutar YouTube berfungsi normal! Tidak ada pemblokiran terdeteksi."
+          : "yt-dlp bisa mengambil metadata video, tetapi gagal mengalirkan audio. Ini pola khas bot-check YouTube pada IP datacenter (Railway)."
+      )
       .addFields(
         { name: "🐍 Python", value: `\`${sys.python}\``, inline: true },
         { name: "🎵 yt-dlp", value: `\`${sys.ytdlp}\``, inline: true },
         { name: "🎬 FFmpeg", value: `\`${sys.ffmpeg}\``, inline: true },
         { name: "🍪 Cookies Aktif", value: `\`${getCookieStatus().source}\``, inline: true },
+        {
+          name: "🔐 Login Cookies",
+          value: cookieAuth.loggedIn
+            ? "✅ Akun YouTube login terdeteksi"
+            : cookieAuth.hasCookies
+              ? "⚠️ Cookies guest (tanpa LOGIN_INFO) — IP Railway biasanya masih diblokir"
+              : "❌ Belum ada cookies — wajib untuk IP datacenter seperti Railway",
+          inline: false,
+        },
         {
           name: "🔑 PO Token Provider",
           value: pot.reachable ? `✅ Aktif (\`${pot.url}\`)` : `⚠️ Tidak aktif (\`${pot.url}\`)`,
@@ -551,9 +573,13 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
             : "⏭️ Dilewati (live test metadata gagal)",
           inline: false,
         },
-        { name: "✨ Status Bot", value: "Siap memutar musik via command `/play`", inline: false }
+        {
+          name: streamOk ? "✨ Status Bot" : "💡 Solusi",
+          value: streamOk ? "Siap memutar musik via command `/play`" : COOKIE_SOLUTION_TEXT,
+          inline: false,
+        }
       )
-      .setFooter({ text: "Diagnosa Selesai • Sistem Normal" })
+      .setFooter({ text: streamOk ? "Diagnosa Selesai • Sistem Normal" : "Diagnosa Selesai • Perlu Cookies Login" })
       .setTimestamp();
 
     await interaction.editReply({
@@ -664,10 +690,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
         },
         {
           name: "💡 Solusi yang Disarankan",
-          value:
-            "1. Gunakan command `/cookies` dan upload file `cookies.txt` akun YouTube kamu agar bot login sebagai user nyata.\n" +
-            "2. Atau pasang environment variable `YOUTUBE_COOKIE` di panel KeritCloud.\n" +
-            "3. Minta admin KeritCloud untuk mengganti IP container node kamu jika subnet IP terkena ban massal.",
+          value: COOKIE_SOLUTION_TEXT,
           inline: false,
         }
       )
@@ -707,6 +730,7 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
   // Gather versions
   const sys = await getSystemVersions();
   const pot = await checkPotProvider();
+  const cookieAuth = getCookieAuthInfo();
 
   const testEmbed = new EmbedBuilder()
     .setColor(0xfee75c)
@@ -727,15 +751,29 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
   const streamTest = test.success ? await runYtStreamTest(sys.ytdlpPath) : null;
 
   if (test.success) {
+    const streamOk = !streamTest || streamTest.success;
     const healthyEmbed = new EmbedBuilder()
-      .setColor(0x57f287)
-      .setTitle("Sistem Sehat ✅")
-      .setDescription("Seluruh komponen pemutar YouTube berfungsi normal! Tidak ada pemblokiran terdeteksi.")
+      .setColor(streamOk ? 0x57f287 : 0xed4245)
+      .setTitle(streamOk ? "Sistem Sehat ✅" : "⚠️ Metadata OK — Audio Gagal ❌")
+      .setDescription(
+        streamOk
+          ? "Seluruh komponen pemutar YouTube berfungsi normal! Tidak ada pemblokiran terdeteksi."
+          : "yt-dlp bisa mengambil metadata video, tetapi gagal mengalirkan audio. Ini pola khas bot-check YouTube pada IP datacenter (Railway)."
+      )
       .addFields(
         { name: "🐍 Python", value: `\`${sys.python}\``, inline: true },
         { name: "🎵 yt-dlp", value: `\`${sys.ytdlp}\``, inline: true },
         { name: "🎬 FFmpeg", value: `\`${sys.ffmpeg}\``, inline: true },
         { name: "🍪 Cookies Aktif", value: `\`${getCookieStatus().source}\``, inline: true },
+        {
+          name: "🔐 Login Cookies",
+          value: cookieAuth.loggedIn
+            ? "✅ Akun YouTube login terdeteksi"
+            : cookieAuth.hasCookies
+              ? "⚠️ Cookies guest (tanpa LOGIN_INFO) — IP Railway biasanya masih diblokir"
+              : "❌ Belum ada cookies — wajib untuk IP datacenter seperti Railway",
+          inline: false,
+        },
         {
           name: "🔑 PO Token Provider",
           value: pot.reachable ? `✅ Aktif (\`${pot.url}\`)` : `⚠️ Tidak aktif (\`${pot.url}\`)`,
@@ -767,9 +805,13 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
             : "⏭️ Dilewati (live test metadata gagal)",
           inline: false,
         },
-        { name: "✨ Status Bot", value: "Siap memutar musik via command `!play` atau `/play`", inline: false }
+        {
+          name: streamOk ? "✨ Status Bot" : "💡 Solusi",
+          value: streamOk ? "Siap memutar musik via command `!play` atau `/play`" : COOKIE_SOLUTION_TEXT,
+          inline: false,
+        }
       )
-      .setFooter({ text: "Diagnosa Selesai • Sistem Normal" })
+      .setFooter({ text: streamOk ? "Diagnosa Selesai • Sistem Normal" : "Diagnosa Selesai • Perlu Cookies Login" })
       .setTimestamp();
 
     await replyMsg.edit({
@@ -869,10 +911,7 @@ export async function handleYtFixMessage(message: Message): Promise<void> {
         },
         {
           name: "💡 Solusi yang Disarankan",
-          value:
-            "1. Gunakan command `/cookies` dan upload file `cookies.txt` akun YouTube kamu.\n" +
-            "2. Atau pasang environment variable `YOUTUBE_COOKIE` di panel KeritCloud.\n" +
-            "3. Minta admin KeritCloud untuk mengganti IP container node kamu jika subnet IP terkena ban massal.",
+          value: COOKIE_SOLUTION_TEXT,
           inline: false,
         }
       )

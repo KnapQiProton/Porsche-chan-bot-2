@@ -43,6 +43,7 @@ import {
   safeDestroyVoiceConnection,
   saveUploadedCookies,
   getCookieStatus,
+  getCookieAuthInfo,
   ensureYtDlpUpdated,
   autoUpdateYtDlp,
   checkPotProvider,
@@ -3336,7 +3337,8 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
           .setColor(status.active ? 0x22c55e : 0xf59e0b)
           .setTitle("🍪 Panduan Autentikasi Cookies YouTube")
           .setDescription(
-            `Status saat ini: **${status.active ? "🟢 Aktif (Siap)" : "🔴 Belum Ada"}**\nSumber: \`${status.source}\`\n\n` +
+            `Status saat ini: **${status.active ? "🟢 Aktif (Siap)" : "🔴 Belum Ada"}**\nSumber: \`${status.source}\`\n${status.detail}\n\n` +
+            `⚠️ **Untuk Railway / IP datacenter, cookies WAJIB berasal dari akun yang sudah login YouTube.** Cookies guest tidak akan melewati bot-check.\n\n` +
             `**Cara mudah memasang Cookies YouTube (Opsi Upload File):**\n` +
             `1. Pasang ekstensi browser **Get cookies.txt LOCALLY** (tersedia di Chrome Web Store, Edge, & Firefox).\n` +
             `2. Buka [YouTube](https://www.youtube.com) di browser dan pastikan akun Google/YouTube kamu sudah login.\n` +
@@ -3354,20 +3356,26 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       }
       const cookieContent = await response.text();
       const result = saveUploadedCookies(cookieContent);
+      const authInfo = getCookieAuthInfo();
+      const persistentDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.COOKIES_DIR;
 
       const embed = new EmbedBuilder()
-        .setColor(0x22c55e)
-        .setTitle("✅ Cookies YouTube Berhasil Diaktifkan!")
+        .setColor(authInfo.loggedIn ? 0x22c55e : 0xf59e0b)
+        .setTitle(
+          authInfo.loggedIn
+            ? "✅ Cookies YouTube (Login) Berhasil Diaktifkan!"
+            : "⚠️ Cookies Tersimpan — Tapi Sepertinya Bukan Cookies Login"
+        )
         .setDescription(
           `Cookies YouTube telah tersimpan dan langsung aktif untuk streaming saat ini.\n` +
-          `• Ditemukan **${result.count}** entri domain YouTube.\n\n` +
-          `💡 **PENTING UNTUK RAILWAY (Agar Permanen):**\n` +
-          `Server Railway me-reset disk saat redeploy/restart. Agar cookies kamu **permanen selamanya**, pasang variable di Railway:\n\n` +
-          `1. Buka dashboard service kamu di **[Railway](https://railway.app)**\n` +
-          `2. Buka tab **Variables** -> klik **New Variable**\n` +
-          `   • **Name:** \`YOUTUBE_COOKIE\`\n` +
-          `   • **Value:** *(Download file lampiran di bawah dan copy isinya)*\n` +
-          `3. Klik Deploy / Save. Selesai! Bot kamu akan selalu login selamanya!`
+          `• Ditemukan **${result.count}** entri domain YouTube.\n` +
+          `• Status login: **${authInfo.loggedIn ? "🟢 Akun login terdeteksi (LOGIN_INFO + SAPISID)" : "🔴 Tidak ada LOGIN_INFO/SAPISID (cookies guest)"}**\n\n` +
+          (authInfo.loggedIn
+            ? `💡 **Agar Permanen di Railway:**\n`
+            : `⚠️ **Cookies guest biasanya TIDAK cukup** untuk melewati bot-check YouTube di IP Railway. Export ulang dari browser yang benar-benar sudah login YouTube, lalu upload lagi.\n\n`) +
+          (persistentDir
+            ? `✅ Railway Volume terdeteksi (\`${persistentDir}\`) — cookies otomatis disimpan permanen, tidak hilang saat redeploy.`
+            : `💡 **Permanen:** mount **Railway Volume** ke service ini (otomatis terdeteksi lewat \`RAILWAY_VOLUME_MOUNT_PATH\`), atau set env \`YOUTUBE_COOKIE\` berisi base64 dari file di bawah.`)
         );
 
       const base64File = new AttachmentBuilder(Buffer.from(result.base64, "utf-8"), {
@@ -3610,7 +3618,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
         const response = await fetch(attachment.url);
         const text = await response.text();
         const res = saveUploadedCookies(text);
-        await message.reply(`✅ Cookies YouTube berhasil disimpan (${res.count} entri)! Gunakan slash command \`/cookies\` untuk melihat kode Base64 untuk Railway.`);
+        const authInfo = getCookieAuthInfo();
+        await message.reply(
+          authInfo.loggedIn
+            ? `✅ Cookies YouTube (login) berhasil disimpan (${res.count} entri)! Streaming siap dicoba.`
+            : `⚠️ Cookies tersimpan (${res.count} entri), tapi tidak ada LOGIN_INFO/SAPISID — ini cookies guest dan biasanya masih diblokir di Railway. Export ulang dari browser yang sudah login YouTube.`
+        );
         await message.delete().catch(() => {});
       } catch (err: any) {
         await message.reply(`❌ Gagal menyimpan cookies: ${err?.message || "Format tidak valid"}`);

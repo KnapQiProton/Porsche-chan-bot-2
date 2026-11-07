@@ -57,12 +57,17 @@ RUN npm run build
 
 # Update yt-dlp to nightly at the END so Docker doesn't cache stale version
 # (This layer runs after source copy, so it always rebuilds on code changes)
-RUN pipx upgrade --pip-args="--pre" yt-dlp 2>/dev/null || true && \
-    echo "yt-dlp version:" && yt-dlp --version
+RUN pipx upgrade --pip-args="--pre" yt-dlp 2>/dev/null || true
+# Re-assert the POT plugin after the upgrade so it can never be dropped
+RUN pipx runpip yt-dlp install -q "bgutil-ytdlp-pot-provider==2.0.2" 2>/dev/null || true
+RUN echo "yt-dlp version:" && yt-dlp --version
 
 # Runtime environment
 ENV NODE_ENV="production"
 ENV NODE_OPTIONS="--max-old-space-size=384"
+# Explicit local bgutil provider URL (plugin default is the same, but this keeps
+# behaviour deterministic and shows up in /check diagnostics).
+ENV YOUTUBE_POT_PROVIDER_URL="http://127.0.0.1:4416"
 # yt-dlp is installed/updated at build time and the POT plugin is injected by
 # entrypoint.sh; a runtime pip update only risks blocking the event loop and
 # wiping the plugin.
