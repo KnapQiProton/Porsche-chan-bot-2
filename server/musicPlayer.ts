@@ -32,15 +32,27 @@ import { spawn, spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { PassThrough } from "stream";
+import { PassThrough, Readable } from "stream";
 import playdl from "play-dl";
 import ytdl from "@distube/ytdl-core";
 import ffmpegStatic from "ffmpeg-static";
 import { logger } from "./logger";
 import { buildCloseRow } from "./messageClose";
 
-// Resolve FFmpeg path (support both bundled ffmpeg-static and system binary)
-export const FFMPEG_BIN = (ffmpegStatic && fs.existsSync(ffmpegStatic) ? ffmpegStatic : "ffmpeg") as string;
+// Resolve FFmpeg path (support system binary on Linux containers, bundled ffmpeg-static, and env override)
+export function resolveFfmpegBin(): string {
+  if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) {
+    return process.env.FFMPEG_PATH;
+  }
+  if (process.platform === "linux" && fs.existsSync("/usr/bin/ffmpeg")) {
+    return "/usr/bin/ffmpeg";
+  }
+  if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
+    return ffmpegStatic;
+  }
+  return "ffmpeg";
+}
+export const FFMPEG_BIN = resolveFfmpegBin();
 if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
   const ffmpegDir = path.dirname(ffmpegStatic);
   if (!process.env.PATH?.includes(ffmpegDir)) {
@@ -2211,6 +2223,7 @@ function tryPipedUrlStream(
   return new Promise((resolve, reject) => {
     let settled = false;
     let ffmpeg: any;
+    let ffmpegStderr = "";
 
     try {
       const args = [
@@ -2223,11 +2236,15 @@ function tryPipedUrlStream(
         args.push("-ss", seekSeconds.toString());
       }
       args.push("-i", audioUrl, "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "pipe:1");
-      ffmpeg = spawn(FFMPEG_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
+      ffmpeg = spawn(FFMPEG_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
     } catch (spawnErr) {
       return reject(spawnErr);
     }
 
+    ffmpeg.stderr?.on("data", (d: Buffer) => {
+      ffmpegStderr = (ffmpegStderr + d.toString()).slice(-2000);
+    });
+    ffmpeg.stderr?.on("error", () => {});
     ffmpeg.stdout.on("error", () => {});
 
     const timer = setTimeout(() => {
@@ -2246,11 +2263,12 @@ function tryPipedUrlStream(
       }
     });
 
-    ffmpeg.on("close", (code: number) => {
+    ffmpeg.on("close", (code: number | null, signal: string | null) => {
       if (!settled && code !== 0) {
         settled = true;
         clearTimeout(timer);
-        reject(new Error(`FFmpeg exited with error code ${code}`));
+        const detail = cleanProcessStderr(ffmpegStderr, 2) || (signal ? `signal ${signal}` : `exit code ${code}`);
+        reject(new Error(`FFmpeg exited: ${detail}`));
       }
     });
 
@@ -2276,6 +2294,161 @@ function tryPipedUrlStream(
       }
     };
     ffmpeg.stdout.on("data", onData);
+  });
+}
+
+/**
+ * Streams audio from an HTTP/HTTPS URL by fetching it directly in Node.js and piping
+ * the raw bytes into FFmpeg stdin.
+ *
+ * Why this is essential for datacenter deployments (e.g. Railway):
+ * 1. Node.js native fetch handles modern TLS, certificates, redirects, and browser
+ *    headers seamlessly across all environments.
+ * 2. It rejects before wasting resources if the stream redirects to `googlevideo.com`
+ *    (which datacenter IPs cannot stream without cookies).
+ * 3. FFmpeg only decodes audio from stdin without touching the network, avoiding
+ *    FFmpeg HTTPS timeouts, TLS failures, and SIGPIPE / null exit codes.
+ * 4. Stderr is captured so any decoding error is reported with rich detail.
+ */
+export function tryPipedFetchStream(
+  audioUrl: string,
+  seekSeconds: number = 0,
+  timeoutMs: number = 15000,
+  options?: { disallowGooglevideo?: boolean; referer?: string }
+): Promise<any> {
+  return new Promise(async (resolve, reject) => {
+    let settled = false;
+    let ffmpeg: any = null;
+    const abortController = new AbortController();
+    let ffmpegStderr = "";
+    let timer: NodeJS.Timeout | null = null;
+
+    const cleanup = () => {
+      try {
+        abortController.abort();
+      } catch {}
+      try {
+        if (ffmpeg && !ffmpeg.killed) ffmpeg.kill("SIGKILL");
+      } catch {}
+    };
+
+    timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        reject(new Error(`Piped fetch stream timeout (${timeoutMs}ms)`));
+      }
+    }, timeoutMs);
+
+    try {
+      let referer = options?.referer;
+      if (!referer) {
+        try {
+          referer = new URL(audioUrl).origin;
+        } catch {}
+      }
+
+      const fetchRes = await fetch(audioUrl, {
+        signal: abortController.signal,
+        redirect: "follow",
+        headers: {
+          "user-agent": MIRROR_USER_AGENT,
+          accept: "*/*",
+          "accept-encoding": "identity",
+          ...(referer ? { referer } : {}),
+        },
+      });
+
+      if (!fetchRes.ok) {
+        throw new Error(`HTTP ${fetchRes.status} ${fetchRes.statusText}`);
+      }
+
+      const finalHost = new URL(fetchRes.url || audioUrl).hostname.toLowerCase();
+      if (options?.disallowGooglevideo && finalHost.endsWith("googlevideo.com")) {
+        throw new Error("stream redirected to googlevideo.com (datacenter IP blocked)");
+      }
+
+      if (!fetchRes.body) {
+        throw new Error("stream response has no body");
+      }
+
+      const args = [];
+      if (seekSeconds > 0) {
+        args.push("-ss", seekSeconds.toString());
+      }
+      args.push("-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "pipe:1");
+
+      ffmpeg = spawn(FFMPEG_BIN, args, { stdio: ["pipe", "pipe", "pipe"] });
+
+      ffmpeg.stdin.on("error", (err: any) => {
+        if (err?.code !== "EPIPE") logger.debug({ err }, "FFmpeg stdin error");
+      });
+      ffmpeg.stdout.on("error", (err: any) => {
+        if (err?.code !== "EPIPE") logger.debug({ err }, "FFmpeg stdout error");
+      });
+      ffmpeg.stderr.on("data", (d: Buffer) => {
+        ffmpegStderr = (ffmpegStderr + d.toString()).slice(-2000);
+      });
+      ffmpeg.stderr.on("error", () => {});
+
+      ffmpeg.on("error", (err: any) => {
+        if (!settled) {
+          settled = true;
+          if (timer) clearTimeout(timer);
+          cleanup();
+          reject(err);
+        }
+      });
+
+      ffmpeg.on("close", (code: number | null, signal: string | null) => {
+        if (!settled && code !== 0) {
+          settled = true;
+          if (timer) clearTimeout(timer);
+          cleanup();
+          const detail = cleanProcessStderr(ffmpegStderr, 2) || (signal ? `signal ${signal}` : `exit code ${code}`);
+          reject(new Error(`FFmpeg exited: ${detail}`));
+        }
+      });
+
+      const nodeStream = Readable.fromWeb(fetchRes.body as any);
+      nodeStream.on("error", (err: any) => {
+        if (!settled) {
+          settled = true;
+          if (timer) clearTimeout(timer);
+          cleanup();
+          reject(new Error(`Stream read error: ${err?.message || err}`));
+        }
+      });
+      nodeStream.pipe(ffmpeg.stdin);
+
+      const onData = (chunk: Buffer) => {
+        if (!settled) {
+          settled = true;
+          if (timer) clearTimeout(timer);
+          ffmpeg.stdout.removeListener("data", onData);
+
+          const pt = new PassThrough();
+          pt.write(chunk);
+          ffmpeg.stdout.pipe(pt);
+
+          pt.on("close", cleanup);
+          pt.on("end", cleanup);
+          pt.on("error", cleanup);
+
+          const resource = createAudioResource(pt, { inputType: StreamType.Raw });
+          (resource as any)._cleanupProcesses = cleanup;
+          resolve(resource);
+        }
+      };
+      ffmpeg.stdout.on("data", onData);
+    } catch (err: any) {
+      if (!settled) {
+        settled = true;
+        if (timer) clearTimeout(timer);
+        cleanup();
+        reject(err);
+      }
+    }
   });
 }
 
@@ -2412,10 +2585,9 @@ async function resolveMirrorAudioFromInstance(
         bitrate: Number(format.bitrate) || 0,
       }));
 
-    if (!apiFormats.length) return [];
-    // Prefer `/latest_version`: its signed redirect survives cases where the
-    // API's proxied URL is rejected (we saw 403 on some popular videos).
-    return [...buildInvidiousLatestVersionCandidates(instance, videoId), ...apiFormats];
+    if (apiFormats.length) return apiFormats;
+    // Fallback only if no proxied adaptiveFormats were returned
+    return buildInvidiousLatestVersionCandidates(instance, videoId);
   }
 
   const json = await fetchMirrorJson(`${instance.base}/streams/${videoId}`, timeoutMs);
@@ -2454,6 +2626,16 @@ export async function validateMirrorCandidate(
     });
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const finalUrl = res.url || candidate.url;
+    let finalHost = "";
+    try {
+      finalHost = new URL(finalUrl).hostname.toLowerCase();
+    } catch {}
+
+    if (finalHost.endsWith("googlevideo.com")) {
+      throw new Error("redirected to googlevideo.com (datacenter IP blocked)");
+    }
 
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
     if (contentType && !/^(audio|video|application\/octet-stream)/.test(contentType)) {
@@ -2817,7 +2999,10 @@ export async function createAudioResourceFromYtDlp(
           } catch {}
 
           try {
-            const resource = await tryPipedUrlStream(candidate.finalUrl, seekSeconds, 15_000);
+            const resource = await tryPipedFetchStream(candidate.finalUrl, seekSeconds, 15_000, {
+              disallowGooglevideo: true,
+              referer: candidate.source,
+            });
             (resource as any)._tier = `tier 8 (mirror: ${mirrorHost})`;
             logger.info(
               {
