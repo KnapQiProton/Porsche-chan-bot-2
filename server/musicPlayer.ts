@@ -25,7 +25,8 @@ import {
   VoiceBasedChannel,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
-  StringSelectMenuInteraction
+  StringSelectMenuInteraction,
+  PermissionFlagsBits,
 } from "discord.js";
 import { spawn, spawnSync } from "child_process";
 import fs from "fs";
@@ -3182,6 +3183,22 @@ export class MusicService {
     voiceChannel: VoiceBasedChannel,
     textChannel?: TextBasedChannel
   ): Promise<GuildSession> {
+    // Fail early with a useful message instead of joining and staying silent.
+    const me = guild.members.me;
+    if (me) {
+      const perms = voiceChannel.permissionsFor(me);
+      if (
+        perms &&
+        (!perms.has(PermissionFlagsBits.ViewChannel) ||
+          !perms.has(PermissionFlagsBits.Connect) ||
+          !perms.has(PermissionFlagsBits.Speak))
+      ) {
+        throw new Error(
+          "Aku nggak punya izin **View Channel / Connect / Speak** di voice channel itu. Kasih izin dulu ya~ (๑•́ ₃ •̀๑)"
+        );
+      }
+    }
+
     let session = sessions.get(guild.id);
     let connection = getVoiceConnection(guild.id);
 
@@ -3218,9 +3235,16 @@ export class MusicService {
       });
 
       try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 7_000);
+        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
       } catch (connErr) {
-        logger.warn({ connErr, guildId: guild.id }, "Voice connection takes longer than 7s to become Ready");
+        logger.error(
+          { connErr, guildId: guild.id, channelId: voiceChannel.id },
+          "Voice connection failed to become Ready within 15s"
+        );
+        safeDestroyVoiceConnection(connection);
+        throw new Error(
+          "Gagal terhubung ke voice channel (timeout). Cek izin Connect/Speak, region voice Discord, atau coba channel lain."
+        );
       }
     }
 
