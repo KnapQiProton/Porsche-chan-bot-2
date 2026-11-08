@@ -2313,7 +2313,7 @@ function getMirrorInstances(): MirrorInstance[] {
 
 function getMirrorTimeoutMs(): number {
   const raw = Number(process.env.YOUTUBE_MIRROR_TIMEOUT_MS);
-  return Number.isFinite(raw) && raw >= 1000 ? Math.min(raw, 20_000) : 7_000;
+  return Number.isFinite(raw) && raw >= 1000 ? Math.min(raw, 20_000) : 10_000;
 }
 
 async function fetchMirrorJson(url: string, timeoutMs: number): Promise<any> {
@@ -2335,74 +2335,231 @@ async function fetchMirrorJson(url: string, timeoutMs: number): Promise<any> {
   }
 }
 
+export type MirrorAudioCandidate = {
+  url: string;
+  source: string;
+  detail: string;
+  bitrate: number;
+};
+
+const MIRROR_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+// Audio itags that Invidious' `/latest_version` endpoint can redirect to.
+// This endpoint often works when the URL returned by `/api/v1/videos` is
+// already expired or rejected with 403 by the mirror's proxy.
+const INVIDIOUS_AUDIO_ITAGS = ["140", "251", "250", "139", "249"];
+
+function absoluteMirrorUrl(raw: string, base: string): string {
+  try {
+    return new URL(raw, base).toString();
+  } catch {
+    return raw;
+  }
+}
+
+function buildInvidiousLatestVersionCandidates(
+  instance: MirrorInstance,
+  videoId: string
+): { url: string; detail: string; bitrate: number }[] {
+  return INVIDIOUS_AUDIO_ITAGS.slice(0, 3).map((itag) => ({
+    url: `${instance.base}/latest_version?id=${videoId}&itag=${itag}`,
+    detail: `latest_version itag ${itag}`,
+    bitrate: 0,
+  }));
+}
+
 async function resolveMirrorAudioFromInstance(
   instance: MirrorInstance,
   videoId: string,
   timeoutMs: number
-): Promise<{ url: string; detail: string } | null> {
+): Promise<{ url: string; detail: string; bitrate: number }[]> {
   if (instance.kind === "invidious") {
     // `local=true` makes Invidious proxy the audio through its own host, which
     // is the whole point: Railway never talks to googlevideo directly.
     const json = await fetchMirrorJson(`${instance.base}/api/v1/videos/${videoId}?local=true`, timeoutMs);
     const formats = Array.isArray(json?.adaptiveFormats) ? json.adaptiveFormats : [];
-    const audio = formats
+    const apiFormats = formats
       .filter((format: any) => format?.url && /audio/i.test(String(format?.type || "")))
-      .sort((a: any, b: any) => (Number(b?.bitrate) || 0) - (Number(a?.bitrate) || 0));
-    if (!audio.length) return null;
-    return { url: String(audio[0].url), detail: String(audio[0].type || "audio") };
+      .sort((a: any, b: any) => (Number(b?.bitrate) || 0) - (Number(a?.bitrate) || 0))
+      .slice(0, 3)
+      .map((format: any) => ({
+        url: absoluteMirrorUrl(String(format.url), instance.base),
+        detail: String(format.type || "audio"),
+        bitrate: Number(format.bitrate) || 0,
+      }));
+
+    if (!apiFormats.length) return [];
+    // Prefer `/latest_version`: its signed redirect survives cases where the
+    // API's proxied URL is rejected (we saw 403 on some popular videos).
+    return [...buildInvidiousLatestVersionCandidates(instance, videoId), ...apiFormats];
   }
 
   const json = await fetchMirrorJson(`${instance.base}/streams/${videoId}`, timeoutMs);
   const streams = Array.isArray(json?.audioStreams) ? json.audioStreams : [];
-  const audio = streams
+  return streams
     .filter((stream: any) => stream?.url)
-    .sort((a: any, b: any) => (Number(b?.bitrate) || 0) - (Number(a?.bitrate) || 0));
-  if (!audio.length) return null;
-  return { url: String(audio[0].url), detail: String(audio[0].mimeType || "audio") };
+    .sort((a: any, b: any) => (Number(b?.bitrate) || 0) - (Number(a?.bitrate) || 0))
+    .slice(0, 3)
+    .map((stream: any) => ({
+      url: absoluteMirrorUrl(String(stream.url), instance.base),
+      detail: String(stream.mimeType || "audio"),
+      bitrate: Number(stream.bitrate) || 0,
+    }));
 }
 
 /**
- * Ask public mirrors for a playable audio URL. The last working instance is
- * tried alone first; if it fails, the remaining instances are probed in
- * parallel and the first success wins.
+ * Quick reachability check for a mirror candidate. Follows redirects and reads
+ * one small chunk, so Tier 8 only spends FFmpeg startup time on URLs that
+ * actually answer with audio.
  */
-export async function resolveMirrorAudioUrl(
+export async function validateMirrorCandidate(
+  candidate: MirrorAudioCandidate,
+  timeoutMs: number = 8_000
+): Promise<MirrorAudioCandidate & { finalUrl: string; contentType: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(candidate.url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "user-agent": MIRROR_USER_AGENT,
+        accept: "*/*",
+        range: "bytes=0-1023",
+      },
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    if (contentType && !/^(audio|video|application\/octet-stream)/.test(contentType)) {
+      throw new Error(`content-type ${contentType.slice(0, 40)}`);
+    }
+
+    const reader = res.body?.getReader();
+    if (reader) {
+      await reader.read().catch(() => {});
+      await reader.cancel().catch(() => {});
+    }
+
+    return {
+      ...candidate,
+      finalUrl: res.url || candidate.url,
+      contentType: contentType || "unknown",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Ask every public mirror for playable audio URLs and return all candidates.
+ *
+ * Returning every format matters: one mirror can hand out several audio
+ * formats, and the highest-bitrate URL is not always the one that actually
+ * streams (expired signature, range rejection, blocked datacenter IP). Tier 8
+ * tries them one by one instead of giving up after the first URL.
+ */
+export async function resolveMirrorAudioCandidates(
   videoId: string,
   timeoutMs: number = getMirrorTimeoutMs()
-): Promise<{ url: string; source: string; detail: string } | null> {
-  const instances = getMirrorInstances().slice(0, 6);
-  if (!instances.length) return null;
-
-  const remember = (instance: MirrorInstance, found: { url: string; detail: string }) => {
-    mirrorWinner = { instance, at: Date.now() };
-    return { url: found.url, source: instance.base, detail: found.detail };
-  };
-
-  const [first, ...rest] = instances;
-  try {
-    const found = await resolveMirrorAudioFromInstance(first, videoId, timeoutMs);
-    if (found) return remember(first, found);
-  } catch {
-    // fall through to the parallel probe
-  }
-
-  if (!rest.length) return null;
+): Promise<MirrorAudioCandidate[]> {
+  const instances = getMirrorInstances().slice(0, 8);
+  if (!instances.length) return [];
 
   const attempts = await Promise.allSettled(
-    rest.map(async (instance) => {
-      const found = await resolveMirrorAudioFromInstance(instance, videoId, timeoutMs);
-      if (!found) throw new Error("no audio stream");
-      return { instance, found };
-    })
+    instances.map(async (instance) => ({
+      instance,
+      found: await resolveMirrorAudioFromInstance(instance, videoId, timeoutMs),
+    }))
   );
 
+  const candidates: MirrorAudioCandidate[] = [];
+  const seen = new Set<string>();
+
   for (const attempt of attempts) {
-    if (attempt.status === "fulfilled" && attempt.value) {
-      return remember(attempt.value.instance, attempt.value.found);
+    if (attempt.status !== "fulfilled") continue;
+    const { instance, found } = attempt.value;
+    if (!found.length) continue;
+
+    // Remember the first instance that returned audio so the next /play tries
+    // it first (getMirrorInstances puts the winner at the front).
+    if (!mirrorWinner || mirrorWinner.instance.base !== instance.base) {
+      mirrorWinner = { instance, at: Date.now() };
+    }
+
+    for (const format of found) {
+      if (seen.has(format.url)) continue;
+      seen.add(format.url);
+      candidates.push({ ...format, source: instance.base });
     }
   }
 
-  return null;
+  return candidates;
+}
+
+/** Backwards-compatible helper: first playable mirror candidate, if any. */
+export async function resolveMirrorAudioUrl(
+  videoId: string,
+  timeoutMs: number = getMirrorTimeoutMs()
+): Promise<MirrorAudioCandidate | null> {
+  const candidates = await resolveMirrorAudioCandidates(videoId, timeoutMs);
+  return candidates[0] ?? null;
+}
+
+/**
+ * End-to-end mirror probe for `/check`: resolves candidates and verifies that
+ * at least one of them answers with audio from the current host (Railway).
+ */
+export async function probeMirrorForDiagnostics(videoId: string): Promise<{
+  ok: boolean;
+  candidates: number;
+  valid: number;
+  detail: string;
+}> {
+  const started = Date.now();
+  try {
+    const candidates = await resolveMirrorAudioCandidates(videoId);
+    if (!candidates.length) {
+      return {
+        ok: false,
+        candidates: 0,
+        valid: 0,
+        detail: `API mirror tidak mengembalikan audio (${Date.now() - started}ms)`,
+      };
+    }
+
+    const probes = await Promise.allSettled(
+      candidates.slice(0, 6).map((candidate) => validateMirrorCandidate(candidate))
+    );
+    const valid = probes.filter((probe) => probe.status === "fulfilled").length;
+    const hosts = [
+      ...new Set(
+        candidates.map((candidate) => {
+          try {
+            return new URL(candidate.url).host;
+          } catch {
+            return candidate.source;
+          }
+        })
+      ),
+    ];
+
+    return {
+      ok: valid > 0,
+      candidates: candidates.length,
+      valid,
+      detail: `${valid}/${candidates.length} kandidat valid • ${hosts.join(", ")} • ${Date.now() - started}ms`,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      candidates: 0,
+      valid: 0,
+      detail: String(err?.message || err).slice(0, 200),
+    };
+  }
 }
 
 // Create AudioResource from YouTube with robust multi-tier live piped streaming architecture and auto-retry
@@ -2569,51 +2726,102 @@ export async function createAudioResourceFromYtDlp(
       }
     }
 
-    // Tier 7: play-dl streaming fallback (works without yt-dlp)
-    try {
-      logger.info({ tier: 7 }, "Attempting stream via play-dl fallback...");
-      const resource = await createAudioResourceFromTrackUrl(targetUrl, seekSeconds);
-      if (resource) {
-        logger.info({ tier: 7 }, "Stream started successfully via play-dl fallback");
-        return resource;
+    // Tier 7: play-dl streaming fallback (works without yt-dlp).
+    // Skipped after a cookie-less bot-check: play-dl hits the same IP gate and
+    // only delays the mirror fallback.
+    if (!botCheckDetected || cookieArgs.length > 0) {
+      try {
+        logger.info({ tier: 7 }, "Attempting stream via play-dl fallback...");
+        const resource = await createAudioResourceFromTrackUrl(targetUrl, seekSeconds);
+        if (resource) {
+          logger.info({ tier: 7 }, "Stream started successfully via play-dl fallback");
+          return resource;
+        }
+      } catch (err: any) {
+        const rawMsg = String(err?.message || err);
+        tierErrors.push(`T7 play-dl: ${rawMsg}`);
+        tierFailures.push({
+          attempt,
+          tier: 7,
+          clients: "play-dl",
+          cookies: cookieArgs.length > 0,
+          elapsedMs: 0,
+          stage: "unknown",
+          reason: rawMsg.slice(0, 500),
+        });
+        logger.warn({ tier: 7, err: rawMsg }, `play-dl stream fallback failed: [${rawMsg}]`);
       }
-    } catch (err: any) {
-      const rawMsg = String(err?.message || err);
-      tierErrors.push(`T7 play-dl: ${rawMsg}`);
-      tierFailures.push({
-        attempt,
-        tier: 7,
-        clients: "play-dl",
-        cookies: cookieArgs.length > 0,
-        elapsedMs: 0,
-        stage: "unknown",
-        reason: rawMsg.slice(0, 500),
-      });
-      logger.warn({ tier: 7, err: rawMsg }, `play-dl stream fallback failed: [${rawMsg}]`);
     }
 
     // Tier 8: public Invidious/Piped mirror. Last resort for datacenter IPs:
-    // the mirror extracts from YouTube and proxies the audio bytes to us.
+    // the mirror extracts from YouTube and proxies/redirects to audio bytes.
     if (videoId) {
       try {
         logger.info({ tier: 8 }, "Attempting stream via public mirror fallback...");
-        const mirror = await resolveMirrorAudioUrl(videoId);
-        if (!mirror) throw new Error("semua mirror publik menolak / tidak punya audio");
+        const candidates = await resolveMirrorAudioCandidates(videoId);
+        if (!candidates.length) throw new Error("semua mirror publik menolak / tidak punya audio");
 
-        const resource = await tryPipedUrlStream(mirror.url, seekSeconds, 20_000);
-        let mirrorHost = mirror.source;
-        try {
-          mirrorHost = new URL(mirror.source).host;
-        } catch {}
-        (resource as any)._tier = `tier 8 (mirror: ${mirrorHost})`;
-        logger.info(
-          { tier: 8, source: mirror.source, detail: mirror.detail },
-          "Stream started successfully via public mirror"
+        // Validate candidates in parallel before paying FFmpeg startup cost.
+        const probes = await Promise.allSettled(
+          candidates.slice(0, 6).map((candidate) => validateMirrorCandidate(candidate))
         );
-        return resource;
+
+        const valid: Array<MirrorAudioCandidate & { finalUrl: string; contentType: string }> = [];
+        const probeErrors: string[] = [];
+        for (let index = 0; index < probes.length; index++) {
+          const probe = probes[index];
+          if (probe.status === "fulfilled") {
+            valid.push(probe.value);
+          } else {
+            const candidate = candidates[index];
+            let host = candidate.source;
+            try {
+              host = new URL(candidate.url).host;
+            } catch {}
+            probeErrors.push(`${host} [${candidate.detail}]: ${String(probe.reason?.message || probe.reason).slice(0, 100)}`);
+          }
+        }
+
+        if (!valid.length) {
+          throw new Error(`semua kandidat mirror tidak bisa diakses — ${probeErrors.join(" | ")}`);
+        }
+
+        const streamErrors: string[] = [];
+        for (const candidate of valid) {
+          let mirrorHost = candidate.source;
+          try {
+            mirrorHost = new URL(candidate.finalUrl).host;
+          } catch {}
+
+          try {
+            const resource = await tryPipedUrlStream(candidate.finalUrl, seekSeconds, 15_000);
+            (resource as any)._tier = `tier 8 (mirror: ${mirrorHost})`;
+            logger.info(
+              {
+                tier: 8,
+                source: candidate.source,
+                host: mirrorHost,
+                detail: candidate.detail,
+                contentType: candidate.contentType,
+                bitrate: candidate.bitrate,
+              },
+              "Stream started successfully via public mirror"
+            );
+            return resource;
+          } catch (streamErr: any) {
+            const streamMsg = String(streamErr?.message || streamErr);
+            streamErrors.push(`${mirrorHost} [${candidate.detail}]: ${streamMsg.slice(0, 100)}`);
+            logger.warn(
+              { tier: 8, source: candidate.source, host: mirrorHost, err: streamMsg },
+              "Mirror candidate failed to stream, trying next candidate"
+            );
+          }
+        }
+
+        throw new Error(`semua kandidat mirror gagal stream — ${streamErrors.join(" | ")}`);
       } catch (err: any) {
         const rawMsg = String(err?.message || err);
-        tierErrors.push(`T8 mirror: ${rawMsg}`);
+        tierErrors.push(`T8 public-mirror: ${rawMsg}`);
         tierFailures.push({
           attempt,
           tier: 8,

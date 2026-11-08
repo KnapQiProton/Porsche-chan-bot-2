@@ -26,6 +26,7 @@ import {
   getCookieStatus,
   getCookieAuthInfo,
   getLastYtFailure,
+  probeMirrorForDiagnostics,
   FFMPEG_BIN,
 } from "./musicPlayer";
 
@@ -642,6 +643,7 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
   if (test.success) {
     const streamOk = !streamTest || streamTest.success;
     const lastFailureField = streamOk ? null : buildLastFailureField();
+    const mirrorProbe = streamOk ? null : await probeMirrorForDiagnostics("dQw4w9WgXcQ");
     const healthyEmbed = new EmbedBuilder()
       .setColor(streamOk ? 0x57f287 : 0xed4245) // Hijau / Merah
       .setTitle(streamOk ? "Sistem Sehat ✅" : "⚠️ Metadata OK — Audio Gagal ❌")
@@ -693,6 +695,15 @@ export async function handleYtFixCommand(interaction: ChatInputCommandInteractio
               ? `✅ Audio keluar: **${streamTest.bytes.toLocaleString("id-ID")} byte** PCM • ${streamTest.tier || "unknown"} • ${streamTest.durationMs}ms`
               : `❌ Gagal: ${(streamTest.error || "tidak ada audio").slice(0, 500)}`
             : "⏭️ Dilewati (live test metadata gagal)",
+          inline: false,
+        },
+        {
+          name: "📡 Mirror Fallback (T8)",
+          value: mirrorProbe
+            ? mirrorProbe.ok
+              ? `✅ ${mirrorProbe.valid}/${mirrorProbe.candidates} kandidat siap • ${mirrorProbe.detail}`
+              : `❌ ${mirrorProbe.detail}`
+            : "⏭️ Tidak diuji (audio utama sudah normal)",
           inline: false,
         },
         ...(lastFailureField ? [lastFailureField] : []),
