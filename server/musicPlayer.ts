@@ -2441,12 +2441,15 @@ export async function createAudioResourceFromYtDlp(
   // Player-client tiers tuned for yt-dlp 2026.x ("tv_embedded" was removed upstream).
   // Cookies are passed on EVERY tier when available: `tv`/`web_safari` return DRM or
   // no HLS formats without an authenticated session, and guest cookies are not enough
-  // on datacenter IPs. PO tokens come from the bgutil provider on 127.0.0.1:4416.
-  // `android_vr` is intentionally absent: yt-dlp upstream reports every format is
-  // 403'd for client version 1.65.10 since 2026.08.17.
+  // on datacenter IPs. PO tokens come from the bgutil provider on 127.0.0.1:4416 and
+  // the JS challenge is solved by yt-dlp's EJS runtime (`--js-runtimes node`, bundled
+  // via the `yt-dlp[default]` extra).
+  // Android clients are kept because they still expose plain audio formats on IPs that
+  // are not bot-checked; they do NOT bypass the IP-level login gate on Railway.
   const streamTiers: Array<{ clients: string; timeoutMs: number }> = cookieArgs.length > 0
     ? [
         { clients: "default", timeoutMs: 22000 },
+        { clients: "android,android_vr", timeoutMs: 18000 },
         { clients: "web,mweb,tv", timeoutMs: 18000 },
         { clients: "web_embedded", timeoutMs: 15000 },
         { clients: "tv_simply", timeoutMs: 15000 },
@@ -2454,8 +2457,9 @@ export async function createAudioResourceFromYtDlp(
       ]
     : [
         { clients: "default", timeoutMs: 22000 },
+        { clients: "android,android_vr", timeoutMs: 18000 },
+        { clients: "web,mweb", timeoutMs: 18000 },
         { clients: "web_embedded", timeoutMs: 15000 },
-        { clients: "mweb,tv,web_safari", timeoutMs: 18000 },
         { clients: "tv_simply", timeoutMs: 15000 },
         { clients: "visionos,tv_downgraded", timeoutMs: 15000 },
       ];
