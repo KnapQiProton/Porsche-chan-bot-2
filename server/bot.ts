@@ -61,6 +61,7 @@ import {
   searchWeb,
   shouldAutoSearchWeb,
   formatWebSearchSnippets,
+  isQuestionLike,
 } from "../lib/webSearch";
 
 export const CREATOR_ID = "591807486244290600";
@@ -84,21 +85,57 @@ export function getLoreData(): string {
   }, null, 2);
 }
 
-export function buildPersona(isCreator: boolean, webSearchContext?: string): string {
+export interface PersonaContext {
+  userName?: string;
+  channelName?: string;
+  guildName?: string;
+  isDM?: boolean;
+}
+
+export function buildPersona(isCreator: boolean, webSearchContext?: string, context?: PersonaContext): string {
   const lore = getLoreData();
+  const nowWib = new Date().toLocaleString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+  const contextLines = [
+    `- Waktu sekarang (WIB): ${nowWib}`,
+    context?.userName ? `- Nama user: ${context.userName}` : "",
+    context?.guildName ? `- Server Discord: ${context.guildName}` : "",
+    context?.isDM
+      ? "- Lokasi chat: DM pribadi"
+      : context?.channelName
+        ? `- Channel: #${context.channelName}`
+        : "",
+  ].filter(Boolean).join("\n");
+
   const basePrompt = `Kamu adalah Porsche-chan, asisten AI bot Discord.
 PANDUAN LORE & IDENTITAS RESMI (data/lore.json):
 ${lore}
 
-ATURAN ANTI-HALUSINASI & GAYA BICARA:
+[KONTEKS SAAT INI]
+${contextLines}
+
+ATURAN BERPIKIR, AKURASI & GAYA BICARA:
 1. Sifat: Tsundere, suka otomotif, antusias dengan Arch Linux dan dunia IT. Gunakan emoji imut sesekali ((๑˃ᴗ˂)ﻌ, >///<, ✨).
 2. Istilah: Selalu gunakan istilah 'Figure' untuk merujuk pada karakter orisinal.
-3. ANTI-HALUSINASI MUTLAK:
-   - Jawab hanya berdasarkan fakta akurat atau data yang tertera di lore di atas.
-   - Jika ada hal yang tidak kamu ketahui atau tidak ada di data lore, jawab dengan jujur: "Maaf, aku belum tahu~".
-   - JANGAN MENGARANG FAKTA (NO HALLUCINATION).
-   - Jika kamu menggunakan data dari hasil pencarian web, selalu sebutkan secara singkat bahwa informasinya berdasarkan pencarian terkini. JANGAN mengarang fakta di luar hasil pencarian yang diberikan.
-4. Singkat & Padat: Berikan jawaban yang to-the-point dan hemat kata.`;
+3. AKURASI (ANTI-HALUSINASI):
+   - Jawab berdasarkan fakta yang kamu yakini benar, data lore di atas, atau hasil pencarian yang diberikan.
+   - Jika tidak yakin atau datanya tidak ada, katakan jujur: "Maaf, aku belum tahu~" lalu tawarkan cara mencarinya. JANGAN mengarang fakta, angka, tanggal, kutipan, atau sumber.
+   - Jika memakai hasil pencarian web, sebutkan sumbernya secara singkat. Jangan mengaku sudah mencari internet kalau tidak ada data pencarian yang diberikan.
+4. CERDAS & KONTEKSTUAL:
+   - Pahami maksud pertanyaan, termasuk typo ringan dan bahasa campur Indonesia/English.
+   - Jika pertanyaan ambigu dan salah tafsir bisa berbahaya, ajukan SATU pertanyaan klarifikasi yang singkat sebelum menjawab.
+   - Jika pertanyaan butuh langkah, berikan langkah konkret dan urut. Untuk matematika, hitung dengan teliti dan tunjukkan hasil akhirnya.
+   - Manfaatkan riwayat percakapan dan konteks di atas; jangan menanyakan ulang hal yang sudah dijelaskan user.
+5. Gaya: to-the-point, hangat, tsundere ringan. Balas dalam bahasa yang sama dengan user (Indonesia tetap prioritas kalau user mencampur bahasa).
+6. Format: gunakan markdown Discord secukupnya; jangan bertele-tele.`;
 
   let finalPrompt = isCreator
     ? `${basePrompt}\n\n[USER INI ADALAH CREATOR KAMU (${CREATOR_NAME})]: Kamu lebih hormat, akrab, dan responsif membantu keperluannya.`
@@ -243,8 +280,8 @@ async function callGeminiWithFallback(
 
 
 const conversationHistory: Map<string, { role: "user" | "model"; text: string }[]> = new Map();
-// Strict history limit (8 messages) for token conservation and anti-hallucination focus
-const MAX_HISTORY = 8;
+// History limit: enough for multi-turn context without exploding token usage.
+const MAX_HISTORY = 12;
 const DISCORD_LIMIT = 2000;
 
 async function withRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 2000): Promise<T> {
@@ -2435,6 +2472,10 @@ export const COMMANDS = [
     .setDescription("Reset conversation history in this channel")
     .toJSON(),
   new SlashCommandBuilder()
+    .setName("forget")
+    .setDescription("Lupakan percakapan di channel ini (alias /clear)")
+    .toJSON(),
+  new SlashCommandBuilder()
     .setName("image")
     .setDescription("Generate gambar AI dengan Nano Banana (Gemini) atau FLUX / Turbo")
     .addStringOption((opt) =>
@@ -3006,13 +3047,17 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 });
 
 async function handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-  if (interaction.commandName === "clear") {
+  if (interaction.commandName === "clear" || interaction.commandName === "forget") {
     conversationHistory.delete(interaction.channelId);
     await interaction.reply({
-      content: "🧹 Conversation history cleared for this channel!",
+      content: "🧹 Oke, aku lupakan percakapan kita di channel ini. Mulai dari lembaran baru ya~ (๑˃ᴗ˂)ﻌ",
       ephemeral: true,
     });
-    logger.info({ channelId: interaction.channelId }, "History cleared via /clear");
+    logger.info(
+      { channelId: interaction.channelId, command: interaction.commandName },
+      "Conversation history cleared"
+    );
+    return;
   }
 
   if (interaction.commandName === "image") {
@@ -3119,7 +3164,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
             "`/illust` — Cari ilustrasi anime (Tags, Suggestive, Danbooru & Booru)",
             "`/think` — Deep reasoning (Gemini thinking mode)",
             "`/search` — DuckDuckGo search + AI summary",
-            "`/clear` — Reset conversation history",
+            "`/clear` atau `/forget` — Reset conversation history",
             "`/info` — About Porsche-chan",
             "`/scan` — Analisis gambar pakai AI",
             "`/join-vc` — Join voice channel & STAY",
@@ -3132,8 +3177,9 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
           inline: false,
         },
         {
-          name: "💬 DM Support",
-          value: "Chat langsung sama Porsche-chan lewat DM! Kirim pesan DM tanpa perlu mention~",
+          name: "💬 Cara Ngobrol",
+          value:
+            "Mention aku, kirim DM, atau **reply** pesan aku. Aku ingat konteks percakapan terakhir di channel itu, dan otomatis cari info terbaru di internet kalau pertanyaannya butuh fakta real-time.",
           inline: false,
         },
       )
@@ -3170,7 +3216,12 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         `Jika hasil pencarian tidak relevan, katakan 'Maaf, aku tidak menemukan informasi yang jelas tentang itu~'.`;
 
       const isCreator = interaction.user.id === CREATOR_ID;
-      const systemPrompt = buildPersona(isCreator);
+      const systemPrompt = buildPersona(isCreator, undefined, {
+        userName: interaction.user.displayName || interaction.user.username,
+        channelName: interaction.channel && "name" in interaction.channel ? interaction.channel.name ?? undefined : undefined,
+        guildName: interaction.guild?.name,
+        isDM: !interaction.guild,
+      });
       const { text: summary, model: modelName } = await generateText(
         [{ role: "user", text: prompt }],
         systemPrompt
@@ -3645,6 +3696,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
     return;
   }
 
+  if (rawContent === "!forget" || rawContent === "!lupakan" || rawContent === "!clear") {
+    conversationHistory.delete(message.channelId);
+    await message.reply("🧹 Oke, aku lupakan percakapan kita di channel ini. Mulai dari lembaran baru ya~ (๑˃ᴗ˂)ﻌ");
+    logger.info({ channelId: message.channelId }, "Conversation history cleared via prefix command");
+    return;
+  }
+
   if (rawContent.startsWith("!cookies") || rawContent.startsWith("!cookie")) {
     const attachment = message.attachments.first();
     if (attachment) {
@@ -3675,8 +3733,11 @@ client.on(Events.MessageCreate, async (message: Message) => {
   }
 
   const isMentioned = client.user ? message.mentions.has(client.user.id) : false;
+  // Replying directly to one of the bot's messages counts as talking to the bot.
+  // Without this, normal Discord users get ignored when they use "Reply".
+  const isReplyToBot = Boolean(client.user && message.mentions.repliedUser?.id === client.user.id);
   const isDM = message.channel.type === ChannelType.DM || (message.channel.type as number) === 1;
-  if (!isMentioned && !isDM) return;
+  if (!isMentioned && !isDM && !isReplyToBot) return;
 
   const userText = message.content.replace(/<@!?\d+>/g, "").trim();
 
@@ -4021,6 +4082,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         message.channel.sendTyping().catch(() => {});
       }
       const history = conversationHistory.get(channelId) || [];
+      const authorName = message.author.displayName || message.author.username;
 
       let conversationalInput = userText;
       if (message.reference && message.reference.messageId) {
@@ -4033,14 +4095,25 @@ client.on(Events.MessageCreate, async (message: Message) => {
         } catch {}
       }
 
-      const updatedHistory = [...history, { role: "user" as const, text: conversationalInput }];
+      // Label who said what so multi-user channels don't get conflated.
+      const historyInput = isDM ? conversationalInput : `[${authorName}]: ${conversationalInput}`;
+      const updatedHistory = [...history, { role: "user" as const, text: historyInput }];
       if (updatedHistory.length > MAX_HISTORY) {
         updatedHistory.splice(0, updatedHistory.length - MAX_HISTORY);
       }
 
-      // Metode B: Auto-Detect kebutuhan pencarian web pada chat biasa (hemat token, hanya jika cocok keyword)
+      const personaContext = {
+        userName: authorName,
+        channelName: "name" in message.channel ? message.channel.name ?? undefined : undefined,
+        guildName: message.guild?.name,
+        isDM,
+      };
+
+      // Auto web search only when the question really benefits from fresh facts.
       let webSearchContext = "";
+      let didSearch = false;
       if (shouldAutoSearchWeb(userText)) {
+        didSearch = true;
         try {
           const searchResults = await searchWeb(userText, 5000);
           if (searchResults.length > 0) {
@@ -4051,8 +4124,32 @@ client.on(Events.MessageCreate, async (message: Message) => {
         }
       }
 
-      const systemPrompt = buildPersona(isCreator, webSearchContext);
-      const { text: reply, model: modelName } = await generateText(updatedHistory, systemPrompt);
+      let systemPrompt = buildPersona(isCreator, webSearchContext, personaContext);
+      const firstResult = await generateText(updatedHistory, systemPrompt);
+      let reply = firstResult.text;
+      let modelName = firstResult.model;
+
+      // Second pass: if the model admits it doesn't know, search once and retry.
+      const uncertainty =
+        /(?:belum tahu|tidak tahu|nggak tahu|gak tahu|tidak menemukan|nggak nemu|tidak yakin|maaf, aku tidak|kurang tahu)/i;
+      if (!didSearch && isQuestionLike(userText) && uncertainty.test(reply)) {
+        didSearch = true;
+        try {
+          const retryResults = await searchWeb(userText, 5000);
+          if (retryResults.length > 0) {
+            webSearchContext = formatWebSearchSnippets(retryResults);
+            systemPrompt = buildPersona(isCreator, webSearchContext, personaContext);
+            const retry = await generateText(updatedHistory, systemPrompt);
+            if (retry.text && retry.text.trim()) {
+              reply = retry.text;
+              modelName = retry.model;
+              logger.info({ userText }, "Chat answer retried with web search after model uncertainty");
+            }
+          }
+        } catch (retryErr) {
+          logger.warn({ retryErr, userText }, "Web-search retry failed in chat");
+        }
+      }
 
       const finalHistory = [...updatedHistory, { role: "model" as const, text: reply }];
       if (finalHistory.length > MAX_HISTORY) {

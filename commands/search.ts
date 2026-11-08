@@ -53,7 +53,12 @@ export async function handleSearchCommand(interaction: ChatInputCommandInteracti
       `Jika hasil pencarian tidak relevan, katakan 'Maaf, aku tidak menemukan informasi yang jelas tentang itu~'.`;
 
     const isCreator = interaction.user.id === CREATOR_ID;
-    const systemPrompt = buildPersona(isCreator);
+    const systemPrompt = buildPersona(isCreator, undefined, {
+      userName: interaction.user.displayName || interaction.user.username,
+      channelName: interaction.channel && "name" in interaction.channel ? interaction.channel.name ?? undefined : undefined,
+      guildName: interaction.guild?.name,
+      isDM: !interaction.guild,
+    });
     const { text: answer, model: modelName } = await generateText(
       [{ role: "user", text: searchPrompt }],
       systemPrompt

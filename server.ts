@@ -36,6 +36,12 @@ import {
   CREATOR_NAME,
   CREATOR_ID,
 } from "./server/bot";
+import {
+  shouldAutoSearchWeb,
+  searchWeb,
+  formatWebSearchSnippets,
+  isQuestionLike,
+} from "./lib/webSearch";
 
 async function startServer() {
   const app = express();
@@ -98,7 +104,15 @@ async function startServer() {
 
   // Interactive Web Chat Simulator with Porsche-chan Persona
   app.post("/api/bot/chat", async (req, res) => {
-    const { message, isCreator = false, history = [] } = req.body;
+    const {
+      message,
+      isCreator = false,
+      history = [],
+      userName,
+      channelName,
+      guildName,
+      isDM = false,
+    } = req.body;
     if (!message || typeof message !== "string") {
       res.status(400).json({ error: "Pesan tidak boleh kosong" });
       return;
@@ -109,17 +123,52 @@ async function startServer() {
         ...history.slice(-10),
         { role: "user" as const, text: message },
       ];
-      const systemPrompt = buildPersona(Boolean(isCreator));
+
+      const personaContext = {
+        userName: typeof userName === "string" ? userName : undefined,
+        channelName: typeof channelName === "string" ? channelName : undefined,
+        guildName: typeof guildName === "string" ? guildName : undefined,
+        isDM: Boolean(isDM),
+      };
+
+      let webSearchContext = "";
+      let didSearch = false;
+      if (shouldAutoSearchWeb(message)) {
+        didSearch = true;
+        const results = await searchWeb(message, 5000);
+        if (results.length > 0) {
+          webSearchContext = formatWebSearchSnippets(results);
+        }
+      }
+
+      let systemPrompt = buildPersona(Boolean(isCreator), webSearchContext, personaContext);
       const result = await generateText(conversation, systemPrompt);
+      let reply = result.text;
+      let provider = result.provider;
+
+      const uncertainty =
+        /(?:belum tahu|tidak tahu|nggak tahu|gak tahu|tidak menemukan|nggak nemu|tidak yakin|maaf, aku tidak|kurang tahu)/i;
+      if (!didSearch && isQuestionLike(message) && uncertainty.test(reply)) {
+        const retryResults = await searchWeb(message, 5000);
+        if (retryResults.length > 0) {
+          webSearchContext = formatWebSearchSnippets(retryResults);
+          systemPrompt = buildPersona(Boolean(isCreator), webSearchContext, personaContext);
+          const retry = await generateText(conversation, systemPrompt);
+          if (retry.text && retry.text.trim()) {
+            reply = retry.text;
+            provider = retry.provider;
+          }
+        }
+      }
 
       logger.info(
-        { provider: result.provider, isCreator, messageLength: message.length },
+        { provider, isCreator, messageLength: message.length },
         "Chat simulated from web interface"
       );
 
       res.json({
-        reply: result.text,
-        provider: result.provider,
+        reply,
+        provider,
         persona: isCreator ? "Creator (KnapQi)" : "Normal User",
       });
     } catch (err) {
