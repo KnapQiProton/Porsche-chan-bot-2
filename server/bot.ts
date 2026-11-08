@@ -58,6 +58,11 @@ import {
 } from "./animeTagEngine";
 import { handleYtCheckButton, handleYtFixCommand, handleYtFixMessage, handleLogsCommand, handleLogsMessage } from "./ytDiagnostics";
 import {
+  buildCloseButton,
+  handleMessageCloseButton,
+  isCloseButton,
+} from "./messageClose";
+import {
   searchWeb,
   shouldAutoSearchWeb,
   formatWebSearchSnippets,
@@ -2176,12 +2181,14 @@ export interface ThinkResult {
   sources: { title: string; url: string; snippet: string }[];
   provider: string;
   createdAt: number;
+  /** Discord user id that ran /think; only they may close the panel. */
+  ownerId?: string;
 }
 
 // In-memory cache for /think pagination (holds up to 100 recent queries)
 const thinkingCache = new Map<string, ThinkResult>();
 
-export async function performDeepThink(question: string): Promise<ThinkResult> {
+export async function performDeepThink(question: string, ownerId?: string): Promise<ThinkResult> {
   const queryClean = question.trim();
   const id = `th_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
@@ -2240,6 +2247,7 @@ Jika ada referensi web di atas yang relevan, gunakan untuk memperkuat keakuratan
     sources: sources.slice(0, 5),
     provider,
     createdAt: Date.now(),
+    ownerId,
   };
 
   // Cache result for pagination
@@ -2254,7 +2262,7 @@ Jika ada referensi web di atas yang relevan, gunakan untuk memperkuat keakuratan
 }
 
 export function buildThinkEmbed(data: ThinkResult, page: 1 | 2): { embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> } {
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const buttons = [
     new ButtonBuilder()
       .setCustomId(`think_page1_${data.id}`)
       .setLabel("📄 Halaman 1: Jawaban Lengkap")
@@ -2264,8 +2272,14 @@ export function buildThinkEmbed(data: ThinkResult, page: 1 | 2): { embed: EmbedB
       .setCustomId(`think_page2_${data.id}`)
       .setLabel(`🌐 Halaman 2: Sumber & Referensi (${data.sources.length})`)
       .setStyle(page === 2 ? ButtonStyle.Primary : ButtonStyle.Secondary)
-      .setDisabled(page === 2)
-  );
+      .setDisabled(page === 2),
+  ];
+
+  if (data.ownerId) {
+    buttons.push(buildCloseButton(data.ownerId, "think"));
+  }
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons);
 
   const embed = new EmbedBuilder().setTimestamp();
 
@@ -3059,6 +3073,12 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       return;
     }
 
+    // Shared close/delete button for music, image, illust and think panels.
+    if (isCloseButton(customId)) {
+      await handleMessageCloseButton(interaction);
+      return;
+    }
+
     if (customId.startsWith("think_page1_") || customId.startsWith("think_page2_")) {
       const page = customId.startsWith("think_page1_") ? 1 : 2;
       const thinkId = customId.replace(/^think_page[12]_/, "");
@@ -3413,7 +3433,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     const question = interaction.options.getString("question", true);
     await interaction.deferReply();
     try {
-      const thinkData = await performDeepThink(question);
+      const thinkData = await performDeepThink(question, interaction.user.id);
       const { embed, row } = buildThinkEmbed(thinkData, 1);
       await interaction.editReply({ embeds: [embed], components: [row] });
     } catch (err) {
@@ -4376,6 +4396,8 @@ export interface ImageSession {
   model: ImageGenModel;
   aspectRatio: AspectRatioType;
   updatedAt: number;
+  /** Discord user id that requested the image; only they may close the panel. */
+  ownerId?: string;
 }
 
 export const imageSessionCache = new Map<string, ImageSession>();
@@ -4420,7 +4442,12 @@ export function buildImageButtonsRow(session: ImageSession): ActionRowBuilder<Bu
     .setLabel(`📐 Ubah Rasio (${arLabels[nextAr]})`)
     .setStyle(ButtonStyle.Secondary);
 
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(rerollBtn, switchModelBtn, arBtn);
+  const buttons = [rerollBtn, switchModelBtn, arBtn];
+  if (session.ownerId) {
+    buttons.push(buildCloseButton(session.ownerId, "image"));
+  }
+
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons);
 }
 
 export async function handleImageButtonInteraction(interaction: ButtonInteraction): Promise<void> {
@@ -4505,6 +4532,7 @@ async function generateAndSendImage({
     model,
     aspectRatio,
     updatedAt: Date.now(),
+    ownerId: interaction?.user.id || replyTo?.author.id,
   };
   imageSessionCache.set(sessionId, session);
 
@@ -4602,6 +4630,8 @@ export interface IllustSession {
   updatedAt: number;
   seenIds: string[];
   pageOffset: number;
+  /** Discord user id that ran /illust; only they may close the panel. */
+  ownerId?: string;
 }
 
 export const illustSessionCache = new Map<string, IllustSession>();
@@ -4643,7 +4673,12 @@ export function buildIllustButtonsRow(session: IllustSession): ActionRowBuilder<
         : ButtonStyle.Secondary
     );
 
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(prevBtn, rerollBtn, nextBtn, aiBtn);
+  const buttons = [prevBtn, rerollBtn, nextBtn, aiBtn];
+  if (session.ownerId) {
+    buttons.push(buildCloseButton(session.ownerId, "illust"));
+  }
+
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons);
 }
 
 export async function handleIllustButtonInteraction(interaction: ButtonInteraction): Promise<void> {
@@ -4912,6 +4947,7 @@ export async function sendIllustImage({
       updatedAt: Date.now(),
       seenIds: [String(info.id)],
       pageOffset: 2,
+      ownerId: interaction?.user.id || replyTo?.author.id,
     };
 
     const embed = new EmbedBuilder()

@@ -37,6 +37,7 @@ import playdl from "play-dl";
 import ytdl from "@distube/ytdl-core";
 import ffmpegStatic from "ffmpeg-static";
 import { logger } from "./logger";
+import { buildCloseRow } from "./messageClose";
 
 // Resolve FFmpeg path (support both bundled ffmpeg-static and system binary)
 export const FFMPEG_BIN = (ffmpegStatic && fs.existsSync(ffmpegStatic) ? ffmpegStatic : "ffmpeg") as string;
@@ -470,6 +471,8 @@ export interface GuildSession {
   manualStop?: boolean;
   /** Last error reported by the audio player / stream (for diagnostics) */
   lastStreamError?: string;
+  /** Discord user id that opened the current music panel; only they may close it. */
+  panelOwnerId?: string;
 }
 
 const sessions = new Map<string, GuildSession>();
@@ -3210,6 +3213,11 @@ export function buildMusicComponents(session: GuildSession): ActionRowBuilder<an
     rows.push(menuRow);
   }
 
+  const ownerId = session.panelOwnerId || session.currentTrack?.requesterId;
+  if (ownerId) {
+    rows.push(buildCloseRow(ownerId, "music"));
+  }
+
   return rows;
 }
 
@@ -3668,6 +3676,7 @@ export class MusicService {
 
       const textChannel = interaction.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
+      session.panelOwnerId = interaction.user.id;
 
       if (musicResult.isPlaylist) {
         if (session.isPlaying && session.currentTrack) {
@@ -4216,6 +4225,7 @@ const followMsg = await interaction.followUp({
 
       const textChannel = message.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
+      session.panelOwnerId = message.author.id;
 
       if (musicResult.isPlaylist) {
         if (session.isPlaying && session.currentTrack) {
@@ -4546,6 +4556,7 @@ const followMsg = await interaction.followUp({
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
 
     const embed = buildNowPlayingEmbed(track, false, currentPos);
+    session.panelOwnerId = interaction.user.id;
     await MusicService.deletePreviewMessage(session);
     await interaction.reply({ embeds: [embed], components: buildMusicComponents(session) });
     session.previewMessage = await interaction.fetchReply().catch(() => null);
@@ -4618,6 +4629,7 @@ const followMsg = await interaction.followUp({
     const currentPos = Math.max(0, (session.seekOffsetSec || 0) + elapsed);
 
     const embed = buildNowPlayingEmbed(track, false, currentPos);
+    session.panelOwnerId = message.author.id;
     await MusicService.deletePreviewMessage(session);
     const npMsg = await message.reply({ embeds: [embed], components: buildMusicComponents(session) });
     session.previewMessage = npMsg;
