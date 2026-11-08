@@ -2833,6 +2833,25 @@ client.once(Events.ClientReady, async (c) => {
     "Bot instance online — pastikan hanya SATU instance yang memakai token ini"
   );
 
+  // Cookie visibility at boot: the #1 cause of "joins VC but silent" on Railway
+  // is a missing/guest-only YouTube cookie. Log it before the first /play.
+  const startupCookie = getCookieAuthInfo();
+  if (!startupCookie.hasCookies) {
+    logger.warn(
+      "YouTube cookies: NONE — Railway/datacenter IP will likely hit bot-check. Set YOUTUBE_COOKIE or upload via /cookies."
+    );
+  } else if (!startupCookie.loggedIn) {
+    logger.warn(
+      { path: startupCookie.path, entries: startupCookie.cookieCount },
+      "YouTube cookies: guest-only (no LOGIN_INFO/SAPISID) — usually NOT enough on Railway. Re-export while logged in."
+    );
+  } else {
+    logger.info(
+      { path: startupCookie.path, entries: startupCookie.cookieCount },
+      "YouTube cookies: login detected — ready for datacenter playback"
+    );
+  }
+
   // Initialize music subsystems & ensure yt-dlp is nightly
   ensureYtDlpUpdated().catch((err) => logger.warn({ err }, "yt-dlp auto-update failed (non-fatal)"));
   checkPotProvider()
