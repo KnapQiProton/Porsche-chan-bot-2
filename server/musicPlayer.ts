@@ -120,6 +120,54 @@ function getEnvCookies(): string | undefined {
   return decodeEnvCookies(raw);
 }
 
+/** Netscape cookie content is logged in when it has LOGIN_INFO + a SAPISID cookie. */
+function cookieContentLooksLoggedIn(content: string): boolean {
+  if (!content) return false;
+  const hasLoginInfo = content.includes("\tLOGIN_INFO\t");
+  const hasSapisid =
+    content.includes("\tSAPISID\t") ||
+    content.includes("\t__Secure-1PAPISID\t") ||
+    content.includes("\t__Secure-3PAPISID\t");
+  return hasLoginInfo && hasSapisid;
+}
+
+/**
+ * Pick the cookie source that should actually be used.
+ *
+ * Precedence rules:
+ * 1. A logged-in env cookie beats a guest/stale cookies.txt. This matters when
+ *    an old `/cookies` upload sits on a Railway volume and the user later sets
+ *    `YOUTUBE_COOKIE`: the env value must not be silently ignored.
+ * 2. Otherwise a persisted file wins (it was uploaded explicitly via /cookies).
+ * 3. If only env exists, use it.
+ */
+function getActiveCookies(): { content: string; path?: string; fromEnv: boolean } | null {
+  const envRaw = getEnvCookies();
+  const envContent = envRaw && envRaw.trim().length > 10 ? envRaw : undefined;
+
+  const filePath = findCookiesFile();
+  let fileContent = "";
+  if (filePath) {
+    try {
+      fileContent = fs.readFileSync(filePath, "utf-8");
+    } catch {}
+  }
+
+  const envLoggedIn = Boolean(envContent && cookieContentLooksLoggedIn(envContent));
+  const fileLoggedIn = Boolean(fileContent && cookieContentLooksLoggedIn(fileContent));
+
+  if (envContent && (!fileContent || (envLoggedIn && !fileLoggedIn))) {
+    return { content: envContent, fromEnv: true };
+  }
+  if (fileContent) {
+    return { content: fileContent, path: filePath || undefined, fromEnv: false };
+  }
+  if (envContent) {
+    return { content: envContent, fromEnv: true };
+  }
+  return null;
+}
+
 // Helper to extract visitor_data (VISITOR_INFO1_LIVE) from cookies or env
 export function getVisitorDataFromCookies(): string | undefined {
   if (process.env.YOUTUBE_VISITOR_DATA && process.env.YOUTUBE_VISITOR_DATA.trim()) {
@@ -129,16 +177,8 @@ export function getVisitorDataFromCookies(): string | undefined {
     return process.env.VISITOR_DATA.trim();
   }
 
-  const cookiePath = findCookiesFile();
-  let rawContent = "";
-  if (cookiePath) {
-    try {
-      rawContent = fs.readFileSync(cookiePath, "utf-8");
-    } catch {}
-  }
-  if (!rawContent) {
-    rawContent = getEnvCookies() || "";
-  }
+  const activeCookies = getActiveCookies();
+  const rawContent = activeCookies?.content || "";
 
   if (rawContent) {
     const lines = rawContent.split(/\r?\n/);
@@ -158,16 +198,7 @@ export function getPoTokenFromCookies(): string | undefined {
   const envPo = process.env.YOUTUBE_PO_TOKEN?.trim() || process.env.PO_TOKEN?.trim();
   if (envPo) return envPo;
 
-  const cookiePath = findCookiesFile();
-  let rawContent = "";
-  if (cookiePath) {
-    try {
-      rawContent = fs.readFileSync(cookiePath, "utf-8");
-    } catch {}
-  }
-  if (!rawContent) {
-    rawContent = getEnvCookies() || "";
-  }
+  const rawContent = getActiveCookies()?.content || "";
 
   if (rawContent) {
     const lines = rawContent.split(/\r?\n/);
@@ -1288,9 +1319,7 @@ export async function getYouTubePlaylist(url: string, ytdlpPath: string, timeout
 
 // Check if YouTube cookies or authentication is present
 export function hasYouTubeCookies(): boolean {
-  if (findCookiesFile()) return true;
-  const envCookie = process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIES || process.env.COOKIES || process.env.YOUTUBE_COOKIE_BASE64;
-  if (envCookie && envCookie.trim().length > 10) return true;
+  if (getActiveCookies()) return true;
   const bearer = process.env.YOUTUBE_OAUTH_TOKEN || process.env.YT_DLP_OAUTH_TOKEN;
   if (bearer && bearer.trim().length > 10) return true;
   return false;
@@ -1298,19 +1327,20 @@ export function hasYouTubeCookies(): boolean {
 
 // Helper to check for YouTube cookies (from file or environment variable)
 export function getYtDlpCookieArgs(): string[] {
-  // 1. Persisted file (Railway volume) or local cookies.txt
-  const cookieFile = findCookiesFile();
-  if (cookieFile) {
-    return ["--cookies", cookieFile];
-  }
+  // Prefer a logged-in env cookie over a stale/guest file; otherwise the
+  // persisted file (Railway volume) wins. See getActiveCookies().
+  const active = getActiveCookies();
+  if (active) {
+    if (!active.fromEnv && active.path) {
+      return ["--cookies", active.path];
+    }
 
-  // 2. Environment variable (supports raw Netscape text, escaped newlines, or base64 encoded)
-  const cookieContent = getEnvCookies();
-  if (cookieContent) {
     const tmpCookiePath = path.join(os.tmpdir(), "porsche_chan_youtube_cookies.txt");
     try {
       const normalized = sanitizeNetscapeCookies(
-        cookieContent.includes("\\n") ? cookieContent.replace(/\\n/g, "\n").replace(/\\t/g, "\t") : cookieContent
+        active.content.includes("\\n")
+          ? active.content.replace(/\\n/g, "\n").replace(/\\t/g, "\t")
+          : active.content
       );
       fs.writeFileSync(tmpCookiePath, normalized, "utf-8");
       return ["--cookies", tmpCookiePath];
@@ -1411,31 +1441,20 @@ export function saveUploadedCookies(cookieData: string | Buffer): {
 export function getCookieAuthInfo(): {
   hasCookies: boolean;
   path?: string;
+  fromEnv?: boolean;
   loggedIn: boolean;
   cookieCount: number;
 } {
-  const cookiePath = findCookiesFile();
-  let content = "";
-  if (cookiePath) {
-    try {
-      content = fs.readFileSync(cookiePath, "utf-8");
-    } catch {}
-  }
-  if (!content) {
-    content = getEnvCookies() || "";
-  }
+  const active = getActiveCookies();
+  const content = active?.content || "";
 
   const cookieCount = (content.match(/youtube\.com/g) || []).length;
-  const hasLoginInfo = content.includes("\tLOGIN_INFO\t");
-  const hasSapisid =
-    content.includes("\tSAPISID\t") ||
-    content.includes("\t__Secure-1PAPISID\t") ||
-    content.includes("\t__Secure-3PAPISID\t");
 
   return {
-    hasCookies: Boolean(cookiePath) || content.length > 10,
-    path: cookiePath || undefined,
-    loggedIn: hasLoginInfo && hasSapisid,
+    hasCookies: Boolean(active),
+    path: active?.path,
+    fromEnv: active?.fromEnv,
+    loggedIn: cookieContentLooksLoggedIn(content),
     cookieCount,
   };
 }
@@ -1450,7 +1469,11 @@ export function getCookieStatus(): {
   if (info.hasCookies) {
     return {
       active: true,
-      source: info.path ? `cookies.txt (${info.path})` : "Environment Variable (YOUTUBE_COOKIE)",
+      source: info.fromEnv
+        ? "Environment Variable (YOUTUBE_COOKIE)"
+        : info.path
+          ? `cookies.txt (${info.path})`
+          : "Environment Variable (YOUTUBE_COOKIE)",
       detail: info.loggedIn
         ? `Login akun terdeteksi (${info.cookieCount} entri YouTube).`
         : `Cookies terpasang (${info.cookieCount} entri) TAPI tidak ada LOGIN_INFO/SAPISID — ini cookies guest, biasanya belum cukup untuk IP Railway. Export ulang cookies saat sudah login YouTube.`,
