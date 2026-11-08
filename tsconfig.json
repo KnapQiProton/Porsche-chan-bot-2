@@ -24,6 +24,6 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["src", "server.ts", "server", "lib/webSearch.ts", "commands"],
+  "include": ["src", "server.ts", "server", "lib/webSearch.ts", "lib/urlReader.ts", "commands"],
   "exclude": ["node_modules", "dist", "cloned_repo"]
 }

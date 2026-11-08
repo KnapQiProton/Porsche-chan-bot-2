@@ -42,6 +42,7 @@ import {
   formatWebSearchSnippets,
   isQuestionLike,
 } from "./lib/webSearch";
+import { readUrlsFromText, extractReadableUrls } from "./lib/urlReader";
 
 async function startServer() {
   const app = express();
@@ -133,7 +134,16 @@ async function startServer() {
 
       let webSearchContext = "";
       let didSearch = false;
-      if (shouldAutoSearchWeb(message)) {
+
+      // Read pasted links before deciding to search the web.
+      const readableUrls = extractReadableUrls(message);
+      let pageContext = "";
+      if (readableUrls.length > 0) {
+        const read = await readUrlsFromText(message, 2);
+        pageContext = read.context;
+      }
+
+      if (readableUrls.length === 0 && shouldAutoSearchWeb(message)) {
         didSearch = true;
         const results = await searchWeb(message, 5000);
         if (results.length > 0) {
@@ -141,18 +151,33 @@ async function startServer() {
         }
       }
 
-      let systemPrompt = buildPersona(Boolean(isCreator), webSearchContext, personaContext);
+      let systemPrompt = buildPersona(
+        Boolean(isCreator),
+        webSearchContext,
+        personaContext,
+        pageContext
+      );
       const result = await generateText(conversation, systemPrompt);
       let reply = result.text;
       let provider = result.provider;
 
       const uncertainty =
         /(?:belum tahu|tidak tahu|nggak tahu|gak tahu|tidak menemukan|nggak nemu|tidak yakin|maaf, aku tidak|kurang tahu)/i;
-      if (!didSearch && isQuestionLike(message) && uncertainty.test(reply)) {
+      if (
+        readableUrls.length === 0 &&
+        !didSearch &&
+        isQuestionLike(message) &&
+        uncertainty.test(reply)
+      ) {
         const retryResults = await searchWeb(message, 5000);
         if (retryResults.length > 0) {
           webSearchContext = formatWebSearchSnippets(retryResults);
-          systemPrompt = buildPersona(Boolean(isCreator), webSearchContext, personaContext);
+          systemPrompt = buildPersona(
+            Boolean(isCreator),
+            webSearchContext,
+            personaContext,
+            pageContext
+          );
           const retry = await generateText(conversation, systemPrompt);
           if (retry.text && retry.text.trim()) {
             reply = retry.text;

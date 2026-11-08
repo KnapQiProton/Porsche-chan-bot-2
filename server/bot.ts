@@ -63,6 +63,12 @@ import {
   formatWebSearchSnippets,
   isQuestionLike,
 } from "../lib/webSearch";
+import {
+  readUrlsFromText,
+  formatPageContext,
+  fetchWebPage,
+  extractReadableUrls,
+} from "../lib/urlReader";
 
 export const CREATOR_ID = "591807486244290600";
 export const CREATOR_NAME = "KnapQi";
@@ -92,7 +98,12 @@ export interface PersonaContext {
   isDM?: boolean;
 }
 
-export function buildPersona(isCreator: boolean, webSearchContext?: string, context?: PersonaContext): string {
+export function buildPersona(
+  isCreator: boolean,
+  webSearchContext?: string,
+  context?: PersonaContext,
+  pageContext?: string
+): string {
   const lore = getLoreData();
   const nowWib = new Date().toLocaleString("id-ID", {
     timeZone: "Asia/Jakarta",
@@ -143,6 +154,19 @@ ATURAN BERPIKIR, AKURASI & GAYA BICARA:
 
   if (webSearchContext && webSearchContext.trim()) {
     finalPrompt += `\n\n[DATA HASIL PENCARIAN WEB TERKINI (REAL-TIME)]:\n${webSearchContext}\nGunakan data pencarian di atas untuk menjawab pertanyaan user secara akurat dan sertakan sumbernya.`;
+  }
+
+  if (pageContext && pageContext.trim()) {
+    finalPrompt += `\n\n[DATA HALAMAN WEBSITE YANG DIBACA]:\n${pageContext}
+
+INSTRUKSI MEMBACA HALAMAN:
+- Gunakan isi halaman di atas sebagai sumber utama jawaban.
+- Jika user minta ringkasan/simpulan: buat ringkasan yang enak dibaca, berisi poin utama, detail penting, dan kesimpulan singkat.
+- Jika user bertanya hal spesifik: jawab berdasarkan bagian halaman yang relevan dan sebutkan konteksnya.
+- Jika user hanya mengirim link tanpa instruksi: beri ringkasan singkat halaman tersebut.
+- Jangan mengarang isi yang tidak ada di halaman. Kalau halaman tidak memuat jawabannya, katakan jujur.
+- Sebutkan URL sumbernya secara singkat.
+- Kalau ada tanda [GAGAL MEMBACA HALAMAN], jelaskan dengan sopan bahwa halamannya tidak bisa dibuka dan sebutkan alasannya.`;
   }
 
   return finalPrompt;
@@ -2587,6 +2611,38 @@ export const COMMANDS = [
     )
     .toJSON(),
   new SlashCommandBuilder()
+    .setName("read")
+    .setDescription("Baca sebuah halaman website lalu ringkas atau jawab pertanyaan tentangnya")
+    .addStringOption((opt) =>
+      opt
+        .setName("url")
+        .setDescription("Link halaman yang ingin dibaca (http/https)")
+        .setRequired(true),
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("instruction")
+        .setDescription("Mau diapakan? Contoh: ringkas, ambil poin penting, jelaskan (opsional)")
+        .setRequired(false),
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("baca")
+    .setDescription("Baca halaman website lalu buat ringkasan (versi Indonesia dari /read)")
+    .addStringOption((opt) =>
+      opt
+        .setName("url")
+        .setDescription("Link halaman yang ingin dibaca (http/https)")
+        .setRequired(true),
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("instruksi")
+        .setDescription("Mau diapakan? Contoh: ringkas, ambil poin penting, jelaskan (opsional)")
+        .setRequired(false),
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
     .setName("info")
     .setDescription("About Porsche-chan")
     .toJSON(),
@@ -3164,6 +3220,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
             "`/illust` — Cari ilustrasi anime (Tags, Suggestive, Danbooru & Booru)",
             "`/think` — Deep reasoning (Gemini thinking mode)",
             "`/search` — DuckDuckGo search + AI summary",
+            "`/read` atau `/baca` — Baca website, lalu ringkas/jawab pertanyaannya",
             "`/clear` atau `/forget` — Reset conversation history",
             "`/info` — About Porsche-chan",
             "`/scan` — Analisis gambar pakai AI",
@@ -3179,7 +3236,8 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         {
           name: "💬 Cara Ngobrol",
           value:
-            "Mention aku, kirim DM, atau **reply** pesan aku. Aku ingat konteks percakapan terakhir di channel itu, dan otomatis cari info terbaru di internet kalau pertanyaannya butuh fakta real-time.",
+            "Mention aku, kirim DM, atau **reply** pesan aku. Aku ingat konteks percakapan terakhir di channel itu, dan otomatis cari info terbaru di internet kalau pertanyaannya butuh fakta real-time.\n\n" +
+            "**Bisa baca website:** kirim link lalu minta *\"ringkas halaman ini\"*, *\"ambil poin pentingnya\"*, atau *\"jelaskan isinya\"*. Bisa juga lewat `/read <url>`.",
           inline: false,
         },
       )
@@ -3249,6 +3307,87 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       logger.error({ err }, "Error in /search command");
       await interaction.editReply({
         content: "❌ Gagal melakukan pencarian di internet. Coba lagi nanti ya~",
+      });
+    }
+  }
+
+  if (interaction.commandName === "read" || interaction.commandName === "baca") {
+    const url = (interaction.options.getString("url") || "").trim();
+    const instruction = (
+      interaction.options.getString("instruction") ||
+      interaction.options.getString("instruksi") ||
+      ""
+    ).trim();
+
+    if (!url) {
+      await interaction.reply({
+        content: "❌ Kirim link halaman yang ingin dibaca ya~",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      const page = await fetchWebPage(url);
+      if (!page.ok || !page.text) {
+        await interaction.editReply({
+          content:
+            `❌ Gagal membaca halaman itu: **${page.error || "tidak bisa dibuka"}**\n` +
+            "Pastikan linknya publik, bukan halaman yang butuh login, dan bukan file PDF/gambar.",
+        });
+        return;
+      }
+
+      const isCreator = interaction.user.id === CREATOR_ID;
+      const systemPrompt = buildPersona(
+        isCreator,
+        undefined,
+        {
+          userName: interaction.user.displayName || interaction.user.username,
+          channelName:
+            interaction.channel && "name" in interaction.channel
+              ? interaction.channel.name ?? undefined
+              : undefined,
+          guildName: interaction.guild?.name,
+          isDM: !interaction.guild,
+        },
+        formatPageContext([page])
+      );
+
+      const task =
+        instruction ||
+        "Buat ringkasan halaman ini: poin utama, detail penting, lalu kesimpulan singkat.";
+      const { text: answer, model: modelName } = await generateText(
+        [{ role: "user", text: `${task}\n\nHalaman: ${page.finalUrl || url}` }],
+        systemPrompt
+      );
+
+      const truncated =
+        answer.length > 3800 ? `${answer.slice(0, 3797)}...` : answer;
+      let host = page.finalUrl || url;
+      try {
+        host = new URL(host).hostname;
+      } catch {}
+
+      const embed = new EmbedBuilder()
+        .setColor(0x10b981)
+        .setTitle(`📄 ${page.title || host}`.slice(0, 256))
+        .setURL(page.finalUrl || url)
+        .setDescription(truncated || "Halamannya kosong atau tidak ada teks yang bisa dibaca.")
+        .setFooter({
+          text: `Sumber: ${host}${page.truncated ? " • isi dipotong" : ""}${
+            modelName ? ` • AI: ${modelName}` : ""
+          }`,
+        })
+        .setTimestamp();
+
+      await interaction.editReply({ content: null, embeds: [embed] });
+    } catch (err) {
+      logger.error({ err, url }, "Error in /read command");
+      await interaction.editReply({
+        content: "❌ Maaf, aku gagal membaca atau merangkum halaman itu. Coba lagi nanti ya~",
       });
     }
   }
@@ -4109,10 +4248,33 @@ client.on(Events.MessageCreate, async (message: Message) => {
         isDM,
       };
 
-      // Auto web search only when the question really benefits from fresh facts.
+      // If the user pasted a link (or replied to a message containing one), read the page first.
+      const readableUrls = extractReadableUrls(conversationalInput);
+      let pageContext = "";
+      if (readableUrls.length > 0) {
+        try {
+          const read = await readUrlsFromText(conversationalInput, 2);
+          pageContext = read.context;
+          logger.info(
+            {
+              urls: read.pages.map((page) => ({
+                url: page.url,
+                ok: page.ok,
+                chars: page.text.length,
+                error: page.error,
+              })),
+            },
+            "Read web page(s) from chat"
+          );
+        } catch (readErr) {
+          logger.warn({ readErr, userText }, "Failed to read web page from chat");
+        }
+      }
+
+      // Auto web search only when there is no page to read and the question needs fresh facts.
       let webSearchContext = "";
       let didSearch = false;
-      if (shouldAutoSearchWeb(userText)) {
+      if (readableUrls.length === 0 && shouldAutoSearchWeb(userText)) {
         didSearch = true;
         try {
           const searchResults = await searchWeb(userText, 5000);
@@ -4124,7 +4286,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         }
       }
 
-      let systemPrompt = buildPersona(isCreator, webSearchContext, personaContext);
+      let systemPrompt = buildPersona(isCreator, webSearchContext, personaContext, pageContext);
       const firstResult = await generateText(updatedHistory, systemPrompt);
       let reply = firstResult.text;
       let modelName = firstResult.model;
@@ -4132,13 +4294,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
       // Second pass: if the model admits it doesn't know, search once and retry.
       const uncertainty =
         /(?:belum tahu|tidak tahu|nggak tahu|gak tahu|tidak menemukan|nggak nemu|tidak yakin|maaf, aku tidak|kurang tahu)/i;
-      if (!didSearch && isQuestionLike(userText) && uncertainty.test(reply)) {
+      if (
+        readableUrls.length === 0 &&
+        !didSearch &&
+        isQuestionLike(userText) &&
+        uncertainty.test(reply)
+      ) {
         didSearch = true;
         try {
           const retryResults = await searchWeb(userText, 5000);
           if (retryResults.length > 0) {
             webSearchContext = formatWebSearchSnippets(retryResults);
-            systemPrompt = buildPersona(isCreator, webSearchContext, personaContext);
+            systemPrompt = buildPersona(isCreator, webSearchContext, personaContext, pageContext);
             const retry = await generateText(updatedHistory, systemPrompt);
             if (retry.text && retry.text.trim()) {
               reply = retry.text;
