@@ -2253,6 +2253,155 @@ function tryPipedUrlStream(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Public mirror fallback (no YouTube cookies required)
+//
+// Datacenter IPs (Railway, VPS) are routinely flagged by YouTube's bot-check,
+// which no PO token can bypass. Public Invidious/Piped instances do the
+// extraction from their own IPs and proxy the audio bytes, so the bot only has
+// to talk to the mirror. This is the last-resort tier: when cookies are present
+// the normal yt-dlp path usually wins and this tier is never reached.
+// ---------------------------------------------------------------------------
+
+type MirrorInstance = { kind: "invidious" | "piped"; base: string };
+
+const DEFAULT_MIRROR_INSTANCES: MirrorInstance[] = [
+  { kind: "invidious", base: "https://yt.chocolatemoo53.com" },
+  { kind: "invidious", base: "https://inv.nadeko.net" },
+  { kind: "invidious", base: "https://invidious.nerdvpn.de" },
+  { kind: "invidious", base: "https://yewtu.be" },
+  { kind: "piped", base: "https://pipedapi.kavin.rocks" },
+  { kind: "piped", base: "https://api.piped.private.coffee" },
+];
+
+const MIRROR_WINNER_TTL_MS = 10 * 60 * 1000;
+let mirrorWinner: { instance: MirrorInstance; at: number } | null = null;
+
+function normalizeMirrorBase(raw: string): MirrorInstance {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  const base = trimmed.replace(/\/api\/v1$/i, "");
+  const kind: MirrorInstance["kind"] = /\/api\/v1$/i.test(trimmed) || /invidious/i.test(base)
+    ? "invidious"
+    : "piped";
+  return { kind, base };
+}
+
+function getMirrorInstances(): MirrorInstance[] {
+  const custom = (process.env.YOUTUBE_MIRROR_API || process.env.INVIDIOUS_INSTANCE || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  const list = custom.length
+    ? custom.map(normalizeMirrorBase)
+    : [...DEFAULT_MIRROR_INSTANCES];
+
+  // Try the instance that worked last time first, but keep the rest as backup.
+  if (mirrorWinner && Date.now() - mirrorWinner.at < MIRROR_WINNER_TTL_MS) {
+    const winnerBase = mirrorWinner.instance.base;
+    return [
+      mirrorWinner.instance,
+      ...list.filter((entry) => entry.base !== winnerBase),
+    ];
+  }
+
+  return list;
+}
+
+function getMirrorTimeoutMs(): number {
+  const raw = Number(process.env.YOUTUBE_MIRROR_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 1000 ? Math.min(raw, 20_000) : 7_000;
+}
+
+async function fetchMirrorJson(url: string, timeoutMs: number): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        accept: "application/json",
+      },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveMirrorAudioFromInstance(
+  instance: MirrorInstance,
+  videoId: string,
+  timeoutMs: number
+): Promise<{ url: string; detail: string } | null> {
+  if (instance.kind === "invidious") {
+    // `local=true` makes Invidious proxy the audio through its own host, which
+    // is the whole point: Railway never talks to googlevideo directly.
+    const json = await fetchMirrorJson(`${instance.base}/api/v1/videos/${videoId}?local=true`, timeoutMs);
+    const formats = Array.isArray(json?.adaptiveFormats) ? json.adaptiveFormats : [];
+    const audio = formats
+      .filter((format: any) => format?.url && /audio/i.test(String(format?.type || "")))
+      .sort((a: any, b: any) => (Number(b?.bitrate) || 0) - (Number(a?.bitrate) || 0));
+    if (!audio.length) return null;
+    return { url: String(audio[0].url), detail: String(audio[0].type || "audio") };
+  }
+
+  const json = await fetchMirrorJson(`${instance.base}/streams/${videoId}`, timeoutMs);
+  const streams = Array.isArray(json?.audioStreams) ? json.audioStreams : [];
+  const audio = streams
+    .filter((stream: any) => stream?.url)
+    .sort((a: any, b: any) => (Number(b?.bitrate) || 0) - (Number(a?.bitrate) || 0));
+  if (!audio.length) return null;
+  return { url: String(audio[0].url), detail: String(audio[0].mimeType || "audio") };
+}
+
+/**
+ * Ask public mirrors for a playable audio URL. The last working instance is
+ * tried alone first; if it fails, the remaining instances are probed in
+ * parallel and the first success wins.
+ */
+export async function resolveMirrorAudioUrl(
+  videoId: string,
+  timeoutMs: number = getMirrorTimeoutMs()
+): Promise<{ url: string; source: string; detail: string } | null> {
+  const instances = getMirrorInstances().slice(0, 6);
+  if (!instances.length) return null;
+
+  const remember = (instance: MirrorInstance, found: { url: string; detail: string }) => {
+    mirrorWinner = { instance, at: Date.now() };
+    return { url: found.url, source: instance.base, detail: found.detail };
+  };
+
+  const [first, ...rest] = instances;
+  try {
+    const found = await resolveMirrorAudioFromInstance(first, videoId, timeoutMs);
+    if (found) return remember(first, found);
+  } catch {
+    // fall through to the parallel probe
+  }
+
+  if (!rest.length) return null;
+
+  const attempts = await Promise.allSettled(
+    rest.map(async (instance) => {
+      const found = await resolveMirrorAudioFromInstance(instance, videoId, timeoutMs);
+      if (!found) throw new Error("no audio stream");
+      return { instance, found };
+    })
+  );
+
+  for (const attempt of attempts) {
+    if (attempt.status === "fulfilled" && attempt.value) {
+      return remember(attempt.value.instance, attempt.value.found);
+    }
+  }
+
+  return null;
+}
+
 // Create AudioResource from YouTube with robust multi-tier live piped streaming architecture and auto-retry
 export async function createAudioResourceFromYtDlp(
   urlOrQuery: string,
@@ -2360,43 +2509,57 @@ export async function createAudioResourceFromYtDlp(
           { tier: i + 1, clients: tier.clients, stage: diag.stage, err: rawMsg },
           `Stream tier ${i + 1} failed: [${rawMsg}]`
         );
+
+        // Bot-check is IP/account level, so every remaining player client will
+        // fail the same way. Skip straight to the mirror fallback instead of
+        // burning ~60s on clients that cannot succeed without cookies.
+        if (botCheckDetected && cookieArgs.length === 0) {
+          logger.warn(
+            { tier: i + 1 },
+            "Bot-check detected without cookies — skipping remaining yt-dlp clients, trying public mirror fallback"
+          );
+          break;
+        }
       }
     }
 
     // Tier 6: Direct URL extraction -> FFmpeg
-    try {
-      logger.info({ tier: 6 }, "Starting yt-dlp with client: direct_url");
-      const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 12000, cookieArgs);
-      if (directUrl) {
-        const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
-        logger.info({ tier: 6 }, "Stream started successfully via direct URL pipe");
-        return resource;
+    // Skipped after a cookie-less bot-check: yt-dlp cannot succeed there either.
+    if (!botCheckDetected || cookieArgs.length > 0) {
+      try {
+        logger.info({ tier: 6 }, "Starting yt-dlp with client: direct_url");
+        const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 12000, cookieArgs);
+        if (directUrl) {
+          const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
+          logger.info({ tier: 6 }, "Stream started successfully via direct URL pipe");
+          return resource;
+        }
+        const noUrlMsg = "yt-dlp tidak mengembalikan URL audio (null)";
+        tierErrors.push(`T6 direct-url: ${noUrlMsg}`);
+        tierFailures.push({
+          attempt,
+          tier: 6,
+          clients: "direct-url",
+          cookies: cookieArgs.length > 0,
+          elapsedMs: 0,
+          stage: "unknown",
+          reason: noUrlMsg,
+        });
+        logger.warn({ tier: 6 }, `Stream failed: [${noUrlMsg}]`);
+      } catch (err: any) {
+        const rawMsg = String(err?.message || err);
+        tierErrors.push(`T6 direct-url: ${rawMsg}`);
+        tierFailures.push({
+          attempt,
+          tier: 6,
+          clients: "direct-url",
+          cookies: cookieArgs.length > 0,
+          elapsedMs: 0,
+          stage: "unknown",
+          reason: rawMsg.slice(0, 500),
+        });
+        logger.warn({ tier: 6, err: rawMsg }, `Stream failed: [${rawMsg}]`);
       }
-      const noUrlMsg = "yt-dlp tidak mengembalikan URL audio (null)";
-      tierErrors.push(`T6 direct-url: ${noUrlMsg}`);
-      tierFailures.push({
-        attempt,
-        tier: 6,
-        clients: "direct-url",
-        cookies: cookieArgs.length > 0,
-        elapsedMs: 0,
-        stage: "unknown",
-        reason: noUrlMsg,
-      });
-      logger.warn({ tier: 6 }, `Stream failed: [${noUrlMsg}]`);
-    } catch (err: any) {
-      const rawMsg = String(err?.message || err);
-      tierErrors.push(`T6 direct-url: ${rawMsg}`);
-      tierFailures.push({
-        attempt,
-        tier: 6,
-        clients: "direct-url",
-        cookies: cookieArgs.length > 0,
-        elapsedMs: 0,
-        stage: "unknown",
-        reason: rawMsg.slice(0, 500),
-      });
-      logger.warn({ tier: 6, err: rawMsg }, `Stream failed: [${rawMsg}]`);
     }
 
     // Tier 7: play-dl streaming fallback (works without yt-dlp)
@@ -2420,6 +2583,41 @@ export async function createAudioResourceFromYtDlp(
         reason: rawMsg.slice(0, 500),
       });
       logger.warn({ tier: 7, err: rawMsg }, `play-dl stream fallback failed: [${rawMsg}]`);
+    }
+
+    // Tier 8: public Invidious/Piped mirror. Last resort for datacenter IPs:
+    // the mirror extracts from YouTube and proxies the audio bytes to us.
+    if (videoId) {
+      try {
+        logger.info({ tier: 8 }, "Attempting stream via public mirror fallback...");
+        const mirror = await resolveMirrorAudioUrl(videoId);
+        if (!mirror) throw new Error("semua mirror publik menolak / tidak punya audio");
+
+        const resource = await tryPipedUrlStream(mirror.url, seekSeconds, 20_000);
+        let mirrorHost = mirror.source;
+        try {
+          mirrorHost = new URL(mirror.source).host;
+        } catch {}
+        (resource as any)._tier = `tier 8 (mirror: ${mirrorHost})`;
+        logger.info(
+          { tier: 8, source: mirror.source, detail: mirror.detail },
+          "Stream started successfully via public mirror"
+        );
+        return resource;
+      } catch (err: any) {
+        const rawMsg = String(err?.message || err);
+        tierErrors.push(`T8 mirror: ${rawMsg}`);
+        tierFailures.push({
+          attempt,
+          tier: 8,
+          clients: "public-mirror",
+          cookies: cookieArgs.length > 0,
+          elapsedMs: 0,
+          stage: "unknown",
+          reason: rawMsg.slice(0, 500),
+        });
+        logger.warn({ tier: 8, err: rawMsg }, `Public mirror fallback failed: [${rawMsg}]`);
+      }
     }
 
     const detail = tierErrors.slice(-4).join(" | ");
@@ -2472,7 +2670,7 @@ export async function createAudioResourceFromYtDlp(
 
     const head = isBotCheck
       ? "YouTube memblokir IP server ini dengan verifikasi login (\"Sign in to confirm you're not a bot\"). " +
-        "PO Token saja tidak cukup untuk IP datacenter seperti Railway. " +
+        "PO Token saja tidak cukup untuk IP datacenter seperti Railway, dan fallback mirror publik juga belum berhasil. " +
         "Upload cookies akun YouTube lewat `/cookies` (sekali saja) atau set env `YOUTUBE_COOKIE`, lalu coba `/play` lagi."
       : "Gagal memutar audio dari YouTube setelah 2 percobaan. YouTube memblokir IP server (403) atau provider PO Token tidak aktif. Jalankan `/check` untuk diagnosa.";
 
