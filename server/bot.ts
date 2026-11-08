@@ -2855,20 +2855,18 @@ client.once(Events.ClientReady, async (c) => {
       logger.error({ err }, "Failed to register slash commands");
     }
 
-    // Auto-clean any stale guild-level commands that shadow global commands (e.g. old /illust without options)
+    // Also register per-guild so new commands (e.g. /read) appear instantly.
+    // Global commands can take up to an hour to propagate; guild commands are
+    // immediate and override global ones with the same name.
     for (const [guildId, guild] of c.guilds.cache) {
       try {
-        const guildCmds = await guild.commands.fetch();
-        if (guildCmds.size > 0) {
-          logger.info(
-            { guildId, guildName: guild.name, count: guildCmds.size },
-            "Menemukan command guild spesifik yang berpotensi menimpa command global. Membersihkan..."
-          );
-          await guild.commands.set([]);
-          logger.info({ guildId }, "Command guild berhasil dibersihkan.");
-        }
+        await guild.commands.set(COMMANDS);
+        logger.info(
+          { guildId, guildName: guild.name, count: COMMANDS.length },
+          "Guild slash commands synced (instant availability)"
+        );
       } catch (gErr) {
-        logger.debug({ gErr, guildId }, "Guild command fetch/cleanup skipped");
+        logger.warn({ gErr, guildId }, "Failed to sync guild slash commands");
       }
     }
   }
@@ -3128,7 +3126,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     await interaction.deferReply({ ephemeral: true });
     try {
       if (interaction.guild) {
-        await interaction.guild.commands.set([]);
+        await interaction.guild.commands.set(COMMANDS);
       }
       const token = process.env.DISCORD_BOT_TOKEN;
       if (token && client.user) {
@@ -3137,7 +3135,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       }
       await interaction.editReply(
         "✨ **Sinkronisasi Berhasil!**\n" +
-        "Semua slash command global telah didaftarkan ulang dan command lokal server (guild commands) yang berpotensi menimpa opsi `/illust` telah dibersihkan.\n\n" +
+        "Command di server ini sudah didaftarkan ulang secara instan, dan command global juga diperbarui.\n\n" +
         "💡 **Jika opsi masih belum muncul di aplikasi Discord Anda:**\n" +
         "• **PC/Desktop:** Tekan `Ctrl + R` untuk me-refresh cache Discord.\n" +
         "• **Mobile (HP):** Tutup penuh aplikasi Discord lalu buka kembali."
@@ -4106,7 +4104,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
   if (userText === "!sync" || userText === "/sync") {
     try {
       if (message.guild) {
-        await message.guild.commands.set([]);
+        await message.guild.commands.set(COMMANDS);
       }
       const token = process.env.DISCORD_BOT_TOKEN;
       if (token && client.user) {
@@ -4115,7 +4113,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
       await message.reply(
         "✨ **Sinkronisasi Berhasil!**\n" +
-        "Command guild lokal yang menimpa `/illust` telah dibersihkan dan slash commands global telah disinkronkan ke Discord.\n\n" +
+        "Command di server ini sudah didaftarkan ulang secara instan, dan command global juga diperbarui.\n\n" +
         "💡 **Jika opsi masih belum muncul di aplikasi Discord Anda:**\n" +
         "• **Desktop (PC):** Tekan `Ctrl + R` untuk me-refresh cache Discord.\n" +
         "• **Mobile (HP):** Tutup penuh aplikasi Discord lalu buka kembali."
