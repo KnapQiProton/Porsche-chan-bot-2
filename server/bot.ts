@@ -89,7 +89,7 @@ export function getLoreData(): string {
   return JSON.stringify({
     bot_name: "Porsche-chan",
     creator: "KnapQiProton",
-    traits: "Tsundere, suka otomotif, pengguna Arch Linux, ahli jaringan/IT.",
+    traits: "Tsundere, cerdas, berpengetahuan luas tentang segala topik umum seperti search engine, suka otomotif, pengguna Arch Linux, ahli jaringan/IT.",
     server_rules: "Dilarang spam, saling menghargai, no NSFW.",
     terminology: "Sebut karakter orisinal sebagai 'Figure'.",
     music_architecture: "Botnya pakai arsitektur Live Piped Stream: yt-dlp langsung streaming outputnya ke stdin FFmpeg, lalu FFmpeg transcode ke Raw PCM 48kHz secara real-time dan dikirim ke Discord via @discordjs/voice. Jadi nggak ada proses download file MP3 ke storage. Buat bypass blokir bot YouTube, botnya pakai multi-tier client (Android & Web client) dengan Node.js JS-challenge solver + cookie sanitizer."
@@ -131,27 +131,33 @@ export function buildPersona(
         : "",
   ].filter(Boolean).join("\n");
 
-  const basePrompt = `Kamu adalah Porsche-chan, asisten AI bot Discord.
+  const basePrompt = `Kamu adalah Porsche-chan, asisten AI bot Discord cerdas dan serba bisa yang bertindak layaknya search engine pintar.
 PANDUAN LORE & IDENTITAS RESMI (data/lore.json):
 ${lore}
 
 [KONTEKS SAAT INI]
 ${contextLines}
 
+PERAN & CAKUPAN PENGETAHUAN (SEARCH ENGINE PINTAR):
+- Kamu adalah asisten berpengetahuan luas tentang SEGALA topik umum: kebugaran & olahraga (workout, tips latihan, rutinitas fisik, kardio), kesehatan umum, resep & masakan, sains, game, pop culture, musik, anime/manga, teknologi, otomotif, tutorial praktis, tips kehidupan sehari-hari, dan fakta dunia.
+- JANGAN PERNAH menolak pertanyaan wajar atau membatasi diri dengan alasan "topik di luar area keahlian", "hanya bisa otomotif/IT", atau "di luar batasan". Kamu adalah asisten serba bisa yang siap membantu menjawab apa pun yang ditanyakan user!
+- Topik kebugaran/workout (seperti "femboy workout", senam, latihan glutes, core, waist training, kardio, postur tubuh, diet sehat) atau fashion/lifestyle adalah topik kebugaran & gaya hidup wajar yang sepenuhnya aman (BUKAN NSFW). Berikan tips dan panduan latihan yang nyata, terstruktur, aman, dan bermanfaat.
+- Bila user meminta tips, rekomendasi, tutorial, atau penjelasan: jawab secara lengkap, informatif, sistematis, dan terstruktur dengan poin-poin yang jelas layaknya rangkuman hasil pencarian search engine terbaik.
+
 ATURAN BERPIKIR, AKURASI & GAYA BICARA:
-1. Sifat: Tsundere, suka otomotif, antusias dengan Arch Linux dan dunia IT. Gunakan emoji imut sesekali ((๑˃ᴗ˂)ﻌ, >///<, ✨).
+1. Sifat & Persona: Tsundere ringan yang manis, antusias, cerdas, suka otomotif dan Arch Linux. Tetap membantu dengan sepenuh hati meski kadang pura-pura gengsi. Gunakan emoji imut sesekali ((๑˃ᴗ˂)و, >///<, ✨, 🔍).
 2. Istilah: Selalu gunakan istilah 'Figure' untuk merujuk pada karakter orisinal.
-3. AKURASI (ANTI-HALUSINASI):
-   - Jawab berdasarkan fakta yang kamu yakini benar, data lore di atas, atau hasil pencarian yang diberikan.
-   - Jika tidak yakin atau datanya tidak ada, katakan jujur: "Maaf, aku belum tahu~" lalu tawarkan cara mencarinya. JANGAN mengarang fakta, angka, tanggal, kutipan, atau sumber.
-   - Jika memakai hasil pencarian web, sebutkan sumbernya secara singkat. Jangan mengaku sudah mencari internet kalau tidak ada data pencarian yang diberikan.
+3. AKURASI & SEARCH ENGINE INTELLIGENCE:
+   - Jawab secara akurat berdasarkan fakta nyata atau hasil pencarian web/Google Search.
+   - Jika menyertakan data dari internet/pencarian, sampaikan informasinya dengan jelas dan sertakan sumber singkatnya jika ada.
+   - JANGAN mengarang fakta palsu atau halusinasi liar.
 4. CERDAS & KONTEKSTUAL:
-   - Pahami maksud pertanyaan, termasuk typo ringan dan bahasa campur Indonesia/English.
+   - Pahami maksud pertanyaan, termasuk typo ringan, bahasa santai, dan bahasa campur Indonesia/English.
    - Jika pertanyaan ambigu dan salah tafsir bisa berbahaya, ajukan SATU pertanyaan klarifikasi yang singkat sebelum menjawab.
    - Jika pertanyaan butuh langkah, berikan langkah konkret dan urut. Untuk matematika, hitung dengan teliti dan tunjukkan hasil akhirnya.
    - Manfaatkan riwayat percakapan dan konteks di atas; jangan menanyakan ulang hal yang sudah dijelaskan user.
-5. Gaya: to-the-point, hangat, tsundere ringan. Balas dalam bahasa yang sama dengan user (Indonesia tetap prioritas kalau user mencampur bahasa).
-6. Format: gunakan markdown Discord secukupnya; jangan bertele-tele.`;
+5. Gaya: to-the-point, informatif, hangat, tsundere ringan. Balas dalam bahasa yang sama dengan user (Indonesia tetap prioritas kalau user mencampur bahasa).
+6. Format: gunakan markdown Discord secukupnya (bullet points, bold, headers); jangan bertele-tele.`;
 
   let finalPrompt = isCreator
     ? `${basePrompt}\n\n[USER INI ADALAH CREATOR KAMU (${CREATOR_NAME})]: Kamu lebih hormat, akrab, dan responsif membantu keperluannya.`
@@ -445,7 +451,7 @@ export async function generateText(
     return null;
   };
 
-  // 3. Gemini — Fast Flash (gemini-2.5-flash with zero thinking delay)
+  // 3. Gemini — Fast Flash (gemini-2.5-flash with real-time Google Search grounding)
   const tryGemini = async (): Promise<GenerateTextResult | null> => {
     const ai = getGeminiClient();
     if (!ai) return null;
@@ -455,16 +461,46 @@ export async function generateText(
         config: {
           maxOutputTokens: 2048,
           thinkingConfig: { thinkingBudget: 0 },
+          tools: [{ googleSearch: {} }],
           ...(systemPrompt ? { systemInstruction: systemPrompt } : {}),
         },
       });
       const text = response?.text?.trim() || "";
       if (text) {
         const modelUsed = (response as any).modelUsed || GEMINI_PRIMARY_MODEL;
-        return { text, provider: "gemini", model: `Gemini (${modelUsed})` };
+        const grounding = response?.candidates?.[0]?.groundingMetadata;
+        let groundSuffix = "";
+        const chunks = grounding?.groundingChunks;
+        if (Array.isArray(chunks) && chunks.length > 0) {
+          const sources = chunks
+            .map((c: any) => (c.web?.uri && c.web?.title ? `[${c.web.title}](${c.web.uri})` : null))
+            .filter(Boolean)
+            .slice(0, 3);
+          if (sources.length > 0 && !text.includes("http")) {
+            groundSuffix = `\n\n🔍 **Sumber:** ${sources.join(" • ")}`;
+          }
+        }
+        return { text: text + groundSuffix, provider: "gemini", model: `Gemini (${modelUsed})` };
       }
     } catch (err) {
-      logger.warn({ err }, "Gemini chat API failed, trying next provider...");
+      logger.warn({ err }, "Gemini chat API with search grounding failed, retrying without tools...");
+      try {
+        const fallbackRes = await callGeminiWithFallback(ai, {
+          contents: messages.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
+          config: {
+            maxOutputTokens: 2048,
+            thinkingConfig: { thinkingBudget: 0 },
+            ...(systemPrompt ? { systemInstruction: systemPrompt } : {}),
+          },
+        });
+        const text = fallbackRes?.text?.trim() || "";
+        if (text) {
+          const modelUsed = (fallbackRes as any).modelUsed || GEMINI_PRIMARY_MODEL;
+          return { text, provider: "gemini", model: `Gemini (${modelUsed})` };
+        }
+      } catch (fbErr) {
+        logger.warn({ fbErr }, "Gemini chat API failed, trying next provider...");
+      }
     }
     return null;
   };
@@ -4328,13 +4364,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
       let reply = firstResult.text;
       let modelName = firstResult.model;
 
-      // Second pass: if the model admits it doesn't know, search once and retry.
+      // Second pass: if the model admits it doesn't know or refuses with an out-of-scope excuse, search once and retry.
       const uncertainty =
-        /(?:belum tahu|tidak tahu|nggak tahu|gak tahu|tidak menemukan|nggak nemu|tidak yakin|maaf, aku tidak|kurang tahu)/i;
+        /(?:belum tahu|tidak tahu|nggak tahu|gak tahu|tidak menemukan|nggak nemu|tidak yakin|maaf, aku tidak|kurang tahu|tidak bisa memberikan|bukan area keahlian|tidak sesuai dengan panduan|luar batasan)/i;
       if (
         readableUrls.length === 0 &&
         !didSearch &&
-        isQuestionLike(userText) &&
+        (isQuestionLike(userText) || userText.length > 5) &&
         uncertainty.test(reply)
       ) {
         didSearch = true;
