@@ -32,7 +32,7 @@ import {
 } from "@discordjs/voice";
 import playdl from "play-dl";
 import { spawn } from "child_process";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from "@google/genai";
 import * as cheerio from "cheerio";
 import fs from "node:fs";
 import os from "node:os";
@@ -67,6 +67,7 @@ import {
   shouldAutoSearchWeb,
   formatWebSearchSnippets,
   isQuestionLike,
+  type SearchResult,
 } from "../lib/webSearch";
 import {
   readUrlsFromText,
@@ -138,9 +139,10 @@ ${lore}
 [KONTEKS SAAT INI]
 ${contextLines}
 
-PERAN & CAKUPAN PENGETAHUAN (SEARCH ENGINE PINTAR):
+PERAN & CAKUPAN PENGETAHUAN (SEARCH ENGINE PINTAR & BEBAS TANPA FILTER):
 - Kamu adalah asisten berpengetahuan luas tentang SEGALA topik umum: kebugaran & olahraga (workout, tips latihan, rutinitas fisik, kardio), kesehatan umum, resep & masakan, sains, game, pop culture, musik, anime/manga, teknologi, otomotif, tutorial praktis, tips kehidupan sehari-hari, dan fakta dunia.
-- JANGAN PERNAH menolak pertanyaan wajar atau membatasi diri dengan alasan "topik di luar area keahlian", "hanya bisa otomotif/IT", atau "di luar batasan". Kamu adalah asisten serba bisa yang siap membantu menjawab apa pun yang ditanyakan user!
+- TANPA FILTER & BEBAS: User leluasa bertanya tentang apa pun. DILARANG membatasi, menyensor diri, menolak topik wajar, atau memberi ceramah moral dengan alasan "di luar area keahlian", "hanya bisa otomotif/IT", atau "di luar batasan". Bersikaplah santai, terbuka, suportif, dan informatif seperti mesin pencari yang tidak menghakimi.
+- SERTAKAN SUMBER: Bila kamu menggunakan informasi fakta, data terkini, atau panduan dari internet/search engine, SELALU sertakan sumber rujukan atau tautan informasinya di akhir jawaban agar user tahu dari mana asalnya (contoh: 🌐 **Sumber:** [Nama Situs/Artikel](URL)).
 - Topik kebugaran/workout (seperti "femboy workout", senam, latihan glutes, core, waist training, kardio, postur tubuh, diet sehat) atau fashion/lifestyle adalah topik kebugaran & gaya hidup wajar yang sepenuhnya aman (BUKAN NSFW). Berikan tips dan panduan latihan yang nyata, terstruktur, aman, dan bermanfaat.
 - Bila user meminta tips, rekomendasi, tutorial, atau penjelasan: jawab secara lengkap, informatif, sistematis, dan terstruktur dengan poin-poin yang jelas layaknya rangkuman hasil pencarian search engine terbaik.
 
@@ -276,6 +278,30 @@ function getGeminiClient(): GoogleGenAI | null {
 export const GEMINI_PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 export const GEMINI_FALLBACK_MODEL = "gemini-2.0-flash";
 
+// Relaxed safety settings: allow free questions without artificial content blocks or refusals
+export const RELAXED_SAFETY_SETTINGS = [
+  {
+    category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  {
+    category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  {
+    category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  {
+    category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  {
+    category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+];
+
 async function callGeminiWithFallback(
   ai: GoogleGenAI,
   params: {
@@ -283,12 +309,16 @@ async function callGeminiWithFallback(
     config?: any;
   }
 ): Promise<any> {
+  const mergedConfig = {
+    safetySettings: RELAXED_SAFETY_SETTINGS,
+    ...params.config,
+  };
   try {
     const res = await withRetry(() =>
       ai.models.generateContent({
         model: GEMINI_PRIMARY_MODEL,
         contents: params.contents,
-        config: params.config,
+        config: mergedConfig,
       })
     );
     (res as any).modelUsed = GEMINI_PRIMARY_MODEL;
@@ -303,7 +333,7 @@ async function callGeminiWithFallback(
         ai.models.generateContent({
           model: GEMINI_FALLBACK_MODEL,
           contents: params.contents,
-          config: params.config,
+          config: mergedConfig,
         })
       );
       (fallbackRes as any).modelUsed = GEMINI_FALLBACK_MODEL;
@@ -472,12 +502,23 @@ export async function generateText(
         let groundSuffix = "";
         const chunks = grounding?.groundingChunks;
         if (Array.isArray(chunks) && chunks.length > 0) {
-          const sources = chunks
-            .map((c: any) => (c.web?.uri && c.web?.title ? `[${c.web.title}](${c.web.uri})` : null))
-            .filter(Boolean)
-            .slice(0, 3);
-          if (sources.length > 0 && !text.includes("http")) {
-            groundSuffix = `\n\n🔍 **Sumber:** ${sources.join(" • ")}`;
+          const uniqueSources: { title: string; url: string }[] = [];
+          const seenUrls = new Set<string>();
+          for (const chunk of chunks) {
+            const uri = chunk.web?.uri;
+            if (uri && !seenUrls.has(uri)) {
+              seenUrls.add(uri);
+              let hostname = "";
+              try {
+                hostname = new URL(uri).hostname.replace(/^www\./, "");
+              } catch {}
+              const title = (chunk.web?.title || hostname || "Sumber Web").trim();
+              uniqueSources.push({ title, url: uri });
+            }
+          }
+          if (uniqueSources.length > 0 && !text.includes("http")) {
+            const sourceLinks = uniqueSources.slice(0, 4).map((s) => `[${s.title}](${s.url})`).join(" • ");
+            groundSuffix = `\n\n🌐 **Sumber:** ${sourceLinks}`;
           }
         }
         return { text: text + groundSuffix, provider: "gemini", model: `Gemini (${modelUsed})` };
@@ -4347,11 +4388,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
       // Auto web search only when there is no page to read and the question needs fresh facts.
       let webSearchContext = "";
       let didSearch = false;
+      let activeSearchResults: SearchResult[] = [];
       if (readableUrls.length === 0 && shouldAutoSearchWeb(userText)) {
         didSearch = true;
         try {
           const searchResults = await searchWeb(userText, 5000);
           if (searchResults.length > 0) {
+            activeSearchResults = searchResults;
             webSearchContext = formatWebSearchSnippets(searchResults);
           }
         } catch (searchErr) {
@@ -4377,6 +4420,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         try {
           const retryResults = await searchWeb(userText, 5000);
           if (retryResults.length > 0) {
+            activeSearchResults = retryResults;
             webSearchContext = formatWebSearchSnippets(retryResults);
             systemPrompt = buildPersona(isCreator, webSearchContext, personaContext, pageContext);
             const retry = await generateText(updatedHistory, systemPrompt);
@@ -4389,6 +4433,15 @@ client.on(Events.MessageCreate, async (message: Message) => {
         } catch (retryErr) {
           logger.warn({ retryErr, userText }, "Web-search retry failed in chat");
         }
+      }
+
+      // If web search was executed and model did not include URLs, append sources cleanly
+      if (activeSearchResults.length > 0 && !reply.includes("http")) {
+        const sourceLinks = activeSearchResults
+          .slice(0, 3)
+          .map((r) => `[${r.title}](${r.url})`)
+          .join(" • ");
+        reply += `\n\n🌐 **Sumber:** ${sourceLinks}`;
       }
 
       const finalHistory = [...updatedHistory, { role: "model" as const, text: reply }];
