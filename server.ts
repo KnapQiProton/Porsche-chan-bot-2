@@ -44,6 +44,15 @@ import {
 } from "./lib/webSearch";
 import { readUrlsFromText, extractReadableUrls } from "./lib/urlReader";
 
+// Prevent background asynchronous crashes from taking down the bot server
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error({ reason, promise }, "Unhandled Rejection caught — preventing process exit");
+});
+
+process.on("uncaughtException", (err) => {
+  logger.error({ err }, "Uncaught Exception caught — preventing process exit");
+});
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;

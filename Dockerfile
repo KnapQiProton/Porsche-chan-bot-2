@@ -54,7 +54,7 @@ COPY public/ ./public/
 COPY lib/ ./lib/
 COPY data/ ./data/
 COPY commands/ ./commands/
-COPY server.ts index.html entrypoint.sh ./
+COPY server.ts index.html entrypoint.sh cookies.txt* ./
 RUN chmod +x entrypoint.sh || true
 
 # Build frontend and backend

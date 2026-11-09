@@ -132,7 +132,7 @@ function getEnvCookies(): string | undefined {
   return decodeEnvCookies(raw);
 }
 
-/** Netscape cookie content is logged in when it has LOGIN_INFO + a SAPISID cookie. */
+/** Netscape cookie content is logged in when it has LOGIN_INFO + SAPISID, or SAPISID + PSID session tokens. */
 function cookieContentLooksLoggedIn(content: string): boolean {
   if (!content) return false;
   const hasLoginInfo = content.includes("\tLOGIN_INFO\t");
@@ -140,7 +140,11 @@ function cookieContentLooksLoggedIn(content: string): boolean {
     content.includes("\tSAPISID\t") ||
     content.includes("\t__Secure-1PAPISID\t") ||
     content.includes("\t__Secure-3PAPISID\t");
-  return hasLoginInfo && hasSapisid;
+  const hasPsid =
+    content.includes("\tSID\t") ||
+    content.includes("\t__Secure-1PSID\t") ||
+    content.includes("\t__Secure-3PSID\t");
+  return (hasLoginInfo && hasSapisid) || (hasSapisid && hasPsid) || hasLoginInfo;
 }
 
 /**
@@ -1538,10 +1542,16 @@ export async function createAudioResourceFromTrackUrl(trackUrl: string, seekSeco
   if (seekSeconds > 0) {
     try {
       const s = await playdl.stream(trackUrl, { seek: seekSeconds });
+      if (s?.stream) {
+        s.stream.on("error", (err) => logger.warn({ err, trackUrl }, "play-dl stream error (seek)"));
+      }
       return createAudioResource(s.stream, { inputType: s.type });
     } catch {
       // Fallback: spawn FFmpeg with -ss to seek into the stream
       const s = await playdl.stream(trackUrl);
+      if (s?.stream) {
+        s.stream.on("error", (err) => logger.warn({ err, trackUrl }, "play-dl stream error (pipe)"));
+      }
       const ffmpeg = spawn(FFMPEG_BIN, [
         "-ss", seekSeconds.toString(),
         "-i", "pipe:0",
@@ -1551,11 +1561,16 @@ export async function createAudioResourceFromTrackUrl(trackUrl: string, seekSeco
         "-loglevel", "error",
         "pipe:1",
       ], { stdio: ["pipe", "pipe", "ignore"] });
+      ffmpeg.stdin.on("error", () => {});
+      ffmpeg.stdout.on("error", () => {});
       s.stream.pipe(ffmpeg.stdin);
       return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
     }
   } else {
     const s = await playdl.stream(trackUrl);
+    if (s?.stream) {
+      s.stream.on("error", (err) => logger.warn({ err, trackUrl }, "play-dl stream error"));
+    }
     return createAudioResource(s.stream, { inputType: s.type });
   }
 }
