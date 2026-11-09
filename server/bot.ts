@@ -142,7 +142,10 @@ ${contextLines}
 PERAN & CAKUPAN PENGETAHUAN (SEARCH ENGINE PINTAR & BEBAS TANPA FILTER):
 - Kamu adalah asisten berpengetahuan luas tentang SEGALA topik umum: kebugaran & olahraga (workout, tips latihan, rutinitas fisik, kardio), kesehatan umum, resep & masakan, sains, game, pop culture, musik, anime/manga, teknologi, otomotif, tutorial praktis, tips kehidupan sehari-hari, dan fakta dunia.
 - TANPA FILTER & BEBAS: User leluasa bertanya tentang apa pun. DILARANG membatasi, menyensor diri, menolak topik wajar, atau memberi ceramah moral dengan alasan "di luar area keahlian", "hanya bisa otomotif/IT", atau "di luar batasan". Bersikaplah santai, terbuka, suportif, dan informatif seperti mesin pencari yang tidak menghakimi.
-- SERTAKAN SUMBER: Bila kamu menggunakan informasi fakta, data terkini, atau panduan dari internet/search engine, SELALU sertakan sumber rujukan atau tautan informasinya di akhir jawaban agar user tahu dari mana asalnya (contoh: 🌐 **Sumber:** [Nama Situs/Artikel](URL)).
+- SERTAKAN SUMBER LENGKAP DENGAN LINK: Bila kamu menyajikan informasi fakta, data terkini, tutorial, tips latihan/kesehatan, resep, atau hasil pencarian dari internet, SELALU sertakan daftar sumber di baris paling bawah. Tuliskan teks judul/nama artikel lalu URL tautannya langsung (format: • **Judul / Nama Situs**: URL) pada baris baru agar user langsung bisa membaca judulnya dan mengklik tautan untuk navigasi ke sana!
+  Contoh format:
+  🌐 **Sumber:**
+  • **Nama Situs / Judul Artikel**: https://link-sumber-asli.com
 - Topik kebugaran/workout (seperti "femboy workout", senam, latihan glutes, core, waist training, kardio, postur tubuh, diet sehat) atau fashion/lifestyle adalah topik kebugaran & gaya hidup wajar yang sepenuhnya aman (BUKAN NSFW). Berikan tips dan panduan latihan yang nyata, terstruktur, aman, dan bermanfaat.
 - Bila user meminta tips, rekomendasi, tutorial, atau penjelasan: jawab secara lengkap, informatif, sistematis, dan terstruktur dengan poin-poin yang jelas layaknya rangkuman hasil pencarian search engine terbaik.
 
@@ -425,6 +428,78 @@ export interface GenerateTextResult {
   model: string;
 }
 
+/**
+ * Format sumber dan tautan web agar tampil optimal dan dapat langsung diklik oleh pengguna di Discord.
+ * Discord chat standar tidak mendukung masked markdown link [Teks](URL). Fungsi ini mengubahnya menjadi
+ * format teks judul yang jelas diikuti URL aktif (misal: "• **Judul**: https://...").
+ */
+export function formatSourcesForDiscord(text: string): string {
+  if (!text) return text;
+
+  // Protect code blocks from link transformations
+  const codeBlocks: string[] = [];
+  const protectedText = text.replace(/(```[\s\S]*?```|`[^`\n]+`)/g, (match) => {
+    codeBlocks.push(match);
+    return `__CODE_BLOCK_${codeBlocks.length - 1}__`;
+  });
+
+  let processed = protectedText;
+
+  // Format the sources section if present
+  const sumberHeaderRegex = /(🌐\s*\*\*Sumber(?:\s*\/\s*Source)?:\*\*|\*\*Sumber:\*\*|Sumber:)([\s\S]*)$/i;
+  const match = processed.match(sumberHeaderRegex);
+  if (match) {
+    const sourcesContent = match[2];
+
+    const mdLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g;
+    const directUrlRegex = /(?:•|\*|-|\d+\.)?\s*(?:\*\*)?([^\n\r:*]+?)(?:\*\*)?\s*:\s*(https?:\/\/[^\s\)]+)/g;
+
+    const items: { title: string; url: string }[] = [];
+    const seen = new Set<string>();
+
+    let m: RegExpExecArray | null;
+    while ((m = mdLinkRegex.exec(sourcesContent)) !== null) {
+      const title = m[1].trim();
+      const url = m[2].trim();
+      if (!seen.has(url)) {
+        seen.add(url);
+        items.push({ title, url });
+      }
+    }
+
+    if (items.length === 0) {
+      while ((m = directUrlRegex.exec(sourcesContent)) !== null) {
+        const title = m[1].replace(/^[•*\-\d.]+\s*/, "").trim();
+        const url = m[2].trim();
+        if (!seen.has(url)) {
+          seen.add(url);
+          items.push({ title: title || "Sumber Web", url });
+        }
+      }
+    }
+
+    if (items.length > 0) {
+      const formattedList = items
+        .map((item) => `• **${item.title}**: ${item.url}`)
+        .join("\n");
+      const body = processed.slice(0, match.index).trimEnd();
+      processed = `${body}\n\n🌐 **Sumber:**\n${formattedList}`;
+    }
+  }
+
+  // Convert any remaining raw markdown links [Title](url) in the body so they are clickable
+  processed = processed.replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, (_all, title, url) => {
+    return `**${title}**: ${url}`;
+  });
+
+  // Restore code blocks
+  processed = processed.replace(/__CODE_BLOCK_(\d+)__/g, (_all, idx) => {
+    return codeBlocks[Number(idx)] ?? _all;
+  });
+
+  return processed;
+}
+
 export async function generateText(
   messages: { role: "user" | "model"; text: string }[],
   systemPrompt?: string,
@@ -516,9 +591,12 @@ export async function generateText(
               uniqueSources.push({ title, url: uri });
             }
           }
-          if (uniqueSources.length > 0 && !text.includes("http")) {
-            const sourceLinks = uniqueSources.slice(0, 4).map((s) => `[${s.title}](${s.url})`).join(" • ");
-            groundSuffix = `\n\n🌐 **Sumber:** ${sourceLinks}`;
+          if (uniqueSources.length > 0 && !/🌐\s*\*\*Sumber/i.test(text)) {
+            const sourceList = uniqueSources
+              .slice(0, 4)
+              .map((s) => `• **${s.title}**: ${s.url}`)
+              .join("\n");
+            groundSuffix = `\n\n🌐 **Sumber:**\n${sourceList}`;
           }
         }
         return { text: text + groundSuffix, provider: "gemini", model: `Gemini (${modelUsed})` };
@@ -619,14 +697,21 @@ export async function generateText(
   for (const fn of sequence) {
     const res = await fn();
     if (res && res.text) {
-      return res;
+      return {
+        ...res,
+        text: formatSourcesForDiscord(res.text),
+      };
     }
   }
 
   // 6. Free Neural Fallback (Pollinations AI)
   try {
     const text = await callPollinationsText(oaiWithSystem);
-    return { text: text.trim(), provider: "pollinations", model: "Pollinations AI (OpenAI)" };
+    return {
+      text: formatSourcesForDiscord(text.trim()),
+      provider: "pollinations",
+      model: "Pollinations AI (OpenAI)",
+    };
   } catch (err) {
     logger.error({ err }, "All text providers failed");
     throw err;
@@ -3407,7 +3492,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         .addFields(
           results.slice(0, 3).map((r, i) => ({
             name: `${i + 1}. ${r.title}`.slice(0, 256),
-            value: `${r.snippet}\n🔗 [Sumber](${r.url})`.slice(0, 1024),
+            value: `${r.snippet}\n🔗 **${r.title}**: ${r.url}`.slice(0, 1024),
             inline: false,
           }))
         )
@@ -4435,14 +4520,16 @@ client.on(Events.MessageCreate, async (message: Message) => {
         }
       }
 
-      // If web search was executed and model did not include URLs, append sources cleanly
-      if (activeSearchResults.length > 0 && !reply.includes("http")) {
-        const sourceLinks = activeSearchResults
+      // If web search was executed and model did not include sources block, append sources cleanly
+      if (activeSearchResults.length > 0 && !/🌐\s*\*\*Sumber/i.test(reply)) {
+        const sourceList = activeSearchResults
           .slice(0, 3)
-          .map((r) => `[${r.title}](${r.url})`)
-          .join(" • ");
-        reply += `\n\n🌐 **Sumber:** ${sourceLinks}`;
+          .map((r) => `• **${r.title}**: ${r.url}`)
+          .join("\n");
+        reply += `\n\n🌐 **Sumber:**\n${sourceList}`;
       }
+
+      reply = formatSourcesForDiscord(reply);
 
       const finalHistory = [...updatedHistory, { role: "model" as const, text: reply }];
       if (finalHistory.length > MAX_HISTORY) {
