@@ -439,12 +439,10 @@ export function formatSourcesForDiscord(text: string): string {
 
   // Protect code blocks from link transformations
   const codeBlocks: string[] = [];
-  const protectedText = text.replace(/(```[\s\S]*?```|`[^`\n]+`)/g, (match) => {
+  let processed = text.replace(/(```[\s\S]*?```|`[^`\n]+`)/g, (match) => {
     codeBlocks.push(match);
     return `__CODE_BLOCK_${codeBlocks.length - 1}__`;
   });
-
-  let processed = protectedText;
 
   // Format the sources section if present
   const sumberHeaderRegex = /(🌐\s*\*\*Sumber(?:\s*\/\s*Source)?:\*\*|\*\*Sumber:\*\*|Sumber:)([\s\S]*)$/i;
@@ -452,8 +450,9 @@ export function formatSourcesForDiscord(text: string): string {
   if (match) {
     const sourcesContent = match[2];
 
-    const mdLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g;
-    const directUrlRegex = /(?:•|\*|-|\d+\.)?\s*(?:\*\*)?([^\n\r:*]+?)(?:\*\*)?\s*:\s*(https?:\/\/[^\s\)]+)/g;
+    const mdLinkRegex = /\[([^\]]+)\]\(\s*<?(https?:\/\/[^\s\)>]+)>?\s*\)/g;
+    const directUrlRegex = /(?:•|\*|-|\d+\.)?\s*(?:\*\*)?([^\n\r:*]+?)(?:\*\*)?\s*[:\-]\s*<?(https?:\/\/[^\s\)>]+)>?/g;
+    const bareUrlRegex = /<?(https?:\/\/[^\s\)>]+)>?/g;
 
     const items: { title: string; url: string }[] = [];
     const seen = new Set<string>();
@@ -461,7 +460,7 @@ export function formatSourcesForDiscord(text: string): string {
     let m: RegExpExecArray | null;
     while ((m = mdLinkRegex.exec(sourcesContent)) !== null) {
       const title = m[1].trim();
-      const url = m[2].trim();
+      const url = m[2].trim().replace(/^<+/, "").replace(/>+$/, "");
       if (!seen.has(url)) {
         seen.add(url);
         items.push({ title, url });
@@ -471,7 +470,7 @@ export function formatSourcesForDiscord(text: string): string {
     if (items.length === 0) {
       while ((m = directUrlRegex.exec(sourcesContent)) !== null) {
         const title = m[1].replace(/^[•*\-\d.]+\s*/, "").trim();
-        const url = m[2].trim();
+        const url = m[2].trim().replace(/^<+/, "").replace(/>+$/, "");
         if (!seen.has(url)) {
           seen.add(url);
           items.push({ title: title || "Sumber Web", url });
@@ -479,12 +478,23 @@ export function formatSourcesForDiscord(text: string): string {
       }
     }
 
+    if (items.length === 0) {
+      while ((m = bareUrlRegex.exec(sourcesContent)) !== null) {
+        const url = m[1].trim().replace(/^<+/, "").replace(/>+$/, "");
+        if (!seen.has(url)) {
+          seen.add(url);
+          let hostname = "";
+          try {
+            hostname = new URL(url).hostname.replace(/^www\./, "");
+          } catch {}
+          items.push({ title: hostname || "Sumber Web", url });
+        }
+      }
+    }
+
     if (items.length > 0) {
       const formattedList = items
-        .map((item) => {
-          const cleanUrl = item.url.trim().replace(/^<+/, "").replace(/>+$/, "");
-          return `• **${item.title}**: <${cleanUrl}>`;
-        })
+        .map((item) => `• **${item.title}**: <${item.url}>`)
         .join("\n");
       const body = processed.slice(0, match.index).trimEnd();
       processed = `${body}\n\n🌐 **Sumber:**\n${formattedList}`;
@@ -492,9 +502,22 @@ export function formatSourcesForDiscord(text: string): string {
   }
 
   // Convert any remaining raw markdown links [Title](url) in the body so they are clickable without embed
-  processed = processed.replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, (_all, title, url) => {
+  processed = processed.replace(/\[([^\]]+)\]\(\s*<?(https?:\/\/[^\s\)>]+)>?\s*\)/g, (_all, title, url) => {
     const cleanUrl = url.trim().replace(/^<+/, "").replace(/>+$/, "");
-    return `**${title}**: <${cleanUrl}>`;
+    return `**${title.trim()}**: <${cleanUrl}>`;
+  });
+
+  // Next, wrap ANY remaining raw http(s) URL anywhere in the message with angle brackets <URL>
+  // so Discord NEVER generates an embed preview card for it
+  processed = processed.replace(/(<)?(https?:\/\/[^\s<>]+)(>)?/g, (_match, prefix, url, suffix) => {
+    let cleanUrl = url.trim();
+    let trailingPunct = "";
+    const punctMatch = cleanUrl.match(/([.,;:!?)]+)$/);
+    if (punctMatch && !suffix) {
+      trailingPunct = punctMatch[1];
+      cleanUrl = cleanUrl.slice(0, -trailingPunct.length);
+    }
+    return `<${cleanUrl}>${trailingPunct}`;
   });
 
   // Restore code blocks
