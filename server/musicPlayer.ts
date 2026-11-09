@@ -241,7 +241,8 @@ export function getPoTokenFromCookies(): string | undefined {
 // Automatically injects PO Token (from env or cookies.txt) and visitor_data
 export function getYtExtractorArgs(hasCookies?: boolean, clientOverride?: string): string[] {
   const customClient = clientOverride || process.env.YOUTUBE_PLAYER_CLIENT?.trim();
-  const playerClients = customClient || "default";
+  // Datacenter IPs (Railway) without cookies get blocked on "default" (web). Use android,android_vr as default when cookies are absent.
+  const playerClients = customClient || (hasCookies ? "default" : "android,android_vr");
   const parts: string[] = [`player_client=${playerClients}`];
 
   const poToken = getPoTokenFromCookies();
@@ -2804,29 +2805,24 @@ export async function createAudioResourceFromYtDlp(
   ];
 
   // Player-client tiers tuned for yt-dlp 2026.x ("tv_embedded" was removed upstream).
-  // Cookies are passed on EVERY tier when available: `tv`/`web_safari` return DRM or
-  // no HLS formats without an authenticated session, and guest cookies are not enough
-  // on datacenter IPs. PO tokens come from the bgutil provider on 127.0.0.1:4416 and
-  // the JS challenge is solved by yt-dlp's EJS runtime (`--js-runtimes node`, bundled
-  // via the `yt-dlp[default]` extra).
-  // Android clients are kept because they still expose plain audio formats on IPs that
-  // are not bot-checked; they do NOT bypass the IP-level login gate on Railway.
+  // Android clients are placed first as they do NOT trigger the web-based "Sign in to confirm you're not a bot"
+  // challenge on datacenter IPs (like Railway).
   const streamTiers: Array<{ clients: string; timeoutMs: number }> = cookieArgs.length > 0
     ? [
+        { clients: "android,android_vr", timeoutMs: 20000 },
         { clients: "default", timeoutMs: 22000 },
-        { clients: "android,android_vr", timeoutMs: 18000 },
-        { clients: "web,mweb,tv", timeoutMs: 18000 },
+        { clients: "android,web_embedded", timeoutMs: 18000 },
         { clients: "web_embedded", timeoutMs: 15000 },
         { clients: "tv_simply", timeoutMs: 15000 },
         { clients: "visionos,tv_downgraded", timeoutMs: 15000 },
       ]
     : [
-        { clients: "default", timeoutMs: 22000 },
-        { clients: "android,android_vr", timeoutMs: 18000 },
-        { clients: "web,mweb", timeoutMs: 18000 },
+        { clients: "android,android_vr", timeoutMs: 20000 },
+        { clients: "android,web_embedded", timeoutMs: 18000 },
+        { clients: "visionos,tv_downgraded", timeoutMs: 18000 },
         { clients: "web_embedded", timeoutMs: 15000 },
         { clients: "tv_simply", timeoutMs: 15000 },
-        { clients: "visionos,tv_downgraded", timeoutMs: 15000 },
+        { clients: "default", timeoutMs: 22000 },
       ];
 
   const tierErrors: string[] = [];
@@ -2879,13 +2875,12 @@ export async function createAudioResourceFromYtDlp(
           `Stream tier ${i + 1} failed: [${rawMsg}]`
         );
 
-        // Bot-check is IP/account level, so every remaining player client will
-        // fail the same way. Skip straight to the mirror fallback instead of
-        // burning ~60s on clients that cannot succeed without cookies.
-        if (botCheckDetected && cookieArgs.length === 0) {
+        // If an android client hits bot-check without cookies, only then abort remaining clients
+        const isAndroidClient = tier.clients.includes("android");
+        if (botCheckDetected && cookieArgs.length === 0 && isAndroidClient && i >= 1) {
           logger.warn(
             { tier: i + 1 },
-            "Bot-check detected without cookies — skipping remaining yt-dlp clients, trying public mirror fallback"
+            "Android client also hit bot-check without cookies — moving to next fallbacks"
           );
           break;
         }
@@ -2893,56 +2888,50 @@ export async function createAudioResourceFromYtDlp(
     }
 
     // Tier 6: Direct URL extraction -> FFmpeg
-    // Skipped after a cookie-less bot-check: yt-dlp cannot succeed there either.
-    if (!botCheckDetected || cookieArgs.length > 0) {
-      try {
-        logger.info({ tier: 6 }, "Starting yt-dlp with client: direct_url");
-        const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 12000, cookieArgs);
-        if (directUrl) {
-          const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
-          logger.info({ tier: 6 }, "Stream started successfully via direct URL pipe");
-          return resource;
-        }
-        const noUrlMsg = "yt-dlp tidak mengembalikan URL audio (null)";
-        tierErrors.push(`T6 direct-url: ${noUrlMsg}`);
-        tierFailures.push({
-          attempt,
-          tier: 6,
-          clients: "direct-url",
-          cookies: cookieArgs.length > 0,
-          elapsedMs: 0,
-          stage: "unknown",
-          reason: noUrlMsg,
-        });
-        logger.warn({ tier: 6 }, `Stream failed: [${noUrlMsg}]`);
-      } catch (err: any) {
-        const rawMsg = String(err?.message || err);
-        tierErrors.push(`T6 direct-url: ${rawMsg}`);
-        tierFailures.push({
-          attempt,
-          tier: 6,
-          clients: "direct-url",
-          cookies: cookieArgs.length > 0,
-          elapsedMs: 0,
-          stage: "unknown",
-          reason: rawMsg.slice(0, 500),
-        });
-        logger.warn({ tier: 6, err: rawMsg }, `Stream failed: [${rawMsg}]`);
+    try {
+      logger.info({ tier: 6 }, "Starting yt-dlp with client: direct_url");
+      const directUrl = await getDirectAudioUrlWithYtDlp(targetUrl, ytdlpPath, 12000, cookieArgs);
+      if (directUrl) {
+        const resource = await tryPipedUrlStream(directUrl, seekSeconds, 12000);
+        logger.info({ tier: 6 }, "Stream started successfully via direct URL pipe");
+        return resource;
       }
+      const noUrlMsg = "yt-dlp tidak mengembalikan URL audio (null)";
+      tierErrors.push(`T6 direct-url: ${noUrlMsg}`);
+      tierFailures.push({
+        attempt,
+        tier: 6,
+        clients: "direct-url",
+        cookies: cookieArgs.length > 0,
+        elapsedMs: 0,
+        stage: "unknown",
+        reason: noUrlMsg,
+      });
+      logger.warn({ tier: 6 }, `Stream failed: [${noUrlMsg}]`);
+    } catch (err: any) {
+      const rawMsg = String(err?.message || err);
+      tierErrors.push(`T6 direct-url: ${rawMsg}`);
+      tierFailures.push({
+        attempt,
+        tier: 6,
+        clients: "direct-url",
+        cookies: cookieArgs.length > 0,
+        elapsedMs: 0,
+        stage: "unknown",
+        reason: rawMsg.slice(0, 500),
+      });
+      logger.warn({ tier: 6, err: rawMsg }, `Stream failed: [${rawMsg}]`);
     }
 
     // Tier 7: play-dl streaming fallback (works without yt-dlp).
-    // Skipped after a cookie-less bot-check: play-dl hits the same IP gate and
-    // only delays the mirror fallback.
-    if (!botCheckDetected || cookieArgs.length > 0) {
-      try {
-        logger.info({ tier: 7 }, "Attempting stream via play-dl fallback...");
-        const resource = await createAudioResourceFromTrackUrl(targetUrl, seekSeconds);
-        if (resource) {
-          logger.info({ tier: 7 }, "Stream started successfully via play-dl fallback");
-          return resource;
-        }
-      } catch (err: any) {
+    try {
+      logger.info({ tier: 7 }, "Attempting stream via play-dl fallback...");
+      const resource = await createAudioResourceFromTrackUrl(targetUrl, seekSeconds);
+      if (resource) {
+        logger.info({ tier: 7 }, "Stream started successfully via play-dl fallback");
+        return resource;
+      }
+    } catch (err: any) {
         const rawMsg = String(err?.message || err);
         tierErrors.push(`T7 play-dl: ${rawMsg}`);
         tierFailures.push({
@@ -2956,7 +2945,6 @@ export async function createAudioResourceFromYtDlp(
         });
         logger.warn({ tier: 7, err: rawMsg }, `play-dl stream fallback failed: [${rawMsg}]`);
       }
-    }
 
     // Tier 8: public Invidious/Piped mirror. Last resort for datacenter IPs:
     // the mirror extracts from YouTube and proxies/redirects to audio bytes.
