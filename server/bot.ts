@@ -267,7 +267,7 @@ export const FLAG_LANGUAGE_NAMES: Record<string, string> = {
   TL: "Filipina / Tagalog",
 };
 
-export type Provider = "gemini" | "groq" | "mistral" | "deepseek" | "openrouter" | "pollinations";
+export type Provider = "gemini" | "groq" | "mistral" | "deepseek" | "openrouter" | "pollinations" | "9router";
 
 let geminiAi: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI | null {
@@ -399,6 +399,7 @@ async function callOpenAICompat(
       messages,
       max_tokens: maxTokens,
       temperature: 0.7,
+      stream: false,
     }),
   });
   if (!res.ok) {
@@ -407,6 +408,55 @@ async function callOpenAICompat(
   }
   const json = (await res.json()) as { choices: { message: { content: string } }[] };
   return json.choices[0]?.message?.content ?? "";
+}
+
+// 9Router configuration (Self-hosted Multi-Provider Router with "Free-Tier" Combo)
+export const ROUTER_API_URL = (
+  process.env.ROUTER_API_URL ||
+  process.env.NINE_ROUTER_API_URL ||
+  "https://9router-idk.up.railway.app/v1"
+).replace(/\/+$/, "");
+export const ROUTER_API_KEY = (
+  process.env.ROUTER_API_KEY ||
+  process.env.NINE_ROUTER_API_KEY ||
+  "sk-5962663bdd61c4ac-qbmlbk-6d2ea50a"
+).trim();
+export const ROUTER_MODEL = (
+  process.env.ROUTER_MODEL ||
+  process.env.NINE_ROUTER_MODEL ||
+  "Free-Tier"
+).trim();
+
+export async function call9Router(
+  messages: OAIMessage[],
+  maxTokens: number = 2048,
+): Promise<{ text: string; actualModel?: string }> {
+  const res = await fetch(`${ROUTER_API_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${ROUTER_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: ROUTER_MODEL,
+      messages,
+      max_tokens: maxTokens,
+      temperature: 0.7,
+      stream: false,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`9Router returned ${res.status}: ${body.slice(0, 200)}`);
+  }
+
+  const json = (await res.json()) as {
+    choices?: { message?: { content?: string } }[];
+    model?: string;
+  };
+  const text = json.choices?.[0]?.message?.content?.trim() || "";
+  return { text, actualModel: json.model };
 }
 
 async function callPollinationsText(messages: OAIMessage[]): Promise<string> {
@@ -702,6 +752,23 @@ export async function generateText(
     return null;
   };
 
+  // 6. 9Router — Multi-provider combo router with "Free-Tier"
+  const try9Router = async (): Promise<GenerateTextResult | null> => {
+    if (!ROUTER_API_KEY) return null;
+    try {
+      const { text, actualModel } = await call9Router(oaiWithSystem, 2048);
+      if (text) {
+        const displayModel = actualModel
+          ? `9Router Free-Tier (${actualModel})`
+          : `9Router (${ROUTER_MODEL})`;
+        return { text, provider: "9router", model: displayModel };
+      }
+    } catch (err) {
+      logger.warn({ err }, "9Router Free-Tier API failed, trying next provider...");
+    }
+    return null;
+  };
+
   // Provider preference & priority
   const preferred = process.env.CHAT_PROVIDER?.toLowerCase().trim();
   const providerMap: Record<string, () => Promise<GenerateTextResult | null>> = {
@@ -710,6 +777,8 @@ export async function generateText(
     gemini: tryGemini,
     mistral: tryMistral,
     openrouter: tryOpenRouter,
+    "9router": try9Router,
+    router: try9Router,
   };
 
   const sequence: Array<() => Promise<GenerateTextResult | null>> = [];
@@ -717,8 +786,8 @@ export async function generateText(
     sequence.push(providerMap[preferred]);
   }
 
-  // Fast response default priority: DeepSeek -> Groq -> Gemini -> Mistral -> OpenRouter
-  const defaultOrder = [tryDeepSeek, tryGroq, tryGemini, tryMistral, tryOpenRouter];
+  // Fast response default priority: DeepSeek -> Groq -> Gemini -> Mistral -> OpenRouter -> 9Router (Free-Tier)
+  const defaultOrder = [tryDeepSeek, tryGroq, tryGemini, tryMistral, tryOpenRouter, try9Router];
   for (const fn of defaultOrder) {
     if (!sequence.includes(fn)) {
       sequence.push(fn);
@@ -735,7 +804,7 @@ export async function generateText(
     }
   }
 
-  // 6. Free Neural Fallback (Pollinations AI)
+  // 7. Free Neural Fallback (Pollinations AI)
   try {
     const text = await callPollinationsText(oaiWithSystem);
     return {
@@ -2332,7 +2401,32 @@ Do NOT include any markdown codeblocks or conversational text around the JSON.`;
     }
   }
 
-  // 5. Pollinations AI (Free neural translation with OpenAI/Llama models)
+  // 5. 9Router (Free-Tier)
+  if (ROUTER_API_KEY) {
+    try {
+      const raw = await callOpenAICompat(
+        ROUTER_API_URL,
+        ROUTER_API_KEY,
+        ROUTER_MODEL,
+        [
+          { role: "system", content: systemInstruction },
+          { role: "user", content: text },
+        ]
+      );
+      const parsed = safeParseTranslationJson(raw);
+      if (parsed?.translatedText) {
+        return {
+          text: parsed.translatedText,
+          detectedSourceLanguage: parsed.detectedSourceLanguage || "Auto",
+          provider: `9Router (${ROUTER_MODEL})`,
+        };
+      }
+    } catch (err) {
+      logger.warn({ err }, "9Router translation failed, trying Pollinations...");
+    }
+  }
+
+  // 6. Pollinations AI (Free neural translation with OpenAI/Llama models)
   try {
     const raw = await callPollinationsText([
       { role: "system", content: systemInstruction },
@@ -2864,7 +2958,45 @@ PANDUAN MENGENALI GAMBAR & MEMBERIKAN PENDAPAT:
     }
   }
 
-  // 3. Pollinations Vision Fallback
+  // 3. 9Router Vision Fallback (Free-Tier models supporting multimodal vision)
+  if (ROUTER_API_KEY) {
+    try {
+      const res = await fetch(`${ROUTER_API_URL}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${ROUTER_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: ROUTER_MODEL,
+          messages: [
+            { role: "system", content: visionSystemInstruction },
+            {
+              role: "user",
+              content: [
+                { type: "text", text: promptText },
+                { type: "image_url", image_url: { url: dataUrl } },
+              ],
+            },
+          ],
+          max_tokens: 4096,
+          stream: false,
+        }),
+      });
+      if (res.ok) {
+        const json = (await res.json()) as any;
+        const text = json.choices?.[0]?.message?.content?.trim();
+        if (text) {
+          const modelUsed = json.model ? `9Router Vision (${json.model})` : `9Router Vision (${ROUTER_MODEL})`;
+          return { text, provider: modelUsed };
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, "9Router vision failed, trying Pollinations...");
+    }
+  }
+
+  // 4. Pollinations Vision Fallback
   try {
     const res = await fetch("https://text.pollinations.ai/", {
       method: "POST",
@@ -5527,6 +5659,8 @@ export function getBotStatus() {
       mistral: Boolean(process.env.MISTRAL_API_KEY),
       deepseek: Boolean(process.env.DEEPSEEK_API_KEY),
       openrouter: Boolean(process.env.OPENROUTER_API_KEY),
+      "9router": Boolean(ROUTER_API_KEY),
+      router: Boolean(ROUTER_API_KEY),
       pollinations: true,
     },
     creator: {

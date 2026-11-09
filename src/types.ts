@@ -13,6 +13,8 @@ export interface BotStatus {
     mistral: boolean;
     deepseek: boolean;
     openrouter: boolean;
+    "9router"?: boolean;
+    router?: boolean;
     pollinations: boolean;
   };
   creator: {
