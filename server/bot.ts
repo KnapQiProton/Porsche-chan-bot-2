@@ -2378,8 +2378,39 @@ export interface ThinkResult {
   ownerId?: string;
 }
 
-// In-memory cache for /think pagination (holds up to 100 recent queries)
+// Persistent cache for /think pagination (holds up to 2000 queries across restarts)
+const THINKING_CACHE_FILE = path.join(process.cwd(), "data", "thinking_cache.json");
 const thinkingCache = new Map<string, ThinkResult>();
+
+function loadThinkingCacheFromDisk(): void {
+  try {
+    if (fs.existsSync(THINKING_CACHE_FILE)) {
+      const raw = fs.readFileSync(THINKING_CACHE_FILE, "utf-8");
+      const list: ThinkResult[] = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          if (item && item.id) thinkingCache.set(item.id, item);
+        }
+        logger.info({ count: thinkingCache.size }, "Loaded thinking cache from disk");
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, "Could not load thinking_cache.json");
+  }
+}
+
+function persistThinkingCacheToDisk(): void {
+  try {
+    const dataDir = path.dirname(THINKING_CACHE_FILE);
+    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+    const array = Array.from(thinkingCache.values()).slice(-2000);
+    fs.writeFileSync(THINKING_CACHE_FILE, JSON.stringify(array), "utf-8");
+  } catch (err) {
+    logger.error({ err }, "Failed to save thinking_cache.json");
+  }
+}
+
+loadThinkingCacheFromDisk();
 
 export async function performDeepThink(question: string, ownerId?: string): Promise<ThinkResult> {
   const queryClean = question.trim();
@@ -2445,11 +2476,11 @@ Jika ada referensi web di atas yang relevan, gunakan untuk memperkuat keakuratan
 
   // Cache result for pagination
   thinkingCache.set(id, result);
-  // Clean up cache older than 1 hour if it gets too large
-  if (thinkingCache.size > 100) {
+  if (thinkingCache.size > 2000) {
     const oldestKey = thinkingCache.keys().next().value;
     if (oldestKey) thinkingCache.delete(oldestKey);
   }
+  persistThinkingCacheToDisk();
 
   return result;
 }
@@ -2518,6 +2549,176 @@ export function buildThinkEmbed(data: ThinkResult, page: 1 | 2): { embed: EmbedB
       }
     }
   }
+
+  return { embed, row };
+}
+
+export interface ChatPageData {
+  id: string;
+  pages: string[];
+  modelName?: string;
+  createdAt: number;
+}
+
+const CHAT_PAGES_FILE = path.join(process.cwd(), "data", "paginated_chat.json");
+const MAX_SAVED_CHAT_PAGES = 3000;
+const chatPagesCache = new Map<string, ChatPageData>();
+
+export function loadChatPagesFromDisk(): void {
+  try {
+    if (fs.existsSync(CHAT_PAGES_FILE)) {
+      const raw = fs.readFileSync(CHAT_PAGES_FILE, "utf-8");
+      const list: ChatPageData[] = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          if (item && item.id && Array.isArray(item.pages)) {
+            chatPagesCache.set(item.id, item);
+          }
+        }
+        logger.info({ count: chatPagesCache.size }, "Loaded paginated chat messages from disk");
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, "Could not load paginated_chat.json, starting fresh cache");
+  }
+}
+
+let saveChatPagesTimer: NodeJS.Timeout | null = null;
+export function persistChatPagesToDisk(): void {
+  if (saveChatPagesTimer) return;
+  saveChatPagesTimer = setTimeout(() => {
+    saveChatPagesTimer = null;
+    try {
+      const dataDir = path.dirname(CHAT_PAGES_FILE);
+      if (!fs.existsSync(dataDir)) {
+        fs.mkdirSync(dataDir, { recursive: true });
+      }
+      const array = Array.from(chatPagesCache.values()).slice(-MAX_SAVED_CHAT_PAGES);
+      fs.writeFileSync(CHAT_PAGES_FILE, JSON.stringify(array), "utf-8");
+    } catch (err) {
+      logger.error({ err }, "Failed to save paginated_chat.json");
+    }
+  }, 1000);
+}
+
+// Initial load on bot boot
+loadChatPagesFromDisk();
+
+export function saveChatPageData(id: string, pages: string[], modelName?: string): ChatPageData {
+  const data: ChatPageData = {
+    id,
+    pages,
+    modelName,
+    createdAt: Date.now(),
+  };
+  chatPagesCache.set(id, data);
+  if (chatPagesCache.size > MAX_SAVED_CHAT_PAGES + 500) {
+    const oldestKey = chatPagesCache.keys().next().value;
+    if (oldestKey !== undefined) chatPagesCache.delete(oldestKey);
+  }
+  persistChatPagesToDisk();
+  return data;
+}
+
+export function getChatPageData(id: string): ChatPageData | undefined {
+  return chatPagesCache.get(id);
+}
+
+export function splitTextIntoEmbedPages(text: string, maxPageSize = 3800): string[] {
+  if (text.length <= maxPageSize) return [text];
+
+  const pages: string[] = [];
+  const paragraphs = text.split("\n\n");
+  let currentPage = "";
+
+  for (const para of paragraphs) {
+    const candidate = currentPage ? `${currentPage}\n\n${para}` : para;
+    if (candidate.length <= maxPageSize) {
+      currentPage = candidate;
+    } else {
+      if (currentPage) {
+        pages.push(currentPage);
+        currentPage = "";
+      }
+      if (para.length > maxPageSize) {
+        const lines = para.split("\n");
+        for (const line of lines) {
+          const lineCandidate = currentPage ? `${currentPage}\n${line}` : line;
+          if (lineCandidate.length <= maxPageSize) {
+            currentPage = lineCandidate;
+          } else {
+            if (currentPage) pages.push(currentPage);
+            if (line.length > maxPageSize) {
+              for (let i = 0; i < line.length; i += maxPageSize) {
+                pages.push(line.slice(i, i + maxPageSize));
+              }
+              currentPage = "";
+            } else {
+              currentPage = line;
+            }
+          }
+        }
+      } else {
+        currentPage = para;
+      }
+    }
+  }
+
+  if (currentPage.trim()) {
+    pages.push(currentPage);
+  }
+
+  return pages.length > 0 ? pages : [text.slice(0, maxPageSize)];
+}
+
+export function buildChatEmbedPage(
+  data: ChatPageData,
+  pageIndex: number
+): { embed: EmbedBuilder; row?: ActionRowBuilder<ButtonBuilder> } {
+  const totalPages = data.pages.length;
+  const safeIndex = Math.max(0, Math.min(pageIndex, totalPages - 1));
+  const content = data.pages[safeIndex];
+
+  const embed = new EmbedBuilder()
+    .setColor(0x8b5cf6)
+    .setDescription(content || "Tidak ada pesan.")
+    .setTimestamp();
+
+  if (client.user) {
+    embed.setAuthor({
+      name: "Porsche-Chan",
+      iconURL: client.user.displayAvatarURL(),
+    });
+  }
+
+  const modelInfo = data.modelName ? `⚡ Model: ${data.modelName}` : "";
+  const pageInfo = totalPages > 1 ? `Halaman ${safeIndex + 1}/${totalPages}` : "";
+  const footerText = [modelInfo, pageInfo].filter(Boolean).join(" • ");
+  if (footerText) {
+    embed.setFooter({ text: footerText });
+  }
+
+  if (totalPages <= 1) {
+    return { embed };
+  }
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`chatpage_${data.id}_${safeIndex - 1}`)
+      .setLabel("◀ Sebelumnya")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safeIndex === 0),
+    new ButtonBuilder()
+      .setCustomId(`chatpage_info_${data.id}_${safeIndex}`)
+      .setLabel(`📄 ${safeIndex + 1}/${totalPages}`)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(true),
+    new ButtonBuilder()
+      .setCustomId(`chatpage_${data.id}_${safeIndex + 1}`)
+      .setLabel("Selanjutnya ▶")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safeIndex >= totalPages - 1)
+  );
 
   return { embed, row };
 }
@@ -3288,6 +3489,30 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       const { embed, row } = buildThinkEmbed(cached, page);
       await interaction.update({ embeds: [embed], components: [row] });
       return;
+    }
+
+    if (customId.startsWith("chatpage_")) {
+      const parts = customId.split("_");
+      // Format: chatpage_{id}_{pageIndex}
+      if (parts.length >= 3) {
+        const pageId = parts[1];
+        const targetPage = parseInt(parts[2], 10);
+        const data = getChatPageData(pageId);
+        if (!data) {
+          await interaction.reply({
+            content: "⚠️ Halaman ini tidak ditemukan atau data pesan sudah dibersihkan. Silakan tanya ulang ya~ (๑•́ ₃ •̀๑)",
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const { embed, row } = buildChatEmbedPage(data, targetPage);
+        await interaction.update({
+          embeds: [embed],
+          components: row ? [row] : [],
+        });
+        return;
+      }
     }
 
     if (
@@ -4574,30 +4799,26 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
       conversationHistory.set(channelId, finalHistory);
 
-      // Append model indicator footer for regular chat
-      const footer = modelName ? `\n\n-# ⚡ Model: ${modelName}` : "";
-      const chunks = splitMessage(reply);
-      if (chunks.length > 0 && footer) {
-        const lastIdx = chunks.length - 1;
-        if (chunks[lastIdx].length + footer.length <= DISCORD_LIMIT) {
-          chunks[lastIdx] += footer;
-        } else {
-          chunks.push(footer.trim());
-        }
-      }
-      for (let i = 0; i < chunks.length; i++) {
-        const payload = {
-          content: chunks[i],
-          flags: MessageFlags.SuppressEmbeds as any,
-        };
-        if (i === 0) {
-          try {
-            await message.reply(payload);
-          } catch {
-            await channel.send(payload);
-          }
-        } else {
-          await channel.send(payload);
+      // Output response as a clean Discord Embed (supporting up to 4096 chars per page)
+      // If the answer exceeds 3800 characters, it is paginated with persistent buttons that never expire.
+      const pages = splitTextIntoEmbedPages(reply, 3800);
+      const pageId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      const pageData = saveChatPageData(pageId, pages, modelName);
+      const { embed, row } = buildChatEmbedPage(pageData, 0);
+
+      const messagePayload = {
+        embeds: [embed],
+        components: row ? [row] : [],
+      };
+
+      try {
+        await message.reply(messagePayload);
+      } catch (replyErr) {
+        logger.warn({ replyErr }, "Failed to reply with embed, attempting channel.send");
+        try {
+          await channel.send(messagePayload);
+        } catch (sendErr) {
+          logger.error({ sendErr }, "Failed to send embed message to channel");
         }
       }
     } catch (error) {
