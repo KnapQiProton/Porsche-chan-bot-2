@@ -578,6 +578,114 @@ export function formatSourcesForDiscord(text: string): string {
   return processed;
 }
 
+export interface ExtractedSourcesResult {
+  cleanText: string;
+  sourcesText: string | null;
+  sources: { title: string; url: string }[];
+}
+
+/**
+ * Pisahkan daftar sumber dan referensi dari teks jawaban utama.
+ * Memungkinkan teks jawaban tampil bersih di tab pertama tanpa blok sumber yang berantakan,
+ * sementara daftar sumber ditampilkan di tab/halaman terpisah.
+ */
+export function extractAndSeparateSources(text: string): ExtractedSourcesResult {
+  if (!text) return { cleanText: text, sourcesText: null, sources: [] };
+
+  // Protect code blocks from transformations
+  const codeBlocks: string[] = [];
+  let processed = text.replace(/(```[\s\S]*?```|`[^`\n]+`)/g, (match) => {
+    codeBlocks.push(match);
+    return `__CODE_BLOCK_${codeBlocks.length - 1}__`;
+  });
+
+  const sumberHeaderRegex = /(?:🌐\s*\*\*(?:Sumber|Source|Referensi)(?:\s*\/\s*(?:Source|Referensi))?:\*\*|\*\*(?:Sumber|Source|Referensi)(?:\s*\/\s*(?:Source|Referensi))?:\*\*|🌐\s*(?:Sumber|Source|Referensi):|(?:Sumber|Source|Referensi):)([\s\S]*)$/i;
+  const match = processed.match(sumberHeaderRegex);
+
+  const items: { title: string; url: string }[] = [];
+  let cleanBody = processed;
+
+  if (match) {
+    cleanBody = processed.slice(0, match.index).trimEnd();
+    const sourcesContent = match[1];
+
+    const mdLinkRegex = /\[([^\]]+)\]\(\s*<?(https?:\/\/[^\s\)>]+)>?\s*\)/g;
+    const directUrlRegex = /(?:•|\*|-|\d+\.)?\s*(?:\*\*)?([^\n\r:*]+?)(?:\*\*)?\s*[:\-]\s*<?(https?:\/\/[^\s\)>]+)>?/g;
+    const bareUrlRegex = /<?(https?:\/\/[^\s\)>]+)>?/g;
+
+    const seen = new Set<string>();
+    let m: RegExpExecArray | null;
+
+    while ((m = mdLinkRegex.exec(sourcesContent)) !== null) {
+      const title = m[1].trim();
+      const url = m[2].trim().replace(/^<+/, "").replace(/>+$/, "");
+      if (!seen.has(url)) {
+        seen.add(url);
+        items.push({ title, url });
+      }
+    }
+
+    if (items.length === 0) {
+      while ((m = directUrlRegex.exec(sourcesContent)) !== null) {
+        const title = m[1].replace(/^[•*\-\d.]+\s*/, "").trim();
+        const url = m[2].trim().replace(/^<+/, "").replace(/>+$/, "");
+        if (!seen.has(url)) {
+          seen.add(url);
+          items.push({ title: title || "Sumber Web", url });
+        }
+      }
+    }
+
+    if (items.length === 0) {
+      while ((m = bareUrlRegex.exec(sourcesContent)) !== null) {
+        const url = m[1].trim().replace(/^<+/, "").replace(/>+$/, "");
+        if (!seen.has(url)) {
+          seen.add(url);
+          let hostname = "";
+          try {
+            hostname = new URL(url).hostname.replace(/^www\./, "");
+          } catch {}
+          items.push({ title: hostname || "Sumber Web", url });
+        }
+      }
+    }
+  }
+
+  // Convert any remaining raw markdown links [Title](url) in cleanBody so they are clickable without embed
+  cleanBody = cleanBody.replace(/\[([^\]]+)\]\(\s*<?(https?:\/\/[^\s\)>]+)>?\s*\)/g, (_all, title, url) => {
+    const cleanUrl = url.trim().replace(/^<+/, "").replace(/>+$/, "");
+    return `**${title.trim()}**: <${cleanUrl}>`;
+  });
+
+  // Next, wrap ANY remaining raw http(s) URL in cleanBody with angle brackets <URL>
+  cleanBody = cleanBody.replace(/(<)?(https?:\/\/[^\s<>]+)(>)?/g, (_match, prefix, url, suffix) => {
+    let cleanUrl = url.trim();
+    let trailingPunct = "";
+    const punctMatch = cleanUrl.match(/([.,;:!?)]+)$/);
+    if (punctMatch && !suffix) {
+      trailingPunct = punctMatch[1];
+      cleanUrl = cleanUrl.slice(0, -trailingPunct.length);
+    }
+    return `<${cleanUrl}>${trailingPunct}`;
+  });
+
+  // Restore code blocks in cleanBody
+  cleanBody = cleanBody.replace(/__CODE_BLOCK_(\d+)__/g, (_all, idx) => {
+    return codeBlocks[Number(idx)] ?? _all;
+  });
+
+  let sourcesText: string | null = null;
+  if (items.length > 0) {
+    sourcesText = items.map((item) => `• **${item.title}**: <${item.url}>`).join("\n");
+  }
+
+  return {
+    cleanText: cleanBody.trim(),
+    sourcesText,
+    sources: items,
+  };
+}
+
 export async function generateText(
   messages: { role: "user" | "model"; text: string }[],
   systemPrompt?: string,
@@ -2650,6 +2758,8 @@ export function buildThinkEmbed(data: ThinkResult, page: 1 | 2): { embed: EmbedB
 export interface ChatPageData {
   id: string;
   pages: string[];
+  sourcesText?: string | null;
+  sourcesCount?: number;
   modelName?: string;
   createdAt: number;
 }
@@ -2698,10 +2808,18 @@ export function persistChatPagesToDisk(): void {
 // Initial load on bot boot
 loadChatPagesFromDisk();
 
-export function saveChatPageData(id: string, pages: string[], modelName?: string): ChatPageData {
+export function saveChatPageData(
+  id: string,
+  pages: string[],
+  modelName?: string,
+  sourcesText?: string | null,
+  sourcesCount?: number
+): ChatPageData {
   const data: ChatPageData = {
     id,
     pages,
+    sourcesText: sourcesText || undefined,
+    sourcesCount: sourcesCount || 0,
     modelName,
     createdAt: Date.now(),
   };
@@ -2767,16 +2885,13 @@ export function splitTextIntoEmbedPages(text: string, maxPageSize = 3800): strin
 
 export function buildChatEmbedPage(
   data: ChatPageData,
-  pageIndex: number
+  view: number | "sources" = 0
 ): { embed: EmbedBuilder; row?: ActionRowBuilder<ButtonBuilder> } {
   const totalPages = data.pages.length;
-  const safeIndex = Math.max(0, Math.min(pageIndex, totalPages - 1));
-  const content = data.pages[safeIndex];
+  const isSourcesView = view === "sources";
+  const safeIndex = typeof view === "number" ? Math.max(0, Math.min(view, totalPages - 1)) : 0;
 
-  const embed = new EmbedBuilder()
-    .setColor(0x8b5cf6)
-    .setDescription(content || "Tidak ada pesan.")
-    .setTimestamp();
+  const embed = new EmbedBuilder().setTimestamp();
 
   if (client.user) {
     embed.setAuthor({
@@ -2786,34 +2901,91 @@ export function buildChatEmbedPage(
   }
 
   const modelInfo = data.modelName ? `⚡ Model: ${data.modelName}` : "";
-  const pageInfo = totalPages > 1 ? `Halaman ${safeIndex + 1}/${totalPages}` : "";
-  const footerText = [modelInfo, pageInfo].filter(Boolean).join(" • ");
-  if (footerText) {
-    embed.setFooter({ text: footerText });
+
+  if (isSourcesView) {
+    // TAB: SUMBER & REFERENSI
+    embed.setColor(0x3b82f6);
+    embed.setTitle("🌐 Sumber & Referensi Web");
+    embed.setDescription(
+      data.sourcesText && data.sourcesText.trim()
+        ? `Berikut adalah rujukan dan tautan web yang digunakan untuk menyusun jawaban:\n\n${data.sourcesText}`
+        : "Tidak ada tautan web khusus untuk jawaban ini."
+    );
+    embed.setFooter({
+      text: [modelInfo, `Tab Sumber (${data.sourcesCount || 0} tautan)`].filter(Boolean).join(" • "),
+    });
+  } else {
+    // TAB: JAWABAN
+    const content = data.pages[safeIndex] || "Tidak ada pesan.";
+    embed.setColor(0x8b5cf6);
+    embed.setDescription(content);
+
+    const pageInfo = totalPages > 1 ? `Halaman ${safeIndex + 1}/${totalPages}` : "";
+    const sourceHint = data.sourcesText ? `🌐 ${data.sourcesCount || 0} Sumber (klik tab di bawah)` : "";
+    const footerText = [modelInfo, pageInfo, sourceHint].filter(Boolean).join(" • ");
+    if (footerText) {
+      embed.setFooter({ text: footerText });
+    }
   }
 
-  if (totalPages <= 1) {
+  // BUILD BUTTONS
+  const buttons: ButtonBuilder[] = [];
+
+  if (totalPages > 1) {
+    // Multi-page answer
+    if (isSourcesView) {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`chatpage_${data.id}_0`)
+          .setLabel("💬 Kembali ke Jawaban")
+          .setStyle(ButtonStyle.Primary)
+      );
+    } else {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`chatpage_${data.id}_${safeIndex - 1}`)
+          .setLabel("◀ Sebelumnya")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(safeIndex === 0),
+        new ButtonBuilder()
+          .setCustomId(`chatpage_info_${data.id}_${safeIndex}`)
+          .setLabel(`📄 ${safeIndex + 1}/${totalPages}`)
+          .setStyle(ButtonStyle.Primary)
+          .setDisabled(true),
+        new ButtonBuilder()
+          .setCustomId(`chatpage_${data.id}_${safeIndex + 1}`)
+          .setLabel("Selanjutnya ▶")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(safeIndex >= totalPages - 1)
+      );
+    }
+  } else if (data.sourcesText) {
+    // Single page answer with sources: tab buttons!
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`chatpage_${data.id}_0`)
+        .setLabel("💬 Jawaban")
+        .setStyle(isSourcesView ? ButtonStyle.Secondary : ButtonStyle.Primary)
+        .setDisabled(!isSourcesView)
+    );
+  }
+
+  // Add the Sources tab button if sources exist
+  if (data.sourcesText) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`chatpage_${data.id}_sources`)
+        .setLabel(`🌐 Sumber (${data.sourcesCount || 0})`)
+        .setStyle(isSourcesView ? ButtonStyle.Primary : ButtonStyle.Secondary)
+        .setDisabled(isSourcesView)
+    );
+  }
+
+  if (buttons.length === 0) {
     return { embed };
   }
 
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`chatpage_${data.id}_${safeIndex - 1}`)
-      .setLabel("◀ Sebelumnya")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(safeIndex === 0),
-    new ButtonBuilder()
-      .setCustomId(`chatpage_info_${data.id}_${safeIndex}`)
-      .setLabel(`📄 ${safeIndex + 1}/${totalPages}`)
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(true),
-    new ButtonBuilder()
-      .setCustomId(`chatpage_${data.id}_${safeIndex + 1}`)
-      .setLabel("Selanjutnya ▶")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(safeIndex >= totalPages - 1)
-  );
-
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons);
   return { embed, row };
 }
 
@@ -3624,11 +3796,15 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     }
 
     if (customId.startsWith("chatpage_")) {
+      if (customId.startsWith("chatpage_info_")) {
+        // Disabled info indicator button
+        return;
+      }
       const parts = customId.split("_");
-      // Format: chatpage_{id}_{pageIndex}
+      // Format: chatpage_{id}_{target} (target can be a page index or "sources")
       if (parts.length >= 3) {
         const pageId = parts[1];
-        const targetPage = parseInt(parts[2], 10);
+        const target = parts[2];
         const data = getChatPageData(pageId);
         if (!data) {
           await interaction.reply({
@@ -3638,7 +3814,8 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
           return;
         }
 
-        const { embed, row } = buildChatEmbedPage(data, targetPage);
+        const targetView = target === "sources" ? "sources" : parseInt(target, 10);
+        const { embed, row } = buildChatEmbedPage(data, targetView);
         await interaction.update({
           embeds: [embed],
           components: row ? [row] : [],
@@ -4911,31 +5088,33 @@ client.on(Events.MessageCreate, async (message: Message) => {
         }
       }
 
-      // If web search was executed and model did not include sources block, append sources cleanly
-      if (activeSearchResults.length > 0 && !/🌐\s*\*\*Sumber/i.test(reply)) {
-        const sourceList = activeSearchResults
-          .slice(0, 3)
-          .map((r) => {
-            const cleanUrl = r.url.trim().replace(/^<+/, "").replace(/>+$/, "");
-            return `• **${r.title}**: <${cleanUrl}>`;
-          })
-          .join("\n");
-        reply += `\n\n🌐 **Sumber:**\n${sourceList}`;
+      // Extract and separate sources so they don't clutter the main answer
+      const extracted = extractAndSeparateSources(reply);
+      let cleanText = extracted.cleanText;
+      let sourcesText = extracted.sourcesText;
+      let sourcesCount = extracted.sources.length;
+
+      // If web search was executed and no sources were captured from text, add from activeSearchResults
+      if ((!sourcesText || sourcesCount === 0) && activeSearchResults.length > 0) {
+        const sourceItems = activeSearchResults.slice(0, 4).map((r) => {
+          const cleanUrl = r.url.trim().replace(/^<+/, "").replace(/>+$/, "");
+          return `• **${r.title}**: <${cleanUrl}>`;
+        });
+        sourcesText = sourceItems.join("\n");
+        sourcesCount = sourceItems.length;
       }
 
-      reply = formatSourcesForDiscord(reply);
-
-      const finalHistory = [...updatedHistory, { role: "model" as const, text: reply }];
+      const finalHistory = [...updatedHistory, { role: "model" as const, text: cleanText }];
       if (finalHistory.length > MAX_HISTORY) {
         finalHistory.splice(0, finalHistory.length - MAX_HISTORY);
       }
       conversationHistory.set(channelId, finalHistory);
 
       // Output response as a clean Discord Embed (supporting up to 4096 chars per page)
-      // If the answer exceeds 3800 characters, it is paginated with persistent buttons that never expire.
-      const pages = splitTextIntoEmbedPages(reply, 3800);
+      // Sources are neatly separated into a dedicated "🌐 Sumber" tab button!
+      const pages = splitTextIntoEmbedPages(cleanText, 3800);
       const pageId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-      const pageData = saveChatPageData(pageId, pages, modelName);
+      const pageData = saveChatPageData(pageId, pages, modelName, sourcesText, sourcesCount);
       const { embed, row } = buildChatEmbedPage(pageData, 0);
 
       const messagePayload = {
