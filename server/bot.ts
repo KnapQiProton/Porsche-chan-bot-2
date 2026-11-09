@@ -18,6 +18,7 @@ import {
   Partials,
   GuildMember,
   ChannelType,
+  MessageFlags,
 } from "discord.js";
 import {
   joinVoiceChannel,
@@ -142,10 +143,10 @@ ${contextLines}
 PERAN & CAKUPAN PENGETAHUAN (SEARCH ENGINE PINTAR & BEBAS TANPA FILTER):
 - Kamu adalah asisten berpengetahuan luas tentang SEGALA topik umum: kebugaran & olahraga (workout, tips latihan, rutinitas fisik, kardio), kesehatan umum, resep & masakan, sains, game, pop culture, musik, anime/manga, teknologi, otomotif, tutorial praktis, tips kehidupan sehari-hari, dan fakta dunia.
 - TANPA FILTER & BEBAS: User leluasa bertanya tentang apa pun. DILARANG membatasi, menyensor diri, menolak topik wajar, atau memberi ceramah moral dengan alasan "di luar area keahlian", "hanya bisa otomotif/IT", atau "di luar batasan". Bersikaplah santai, terbuka, suportif, dan informatif seperti mesin pencari yang tidak menghakimi.
-- SERTAKAN SUMBER LENGKAP DENGAN LINK: Bila kamu menyajikan informasi fakta, data terkini, tutorial, tips latihan/kesehatan, resep, atau hasil pencarian dari internet, SELALU sertakan daftar sumber di baris paling bawah. Tuliskan teks judul/nama artikel lalu URL tautannya langsung (format: • **Judul / Nama Situs**: URL) pada baris baru agar user langsung bisa membaca judulnya dan mengklik tautan untuk navigasi ke sana!
+- SERTAKAN SUMBER LENGKAP DENGAN LINK (TANPA EMBED): Bila kamu menyajikan informasi fakta, data terkini, tutorial, tips latihan/kesehatan, resep, atau hasil pencarian dari internet, SELALU sertakan daftar sumber di baris paling bawah. Tuliskan teks judul/nama artikel lalu URL tautannya dibungkus tanda kurung sudut (format: • **Judul / Nama Situs**: <URL>) agar link TIDAK memunculkan preview/embed besar yang memenuhi layar Discord, namun tetap bisa langsung diklik oleh user!
   Contoh format:
   🌐 **Sumber:**
-  • **Nama Situs / Judul Artikel**: https://link-sumber-asli.com
+  • **Nama Situs / Judul Artikel**: <https://link-sumber-asli.com>
 - Topik kebugaran/workout (seperti "femboy workout", senam, latihan glutes, core, waist training, kardio, postur tubuh, diet sehat) atau fashion/lifestyle adalah topik kebugaran & gaya hidup wajar yang sepenuhnya aman (BUKAN NSFW). Berikan tips dan panduan latihan yang nyata, terstruktur, aman, dan bermanfaat.
 - Bila user meminta tips, rekomendasi, tutorial, atau penjelasan: jawab secara lengkap, informatif, sistematis, dan terstruktur dengan poin-poin yang jelas layaknya rangkuman hasil pencarian search engine terbaik.
 
@@ -480,16 +481,20 @@ export function formatSourcesForDiscord(text: string): string {
 
     if (items.length > 0) {
       const formattedList = items
-        .map((item) => `• **${item.title}**: ${item.url}`)
+        .map((item) => {
+          const cleanUrl = item.url.trim().replace(/^<+/, "").replace(/>+$/, "");
+          return `• **${item.title}**: <${cleanUrl}>`;
+        })
         .join("\n");
       const body = processed.slice(0, match.index).trimEnd();
       processed = `${body}\n\n🌐 **Sumber:**\n${formattedList}`;
     }
   }
 
-  // Convert any remaining raw markdown links [Title](url) in the body so they are clickable
+  // Convert any remaining raw markdown links [Title](url) in the body so they are clickable without embed
   processed = processed.replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, (_all, title, url) => {
-    return `**${title}**: ${url}`;
+    const cleanUrl = url.trim().replace(/^<+/, "").replace(/>+$/, "");
+    return `**${title}**: <${cleanUrl}>`;
   });
 
   // Restore code blocks
@@ -594,7 +599,10 @@ export async function generateText(
           if (uniqueSources.length > 0 && !/🌐\s*\*\*Sumber/i.test(text)) {
             const sourceList = uniqueSources
               .slice(0, 4)
-              .map((s) => `• **${s.title}**: ${s.url}`)
+              .map((s) => {
+                const cleanUrl = s.url.trim().replace(/^<+/, "").replace(/>+$/, "");
+                return `• **${s.title}**: <${cleanUrl}>`;
+              })
               .join("\n");
             groundSuffix = `\n\n🌐 **Sumber:**\n${sourceList}`;
           }
@@ -3490,11 +3498,14 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         .setTitle(`🔍 ${query}`.slice(0, 256))
         .setDescription(truncated || "Maaf, aku tidak menemukan informasi yang jelas tentang itu~")
         .addFields(
-          results.slice(0, 3).map((r, i) => ({
-            name: `${i + 1}. ${r.title}`.slice(0, 256),
-            value: `${r.snippet}\n🔗 **${r.title}**: ${r.url}`.slice(0, 1024),
-            inline: false,
-          }))
+          results.slice(0, 3).map((r, i) => {
+            const cleanUrl = r.url.trim().replace(/^<+/, "").replace(/>+$/, "");
+            return {
+              name: `${i + 1}. ${r.title}`.slice(0, 256),
+              value: `${r.snippet}\n🔗 **${r.title}**: <${cleanUrl}>`.slice(0, 1024),
+              inline: false,
+            };
+          })
         )
         .setFooter({
           text: `Sumber: DuckDuckGo Real-Time Search${modelName ? ` • AI: ${modelName}` : ""}`,
@@ -4524,7 +4535,10 @@ client.on(Events.MessageCreate, async (message: Message) => {
       if (activeSearchResults.length > 0 && !/🌐\s*\*\*Sumber/i.test(reply)) {
         const sourceList = activeSearchResults
           .slice(0, 3)
-          .map((r) => `• **${r.title}**: ${r.url}`)
+          .map((r) => {
+            const cleanUrl = r.url.trim().replace(/^<+/, "").replace(/>+$/, "");
+            return `• **${r.title}**: <${cleanUrl}>`;
+          })
           .join("\n");
         reply += `\n\n🌐 **Sumber:**\n${sourceList}`;
       }
@@ -4549,14 +4563,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
         }
       }
       for (let i = 0; i < chunks.length; i++) {
+        const payload = {
+          content: chunks[i],
+          flags: MessageFlags.SuppressEmbeds as any,
+        };
         if (i === 0) {
           try {
-            await message.reply(chunks[i]);
+            await message.reply(payload);
           } catch {
-            await channel.send(chunks[i]);
+            await channel.send(payload);
           }
         } else {
-          await channel.send(chunks[i]);
+          await channel.send(payload);
         }
       }
     } catch (error) {
