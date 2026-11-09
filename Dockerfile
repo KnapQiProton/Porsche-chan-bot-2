@@ -44,8 +44,8 @@ WORKDIR /app
 # Copy configuration files
 COPY package.json .npmrc tsconfig.json tsconfig.base.json vite.config.ts ./
 
-# Install dependencies (including dev tools needed for building, omitting optional native addons)
-RUN npm install --legacy-peer-deps --include=dev --omit=optional || (echo "=== NPM ERROR LOG ===" && cat /root/.npm/_logs/*-debug-0.log 2>/dev/null && exit 1)
+# Install dependencies (including dev tools needed for building)
+RUN npm install --legacy-peer-deps --include=dev || (echo "=== NPM ERROR LOG ===" && cat /root/.npm/_logs/*-debug-0.log 2>/dev/null && exit 1)
 
 # Copy source code and assets
 COPY server/ ./server/
