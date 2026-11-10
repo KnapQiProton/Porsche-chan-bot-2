@@ -50,6 +50,7 @@ import {
   checkPotProvider,
   initSoundCloud,
   ENABLE_SOUNDCLOUD,
+  type PlaybackMode,
 } from "./musicPlayer";
 import {
   parseSmartAnimeQuery,
@@ -79,6 +80,20 @@ import {
 
 export const CREATOR_ID = "591807486244290600";
 export const CREATOR_NAME = "KnapQi";
+
+// Parse `--mirror`, `--ytdlp`, or `--auto` from prefix/mention commands.
+// Example: `!play --mirror lofi hip hop` -> mode "mirror", query "lofi hip hop".
+function parsePlaybackModeFlags(input: string): { query: string; mode: PlaybackMode } {
+  let mode: PlaybackMode = "auto";
+  const query = input
+    .replace(/--(mirror|ytdlp|auto)\b/gi, (_match, flag: string) => {
+      mode = flag.toLowerCase() as PlaybackMode;
+      return " ";
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+  return { query, mode };
+}
 
 // Helper to dynamically read bot identity & rules from data/lore.json
 export function getLoreData(): string {
@@ -3407,6 +3422,17 @@ export const COMMANDS = [
         .setDescription("Putar seluruh playlist jika URL memiliki playlist? (Default: False untuk link video)")
         .setRequired(false),
     )
+    .addStringOption((opt) =>
+      opt
+        .setName("mode")
+        .setDescription("Pilih pemutar: auto (default), mirror (langsung lewat mirror), atau ytdlp (cookies/proxy)")
+        .setRequired(false)
+        .addChoices(
+          { name: "Auto (paling pintar)", value: "auto" },
+          { name: "Mirror (paling cepat di Railway)", value: "mirror" },
+          { name: "yt-dlp (cookies / proxy)", value: "ytdlp" },
+        ),
+    )
     .toJSON(),
   new SlashCommandBuilder()
     .setName("stop")
@@ -4523,19 +4549,20 @@ client.on(Events.MessageCreate, async (message: Message) => {
   }
 
   // Prefix commands in guild: !play <url/query>, !playlist <url>, !play-all <url>, !stop, !pause, !resume, !forward, !rewind
+  // Playback mode flags: --auto (default), --mirror, --ytdlp
   if (rawContent.startsWith("!play ") || rawContent.startsWith("!putar ")) {
-    const q = rawContent.replace(/^!(?:play|putar)\s+/i, "").trim();
-    if (q) {
-      await MusicService.playFromMessage(message, q, false);
+    const parsed = parsePlaybackModeFlags(rawContent.replace(/^!(?:play|putar)\s+/i, "").trim());
+    if (parsed.query) {
+      await MusicService.playFromMessage(message, parsed.query, false, parsed.mode);
       return;
     }
   }
 
   // Force playlist prefix commands: !playlist <url>, !putar-playlist <url>, !play-all <url>
   if (rawContent.startsWith("!playlist ") || rawContent.startsWith("!putar-playlist ") || rawContent.startsWith("!play-all ")) {
-    const q = rawContent.replace(/^!(?:playlist|putar-playlist|play-all)\s+/i, "").trim();
-    if (q) {
-      await MusicService.playFromMessage(message, q, true);
+    const parsed = parsePlaybackModeFlags(rawContent.replace(/^!(?:playlist|putar-playlist|play-all)\s+/i, "").trim());
+    if (parsed.query) {
+      await MusicService.playFromMessage(message, parsed.query, true, parsed.mode);
       return;
     }
   }
@@ -4656,9 +4683,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // Mentions with play / stop / pause / resume / seek commands
   if (/^(?:play|putar|setel)\s+/i.test(userText)) {
-    const q = userText.replace(/^(?:play|putar|setel)\s+/i, "").trim();
-    if (q) {
-      await MusicService.playFromMessage(message, q);
+    const parsed = parsePlaybackModeFlags(userText.replace(/^(?:play|putar|setel)\s+/i, "").trim());
+    if (parsed.query) {
+      await MusicService.playFromMessage(message, parsed.query, false, parsed.mode);
       return;
     }
   }

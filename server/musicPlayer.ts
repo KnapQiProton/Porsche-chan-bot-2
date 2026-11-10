@@ -469,6 +469,8 @@ const YT_EXTRACTOR_ARGS = getYtExtractorArgs();
 
 export type MusicSource = "youtube" | "youtube_music" | "spotify" | "soundcloud" | "search";
 
+export type PlaybackMode = "auto" | "mirror" | "ytdlp";
+
 export interface TrackMetadata {
   title: string;
   artist: string;
@@ -2788,12 +2790,27 @@ export async function createAudioResourceFromYtDlp(
   urlOrQuery: string,
   seekSeconds: number = 0,
   ytdlpPath: string,
-  fallbackSearchQuery?: string
+  fallbackSearchQuery?: string,
+  mode: PlaybackMode = "auto"
 ): Promise<any> {
   const cookieArgs = getYtDlpCookieArgs();
+  const cookieAuth = getCookieAuthInfo();
+  const cookiesLoggedIn = cookieAuth.loggedIn;
   const commonFlags = getCommonYtDlpFlags();
   const videoId = extractYouTubeVideoId(urlOrQuery);
   const targetUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : urlOrQuery;
+
+  logger.info(
+    {
+      mode,
+      videoId: videoId || undefined,
+      cookies: cookieAuth.hasCookies
+        ? `${cookiesLoggedIn ? "login" : "guest"}(${cookieAuth.cookieCount})`
+        : "none",
+      cookieSource: cookieAuth.fromEnv ? "env" : cookieAuth.path ? "file" : "none",
+    },
+    `Playback start (mode=${mode})`
+  );
 
   // Format priority: best audio, then format 18 (360p MP4+AAC), then best
   const fmtSelector = "ba/ba*/18/b/best";
@@ -2844,7 +2861,97 @@ export async function createAudioResourceFromYtDlp(
   const tierFailures: TierFailureDiagnostics[] = [];
   let botCheckDetected = false;
 
-  const attemptStream = async (attempt: number): Promise<any> => {
+  const tryMirrorStream = async (attempt: number): Promise<any> => {
+    if (!videoId) {
+      throw new Error("Mode mirror hanya tersedia untuk video YouTube.");
+    }
+
+    logger.info({ tier: 8, attempt }, "Attempting stream via public mirror fallback...");
+    try {
+      const candidates = await resolveMirrorAudioCandidates(videoId);
+      if (!candidates.length) throw new Error("semua mirror publik menolak / tidak punya audio");
+
+      // Validate candidates in parallel before paying FFmpeg startup cost.
+      const probes = await Promise.allSettled(
+        candidates.slice(0, 6).map((candidate) => validateMirrorCandidate(candidate))
+      );
+
+      const valid: Array<MirrorAudioCandidate & { finalUrl: string; contentType: string }> = [];
+      const probeErrors: string[] = [];
+      for (let index = 0; index < probes.length; index++) {
+        const probe = probes[index];
+        if (probe.status === "fulfilled") {
+          valid.push(probe.value);
+        } else {
+          const candidate = candidates[index];
+          let host = candidate.source;
+          try {
+            host = new URL(candidate.url).host;
+          } catch {}
+          probeErrors.push(`${host} [${candidate.detail}]: ${String(probe.reason?.message || probe.reason).slice(0, 100)}`);
+        }
+      }
+
+      if (!valid.length) {
+        throw new Error(`semua kandidat mirror tidak bisa diakses — ${probeErrors.join(" | ")}`);
+      }
+
+      const streamErrors: string[] = [];
+      for (const candidate of valid) {
+        let mirrorHost = candidate.source;
+        try {
+          mirrorHost = new URL(candidate.finalUrl).host;
+        } catch {}
+
+        try {
+          const resource = await tryPipedFetchStream(candidate.finalUrl, seekSeconds, 15_000, {
+            disallowGooglevideo: true,
+            referer: candidate.source,
+          });
+          (resource as any)._tier = `tier 8 (mirror: ${mirrorHost})`;
+          logger.info(
+            {
+              tier: 8,
+              source: candidate.source,
+              host: mirrorHost,
+              detail: candidate.detail,
+              contentType: candidate.contentType,
+              bitrate: candidate.bitrate,
+            },
+            "Stream started successfully via public mirror"
+          );
+          return resource;
+        } catch (streamErr: any) {
+          const streamMsg = String(streamErr?.message || streamErr);
+          streamErrors.push(`${mirrorHost} [${candidate.detail}]: ${streamMsg.slice(0, 100)}`);
+          logger.warn(
+            { tier: 8, source: candidate.source, host: mirrorHost, err: streamMsg },
+            "Mirror candidate failed to stream, trying next candidate"
+          );
+        }
+      }
+
+      throw new Error(`semua kandidat mirror gagal stream — ${streamErrors.join(" | ")}`);
+    } catch (err: any) {
+      const rawMsg = String(err?.message || err);
+      tierErrors.push(`T8 public-mirror: ${rawMsg}`);
+      tierFailures.push({
+        attempt,
+        tier: 8,
+        clients: "public-mirror",
+        cookies: cookieArgs.length > 0,
+        elapsedMs: 0,
+        stage: "unknown",
+        reason: rawMsg.slice(0, 500),
+      });
+      logger.warn({ tier: 8, attempt, err: rawMsg }, `Public mirror fallback failed: [${rawMsg}]`);
+      const wrapped = new Error(rawMsg);
+      (wrapped as any).botCheck = false;
+      throw wrapped;
+    }
+  };
+
+  const tryYtDlpStream = async (attempt: number): Promise<any> => {
     logger.info({ attempt, targetUrl }, `Attempting YouTube stream (Percobaan ${attempt}/2)...`);
 
     for (let i = 0; i < streamTiers.length; i++) {
@@ -2890,16 +2997,26 @@ export async function createAudioResourceFromYtDlp(
           `Stream tier ${i + 1} failed: [${rawMsg}]`
         );
 
-        // If an android client hits bot-check without cookies, only then abort remaining clients
-        const isAndroidClient = tier.clients.includes("android");
-        if (botCheckDetected && cookieArgs.length === 0 && isAndroidClient && i >= 1) {
+        // Bot-check is IP-level, not client-level: when the first (android)
+        // tier already hits it, the remaining yt-dlp clients hit the same
+        // wall. Stop burning ~10s and jump straight to the mirror fallback.
+        if (botCheckDetected) {
           logger.warn(
-            { tier: i + 1 },
-            "Android client also hit bot-check without cookies — moving to next fallbacks"
+            { tier: i + 1, clients: tier.clients },
+            "Bot-check detected — skipping remaining yt-dlp clients"
           );
           break;
         }
       }
+    }
+
+    // After a bot-check, T6/T7 are guaranteed to fail too: T6 is yt-dlp
+    // again and T7 (play-dl) throws an unhandled 429. Fail fast so the
+    // orchestrator can jump straight to the mirror strategy.
+    if (botCheckDetected) {
+      const botError: any = new Error("YouTube bot-check terdeteksi — melewati T6/T7");
+      botError.botCheck = true;
+      throw botError;
     }
 
     // Tier 6: Direct URL extraction -> FFmpeg
@@ -2961,111 +3078,69 @@ export async function createAudioResourceFromYtDlp(
         logger.warn({ tier: 7, err: rawMsg }, `play-dl stream fallback failed: [${rawMsg}]`);
       }
 
-    // Tier 8: public Invidious/Piped mirror. Last resort for datacenter IPs:
-    // the mirror extracts from YouTube and proxies/redirects to audio bytes.
-    if (videoId) {
-      try {
-        logger.info({ tier: 8 }, "Attempting stream via public mirror fallback...");
-        const candidates = await resolveMirrorAudioCandidates(videoId);
-        if (!candidates.length) throw new Error("semua mirror publik menolak / tidak punya audio");
-
-        // Validate candidates in parallel before paying FFmpeg startup cost.
-        const probes = await Promise.allSettled(
-          candidates.slice(0, 6).map((candidate) => validateMirrorCandidate(candidate))
-        );
-
-        const valid: Array<MirrorAudioCandidate & { finalUrl: string; contentType: string }> = [];
-        const probeErrors: string[] = [];
-        for (let index = 0; index < probes.length; index++) {
-          const probe = probes[index];
-          if (probe.status === "fulfilled") {
-            valid.push(probe.value);
-          } else {
-            const candidate = candidates[index];
-            let host = candidate.source;
-            try {
-              host = new URL(candidate.url).host;
-            } catch {}
-            probeErrors.push(`${host} [${candidate.detail}]: ${String(probe.reason?.message || probe.reason).slice(0, 100)}`);
-          }
-        }
-
-        if (!valid.length) {
-          throw new Error(`semua kandidat mirror tidak bisa diakses — ${probeErrors.join(" | ")}`);
-        }
-
-        const streamErrors: string[] = [];
-        for (const candidate of valid) {
-          let mirrorHost = candidate.source;
-          try {
-            mirrorHost = new URL(candidate.finalUrl).host;
-          } catch {}
-
-          try {
-            const resource = await tryPipedFetchStream(candidate.finalUrl, seekSeconds, 15_000, {
-              disallowGooglevideo: true,
-              referer: candidate.source,
-            });
-            (resource as any)._tier = `tier 8 (mirror: ${mirrorHost})`;
-            logger.info(
-              {
-                tier: 8,
-                source: candidate.source,
-                host: mirrorHost,
-                detail: candidate.detail,
-                contentType: candidate.contentType,
-                bitrate: candidate.bitrate,
-              },
-              "Stream started successfully via public mirror"
-            );
-            return resource;
-          } catch (streamErr: any) {
-            const streamMsg = String(streamErr?.message || streamErr);
-            streamErrors.push(`${mirrorHost} [${candidate.detail}]: ${streamMsg.slice(0, 100)}`);
-            logger.warn(
-              { tier: 8, source: candidate.source, host: mirrorHost, err: streamMsg },
-              "Mirror candidate failed to stream, trying next candidate"
-            );
-          }
-        }
-
-        throw new Error(`semua kandidat mirror gagal stream — ${streamErrors.join(" | ")}`);
-      } catch (err: any) {
-        const rawMsg = String(err?.message || err);
-        tierErrors.push(`T8 public-mirror: ${rawMsg}`);
-        tierFailures.push({
-          attempt,
-          tier: 8,
-          clients: "public-mirror",
-          cookies: cookieArgs.length > 0,
-          elapsedMs: 0,
-          stage: "unknown",
-          reason: rawMsg.slice(0, 500),
-        });
-        logger.warn({ tier: 8, err: rawMsg }, `Public mirror fallback failed: [${rawMsg}]`);
-      }
-    }
-
     const detail = tierErrors.slice(-4).join(" | ");
     const streamError = new Error(`Semua tier streaming yt-dlp gagal memuat audio.${detail ? ` (${detail})` : ""}`);
     (streamError as any).botCheck = botCheckDetected;
     throw streamError;
   };
 
-  // Attempt 1
-  try {
-    return await attemptStream(1);
-  } catch (err1: any) {
-    logger.warn({ err: err1?.message }, "YouTube stream attempt 1 failed. Retrying in 2 seconds...");
+  const runYtDlp = async (): Promise<any> => {
+    try {
+      return await tryYtDlpStream(1);
+    } catch (err1: any) {
+      if (err1?.botCheck) throw err1;
+      logger.warn({ err: err1?.message }, "yt-dlp stream failed. Retrying in 2 seconds...");
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return await tryYtDlpStream(2);
+    }
+  };
+
+  const runMirror = async (): Promise<any> => {
+    try {
+      return await tryMirrorStream(1);
+    } catch (err1: any) {
+      logger.warn({ err: err1?.message }, "Mirror stream failed. Retrying once...");
+      return await tryMirrorStream(2);
+    }
+  };
+
+  // "auto" picks whichever route is most likely to work right now: verified
+  // login cookies -> yt-dlp first; otherwise the mirror first, because a
+  // datacenter IP will almost certainly hit YouTube's bot-check.
+  const strategies: Array<{ name: "yt-dlp" | "mirror"; run: () => Promise<any> }> =
+    mode === "mirror"
+      ? [{ name: "mirror", run: runMirror }]
+      : mode === "ytdlp"
+        ? [{ name: "yt-dlp", run: runYtDlp }]
+        : cookiesLoggedIn
+          ? [
+              { name: "yt-dlp", run: runYtDlp },
+              { name: "mirror", run: runMirror },
+            ]
+          : [
+              { name: "mirror", run: runMirror },
+              { name: "yt-dlp", run: runYtDlp },
+            ];
+
+  let lastError: any;
+  for (const strategy of strategies) {
+    try {
+      logger.info(
+        { mode, strategy: strategy.name, cookiesLoggedIn },
+        `Trying playback strategy: ${strategy.name}`
+      );
+      return await strategy.run();
+    } catch (err: any) {
+      lastError = err;
+      logger.warn(
+        { mode, strategy: strategy.name, botCheck: Boolean(err?.botCheck), err: err?.message },
+        `Playback strategy ${strategy.name} failed`
+      );
+    }
   }
 
-  // Delay 2s before retry (Attempt 2)
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-
-  // Attempt 2
-  try {
-    return await attemptStream(2);
-  } catch (err2: any) {
+  {
+    const err2 = lastError;
     const isBotCheck =
       Boolean(err2?.botCheck) ||
       /sign in to confirm|not a bot|confirm you(?:'|’)?re not a bot/i.test(String(err2?.message || ""));
@@ -3075,7 +3150,7 @@ export async function createAudioResourceFromYtDlp(
       url: targetUrl,
       videoId: videoId || undefined,
       seekSeconds,
-      attempts: 2,
+      attempts: strategies.length,
       botCheck: isBotCheck,
       tiers: streamTiers,
       failures: tierFailures,
@@ -3091,14 +3166,15 @@ export async function createAudioResourceFromYtDlp(
 
     logger.error(
       `YouTube playback failed — diagnostic report\n${diagnostic.full}\n` +
-        `Semua tier gagal. Detail singkat: ${String(err2?.message || err2).slice(0, 300)}`
+        `Semua strategi gagal (mode=${mode}). Detail singkat: ${String(err2?.message || err2).slice(0, 300)}`
     );
 
     const head = isBotCheck
       ? "YouTube memblokir IP server ini dengan verifikasi login (\"Sign in to confirm you're not a bot\"). " +
         "PO Token saja tidak cukup untuk IP datacenter seperti Railway, dan fallback mirror publik juga belum berhasil. " +
-        "Upload cookies akun YouTube lewat `/cookies` (sekali saja) atau set env `YOUTUBE_COOKIE`, lalu coba `/play` lagi."
-      : "Gagal memutar audio dari YouTube setelah 2 percobaan. YouTube memblokir IP server (403) atau provider PO Token tidak aktif. Jalankan `/check` untuk diagnosa.";
+        "Upload cookies akun YouTube lewat `/cookies` (sekali saja) atau set env `YOUTUBE_COOKIE`, lalu coba `/play` lagi. " +
+        "Kalau mirror biasanya berhasil, coba `/play` dengan opsi `mode: mirror`."
+      : `Gagal memutar audio dari YouTube (mode=${mode}). YouTube memblokir IP server (403) atau provider PO Token tidak aktif. Jalankan \`/check\` untuk diagnosa.`;
 
     const error: any = new Error(
       `${head}\n\n${diagnostic.short}\n\n` +
@@ -3116,7 +3192,7 @@ export async function createAudioResourceFromYtDlp(
 export async function resolveMusic(
   input: string,
   requester: { name: string; id: string },
-  options?: { forcePlaylist?: boolean }
+  options?: { forcePlaylist?: boolean; mode?: PlaybackMode }
 ): Promise<ResolvedMusicResult> {
   const cleanInput = input.trim();
   const ytdlpPath = await getOrDownloadYtDlp();
@@ -3219,7 +3295,7 @@ export async function resolveMusic(
           rawTrackUrl: t.url,
           createStream: async (seekSeconds: number = 0) => {
             const ytMatch = await searchYouTubeWithYtDlp(query, ytdlpPath, t.title, t.artist, t.durationSec);
-            return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, query);
+            return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, query, options?.mode);
           },
         };
       });
@@ -3263,7 +3339,7 @@ export async function resolveMusic(
           requesterId: requester.id,
           rawTrackUrl: ytMatch.url,
           createStream: async (seekSeconds: number = 0) => {
-            return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, query);
+            return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, query, options?.mode);
           },
         },
       ],
@@ -3308,7 +3384,7 @@ export async function resolveMusic(
           requesterId: requester.id,
           rawTrackUrl: t.url,
           createStream: async (seekSeconds: number = 0) => {
-            return createAudioResourceFromYtDlp(t.url, seekSeconds, ytdlpPath, `${t.title} ${t.artist}`);
+            return createAudioResourceFromYtDlp(t.url, seekSeconds, ytdlpPath, `${t.title} ${t.artist}`, options?.mode);
           },
         }));
 
@@ -3351,7 +3427,7 @@ export async function resolveMusic(
             rawTrackUrl: canonicalUrl,
             hasPlaylistParam: hasPlaylist,
             createStream: async (seekSeconds: number = 0) => {
-              return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`);
+              return createAudioResourceFromYtDlp(canonicalUrl, seekSeconds, ytdlpPath, `${ytMeta.title} ${ytMeta.artist}`, options?.mode);
             },
           },
         ],
@@ -3382,7 +3458,7 @@ export async function resolveMusic(
           if (ytMatch.url.includes("soundcloud.com")) {
             return createAudioResourceFromTrackUrl(ytMatch.url, seekSeconds);
           }
-          return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, `${ytMatch.title} ${ytMatch.artist}`);
+          return createAudioResourceFromYtDlp(ytMatch.url, seekSeconds, ytdlpPath, `${ytMatch.title} ${ytMatch.artist}`, options?.mode);
         },
       },
     ],
@@ -4074,6 +4150,8 @@ export class MusicService {
 
     const queryOrUrl = interaction.options.getString("url", true);
     const forcePlaylist = interaction.options.getBoolean("playlist") ?? false;
+    const modeOption = interaction.options.getString("mode");
+    const mode: PlaybackMode = modeOption === "mirror" || modeOption === "ytdlp" ? modeOption : "auto";
     await interaction.deferReply();
 
     // 2-minute generous interaction timeout watchdog for heavy YouTube/yt-dlp resolution
@@ -4091,7 +4169,7 @@ export class MusicService {
       const musicResult = await resolveMusic(queryOrUrl, {
         name: interaction.user.displayName || interaction.user.username,
         id: interaction.user.id,
-      }, { forcePlaylist });
+      }, { forcePlaylist, mode });
 
       const textChannel = interaction.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
@@ -4618,7 +4696,12 @@ const followMsg = await interaction.followUp({
     setTimeout(() => leaveMsg.delete().catch(() => {}), 5_000);
   }
 
-  public static async playFromMessage(message: Message, queryOrUrl: string, forcePlaylist: boolean = false): Promise<void> {
+  public static async playFromMessage(
+    message: Message,
+    queryOrUrl: string,
+    forcePlaylist: boolean = false,
+    mode: PlaybackMode = "auto"
+  ): Promise<void> {
     const member = message.member;
     const voiceChannel = member?.voice?.channel;
     const guild = message.guild;
@@ -4640,7 +4723,7 @@ const followMsg = await interaction.followUp({
       const musicResult = await resolveMusic(queryOrUrl, {
         name: message.author.displayName || message.author.username,
         id: message.author.id,
-      }, { forcePlaylist });
+      }, { forcePlaylist, mode });
 
       const textChannel = message.channel as TextBasedChannel;
       const session = await MusicService.joinOrGetVoice(guild, voiceChannel, textChannel);
